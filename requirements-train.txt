@@ -1,0 +1,14 @@
+torch
+transformers
+accelerate
+safetensors
+langgraph
+pyyaml
+# Optional official MARBLE scoring bridge.  The bridge is activated with
+# scripts/run_multiagentbench.py --official-marble.
+litellm
+beartype
+ruamel.yaml
+requests
+beautifulsoup4
+psycopg2-binary

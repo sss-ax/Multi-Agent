@@ -1,0 +1,770 @@
+"""Evaluate the graph-only workflow on common deterministic benchmarks.
+
+Supported domains:
+- gsm8k: numeric exact match after answer extraction.
+- mbpp: generated Python is executed against bundled tests.
+- humaneval: generated Python is executed against HumanEval check().
+- mmlu_pro: multiple-choice exact match against the gold letter.
+- hotpotqa: answer exact match and token F1 using the official normalization.
+- tatqa: numeric/text table QA match.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import gzip
+import json
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Dict, Iterable, List
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def _open_text(path: Path):
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt", encoding="utf-8")
+    return path.open(encoding="utf-8")
+
+
+def _raw_rows(path: Path) -> Iterable[Dict[str, Any]]:
+    suffixes = "".join(path.suffixes)
+    if suffixes.endswith(".jsonl") or suffixes.endswith(".jsonl.gz"):
+        with _open_text(path) as handle:
+            for line in handle:
+                if line.strip():
+                    yield json.loads(line)
+        return
+    if path.suffix == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        rows = data.values() if isinstance(data, dict) else data
+        for row in rows:
+            if isinstance(row, dict):
+                yield row
+        return
+    if path.suffix == ".csv":
+        with path.open(encoding="utf-8", newline="") as handle:
+            yield from csv.DictReader(handle)
+        return
+    raise ValueError(f"unsupported data file extension: {path}")
+
+
+def _answer_letter(row: Dict[str, Any], options: List[str]) -> str:
+    value = row.get("answer", row.get("gold_answer", row.get("label", row.get("target"))))
+    if isinstance(value, int):
+        return LETTERS[value]
+    text = str(value).strip()
+    if re.fullmatch(r"[A-Ja-j]", text):
+        return text.upper()
+    if text.isdigit():
+        return LETTERS[int(text)]
+    for index, option in enumerate(options):
+        if normalize_answer(option) == normalize_answer(text):
+            return LETTERS[index]
+    return text.upper()
+
+
+def _options(row: Dict[str, Any]) -> List[str]:
+    options = row.get("options", row.get("choices", row.get("options_")))
+    if isinstance(options, str):
+        try:
+            parsed = json.loads(options)
+            options = parsed
+        except json.JSONDecodeError:
+            options = [item.strip() for item in re.split(r"\s*\|\s*", options) if item.strip()]
+    if isinstance(options, dict):
+        return [str(options[key]) for key in sorted(options)]
+    if isinstance(options, list):
+        return [str(item) for item in options]
+    result = []
+    for letter in LETTERS[:10]:
+        for key in (letter, letter.lower(), f"option_{letter}", f"option_{letter.lower()}"):
+            if key in row and str(row[key]).strip():
+                result.append(str(row[key]))
+                break
+    return result
+
+
+def _hotpot_context(row: Dict[str, Any]) -> tuple[List[str], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    context = row.get("context", [])
+    entities: List[str] = []
+    facts: List[Dict[str, Any]] = []
+    if isinstance(context, dict):
+        titles = context.get("title", [])
+        sentences_by_title = context.get("sentences", [])
+        context = list(zip(titles, sentences_by_title))
+    for item in context:
+        if isinstance(item, list) and len(item) >= 2:
+            title, sentences = str(item[0]), item[1]
+        elif isinstance(item, tuple) and len(item) >= 2:
+            title, sentences = str(item[0]), item[1]
+        elif isinstance(item, dict):
+            title, sentences = str(item.get("title", "")), item.get("sentences", item.get("text", []))
+        else:
+            continue
+        entities.append(title)
+        if isinstance(sentences, str):
+            sentences = [sentences]
+        for sent_id, sentence in enumerate(sentences or []):
+            facts.append({"title": title, "sent_id": sent_id, "text": str(sentence)})
+    supporting = []
+    raw_supporting = row.get("supporting_facts", [])
+    if isinstance(raw_supporting, dict):
+        raw_supporting = list(zip(raw_supporting.get("title", []), raw_supporting.get("sent_id", [])))
+    for item in raw_supporting:
+        if isinstance(item, list) and len(item) >= 2:
+            supporting.append({"entity": str(item[0]), "sent_id": item[1]})
+        elif isinstance(item, tuple) and len(item) >= 2:
+            supporting.append({"entity": str(item[0]), "sent_id": item[1]})
+        elif isinstance(item, dict):
+            supporting.append(item)
+    return entities, facts, supporting
+
+
+def render_native_task(row: Dict[str, Any]) -> str:
+    task_type = row["task_type"]
+    if task_type == "code_generation":
+        requirements = row.get("requirements", {})
+        text = requirements.get("text", row.get("question", "")) if isinstance(requirements, dict) else str(requirements)
+        entry_point = requirements.get("entry_point", "") if isinstance(requirements, dict) else ""
+        tests = row.get("tests", [])
+        test_lines = [str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in tests]
+        lines = [
+            "Write Python code that passes the tests.",
+            "Return only executable Python code, with no Markdown.",
+        ]
+        if entry_point:
+            lines.append(f"The required function name is: {entry_point}")
+        lines.extend(["", "Requirements:", str(text).strip()])
+        if test_lines:
+            lines.extend(["", "Tests that your code must pass:", *test_lines])
+        return "\n".join(lines)
+    if task_type == "multihop_qa":
+        lines = [str(row["question"]).strip(), "", "Evidence:"]
+        for fact in row.get("supporting_facts", row.get("evidence", [])):
+            if isinstance(fact, dict):
+                title = fact.get("title", fact.get("entity", ""))
+                text = fact.get("text", fact)
+                lines.append(f"- {title}: {text}")
+            else:
+                lines.append(f"- {fact}")
+        return "\n".join(lines)
+    return str(row["question"]).strip()
+
+
+def read(path: Path, domain: str, limit: int) -> List[Dict[str, Any]]:
+    result = []
+    for raw in _raw_rows(path):
+        row = dict(raw)
+        if domain == "gsm8k":
+            answer = str(row.get("answer", ""))
+            match = re.search(r"####\s*([-+]?\d[\d,]*(?:\.\d+)?)", answer)
+            if not match:
+                continue
+            row = {
+                "sample_id": row.get("id", f"gsm8k_eval_{len(result)}"),
+                "domain": "gsm8k",
+                "task_type": "numeric_solve",
+                "question": str(row.get("question", "")).strip(),
+                "gold_answer": match.group(1).replace(",", ""),
+            }
+        elif domain == "humaneval":
+            prompt = str(row.get("prompt", ""))
+            entry_point = str(row.get("entry_point", ""))
+            test = str(row.get("test", ""))
+            row = {
+                "sample_id": row.get("task_id", f"humaneval_{len(result)}"),
+                "domain": "humaneval",
+                "task_type": "code_generation",
+                "question": (
+                    "Complete the following Python function. Return only executable Python code.\n\n"
+                    f"{prompt}"
+                ),
+                "requirements": {"text": prompt, "entry_point": entry_point},
+                "tests": [{"setup": "", "text": f"{test}\ncheck({entry_point})"}],
+                "gold_answer": {"entry_point": entry_point},
+            }
+        elif domain == "mbpp":
+            tests = row.get("tests", row.get("test_list", []))
+            if isinstance(tests, str):
+                try:
+                    tests = json.loads(tests)
+                except json.JSONDecodeError:
+                    tests = [line for line in tests.splitlines() if line.strip()]
+            row = {
+                "sample_id": row.get("task_id", row.get("id", f"mbpp_{len(result)}")),
+                "domain": "mbpp",
+                "task_type": "code_generation",
+                "question": (
+                    "Write a Python function that satisfies the requirements. "
+                    "Return only executable Python code.\n\n"
+                    f"{row.get('text', row.get('question', row.get('prompt', '')))}"
+                ),
+                "requirements": {"text": row.get("text", row.get("question", row.get("prompt", "")))},
+                "tests": [{"setup": "", "text": test} for test in tests],
+                "gold_answer": {"tests": len(tests)},
+            }
+        elif domain == "mmlu_pro":
+            options = _options(row)
+            if not options:
+                continue
+            gold = _answer_letter(row, options)
+            choice_lines = [f"{LETTERS[index]}. {option}" for index, option in enumerate(options)]
+            row = {
+                "sample_id": row.get("question_id", row.get("id", f"mmlu_pro_{len(result)}")),
+                "domain": "mmlu_pro",
+                "task_type": "multiple_choice",
+                "question": (
+                    f"{row.get('question', row.get('input', ''))}\n\n"
+                    + "\n".join(choice_lines)
+                    + "\n\nAnswer with only the option letter."
+                ),
+                "choices": [{"label": LETTERS[index], "text": option} for index, option in enumerate(options)],
+                "gold_answer": gold,
+                "category": row.get("category", row.get("subject", "")),
+            }
+        elif domain == "hotpotqa":
+            entities, facts, links = _hotpot_context(row)
+            row = {
+                "sample_id": row.get("_id", row.get("id", f"hotpotqa_{len(result)}")),
+                "domain": "hotpotqa",
+                "task_type": "multihop_qa",
+                "question": str(row.get("question", "")).strip(),
+                "entities": entities,
+                "supporting_facts": facts,
+                "evidence_links": links,
+                "gold_answer": row.get("answer", ""),
+            }
+        result.append(row)
+        if limit and len(result) >= limit:
+            break
+    return result
+
+
+def add_source_nodes(workflow: Any, graph: Any, row: Dict[str, Any], sample_id: str) -> None:
+    task_type = row["task_type"]
+    refs: Dict[str, Any] = {}
+
+    def add(logical_id: str, node_type: str, content: Any) -> None:
+        refs[logical_id] = graph.add_node(
+            task_id=sample_id,
+            branch_id="main",
+            logical_id=logical_id,
+            node_type=node_type,
+            content=content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, separators=(",", ":")),
+            owner="dataset",
+            status="ready",
+            validation={"schema_valid": True},
+            created_by_role="dataset",
+        )
+
+    if task_type == "table_qa":
+        add("table", "table", row.get("table", {}))
+        for index, cell in enumerate(row.get("table_cells", row.get("facts", [])), start=1):
+            add(f"table_cell_{index}", "table_cell", cell)
+        for index, evidence in enumerate(row.get("evidence", []), start=1):
+            add(f"evidence_{index}", "evidence", evidence)
+    elif task_type == "multihop_qa":
+        for index, entity in enumerate(row.get("entities", []), start=1):
+            add(f"entity_{index}", "entity", {"name": entity})
+        for index, fact in enumerate(row.get("supporting_facts", row.get("evidence", [])), start=1):
+            add(f"supporting_fact_{index}", "supporting_fact", fact)
+        for index, link in enumerate(row.get("evidence_links", []), start=1):
+            add(f"evidence_link_{index}", "evidence_link", link)
+    elif task_type == "multiple_choice":
+        for index, choice in enumerate(row.get("choices", []), start=1):
+            add(f"choice_{index}", "choice", choice)
+    elif task_type == "code_generation":
+        add("requirements", "requirements", row.get("requirements", {"text": row["question"]}))
+        for index, test in enumerate(row.get("tests", []), start=1):
+            add(f"test_{index}", "test", test)
+
+    task = graph.latest_valid(sample_id, "main", "task")
+    for node in refs.values():
+        graph.add_edge(source=task.node_id, target=node.node_id, relation="depends_on", created_by_role="dataset")
+
+
+def normalize_answer(value: Any) -> str:
+    text = str(value).strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def hotpot_normalize(value: Any) -> str:
+    text = str(value).lower()
+    text = re.sub(r"\b(a|an|the)\b", " ", text)
+    text = re.sub(r"[^a-z0-9 ]", " ", text)
+    return " ".join(text.split())
+
+
+def hotpot_f1(prediction: Any, gold: Any) -> float:
+    pred_tokens = hotpot_normalize(prediction).split()
+    gold_tokens = hotpot_normalize(gold).split()
+    if not pred_tokens or not gold_tokens:
+        return float(pred_tokens == gold_tokens)
+    common = {}
+    for token in pred_tokens:
+        common[token] = min(pred_tokens.count(token), gold_tokens.count(token))
+    overlap = sum(common.values())
+    if overlap == 0:
+        return 0.0
+    precision = overlap / len(pred_tokens)
+    recall = overlap / len(gold_tokens)
+    return 2 * precision * recall / (precision + recall)
+
+
+def extract_choice(value: Any) -> str:
+    text = str(value).strip()
+    match = re.search(r"\b([A-J])\b", text.upper())
+    return match.group(1) if match else text[:1].upper()
+
+
+def extract_code(value: Any) -> str:
+    text = str(value or "")
+    fenced = re.search(r"```(?:python|py)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        return fenced.group(1).strip()
+    lines = text.splitlines()
+    start = next((i for i, line in enumerate(lines) if line.lstrip().startswith(("def ", "class ", "from ", "import "))), 0)
+    code = "\n".join(lines[start:]).strip()
+    return code
+
+
+def prompt_imports(requirements: Any) -> str:
+    text = ""
+    if isinstance(requirements, dict):
+        text = str(requirements.get("text", ""))
+    else:
+        text = str(requirements or "")
+    imports = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("import ", "from ")) and stripped not in imports:
+            imports.append(stripped)
+    return "\n".join(imports)
+
+
+def run_code_tests(code: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    tests = row.get("tests", [])
+    setup = "\n".join(str(item.get("setup", "")) for item in tests if isinstance(item, dict))
+    test_text = [item.get("text", item) if isinstance(item, dict) else item for item in tests]
+    imports = prompt_imports(row.get("requirements"))
+    script = "\n".join(part for part in (imports, setup, code, "\n".join(str(test) for test in test_text)) if part)
+    try:
+        completed = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        return {"correct": False, "pass_at_1": 0.0, "predicted_answer": {"code": code, "tests_passed": False, "errors": ["python test execution timed out"]}}
+    passed = completed.returncode == 0
+    error = completed.stderr[-2000:] or completed.stdout[-2000:]
+    return {
+        "correct": passed,
+        "pass_at_1": float(passed),
+        "predicted_answer": {"code": code, "tests_passed": passed, "errors": [] if passed else [error]},
+    }
+
+
+def numeric_answer(value: Any) -> str:
+    text = normalize_answer(value).replace(",", "")
+    try:
+        number = float(text)
+        return str(int(number)) if number.is_integer() else f"{number:.8f}".rstrip("0").rstrip(".")
+    except ValueError:
+        return text
+
+
+def extract_numeric_answer(value: Any) -> str:
+    text = normalize_answer(value).replace(",", "")
+    labelled = re.findall(
+        r"(?:final\s+answer|answer|result|total|答案|结果|总数|makes|is)"
+        r"[^0-9+\-]{0,80}"
+        r"([-+]?\d+(?:\.\d+)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    candidates = labelled or re.findall(r"[-+]?\d+(?:\.\d+)?", text)
+    if not candidates:
+        return text
+    return numeric_answer(candidates[-1])
+
+
+def is_correct(workflow: Any, row: Dict[str, Any], graph: Any) -> bool:
+    task_type = row["task_type"]
+    result = workflow.latest_node_by_type(graph, "result")
+    if task_type == "code_generation":
+        if result is None:
+            return False
+        try:
+            value = json.loads(result.content)
+            return bool(value.get("value", {}).get("tests_passed"))
+        except (TypeError, json.JSONDecodeError, AttributeError):
+            return False
+    final = workflow.latest_node_by_type(graph, "final_answer")
+    if final is None:
+        return False
+    predicted = normalize_answer(final.content)
+    gold = normalize_answer(row.get("gold_answer", ""))
+    if task_type == "numeric_solve":
+        return extract_numeric_answer(predicted) == numeric_answer(gold)
+    if task_type == "multiple_choice":
+        return extract_choice(predicted) == extract_choice(gold)
+    if task_type == "table_qa":
+        try:
+            return abs(float(predicted.replace(",", "")) - float(gold.replace(",", ""))) < 1e-6
+        except ValueError:
+            return predicted == gold
+    return predicted == gold
+
+
+def score_record(workflow: Any, row: Dict[str, Any], graph: Any) -> Dict[str, Any]:
+    task_type = row["task_type"]
+    result = workflow.latest_node_by_type(graph, "result")
+    final = workflow.latest_node_by_type(graph, "final_answer")
+    predicted = final.content if final is not None else None
+    if task_type == "code_generation":
+        passed = False
+        if result is not None:
+            try:
+                value = json.loads(result.content) if isinstance(result.content, str) else result.content
+                passed = bool(value.get("value", value).get("tests_passed"))
+            except (TypeError, json.JSONDecodeError, AttributeError):
+                passed = False
+        return {"correct": passed, "pass_at_1": float(passed), "predicted_answer": predicted}
+    if task_type == "multihop_qa":
+        em = float(hotpot_normalize(predicted) == hotpot_normalize(row.get("gold_answer", "")))
+        f1 = hotpot_f1(predicted, row.get("gold_answer", ""))
+        return {"correct": bool(em), "exact_match": em, "f1": f1, "predicted_answer": predicted}
+    correct = is_correct(workflow, row, graph)
+    return {"correct": correct, "exact_match": float(correct), "predicted_answer": predicted}
+
+
+def score_prediction(row: Dict[str, Any], predicted: Any) -> Dict[str, Any]:
+    task_type = row["task_type"]
+    if task_type == "code_generation":
+        return run_code_tests(extract_code(predicted), row)
+    if task_type == "multihop_qa":
+        em = float(hotpot_normalize(predicted) == hotpot_normalize(row.get("gold_answer", "")))
+        f1 = hotpot_f1(predicted, row.get("gold_answer", ""))
+        return {"correct": bool(em), "exact_match": em, "f1": f1, "predicted_answer": predicted}
+    if task_type == "multiple_choice":
+        correct = extract_choice(predicted) == extract_choice(row.get("gold_answer", ""))
+        return {"correct": correct, "exact_match": float(correct), "predicted_answer": predicted}
+    gold = normalize_answer(row.get("gold_answer", ""))
+    pred = normalize_answer(predicted)
+    if task_type == "numeric_solve":
+        correct = extract_numeric_answer(predicted) == numeric_answer(gold)
+    elif task_type == "table_qa":
+        try:
+            correct = abs(float(pred.replace(",", "")) - float(gold.replace(",", ""))) < 1e-6
+        except ValueError:
+            correct = pred == gold
+    else:
+        correct = pred == gold
+    return {"correct": correct, "exact_match": float(correct), "predicted_answer": predicted}
+
+
+def communication_totals(records: List[Dict[str, Any]]) -> Dict[str, int]:
+    totals = {
+        "graph_delta_candidate_tokens": 0,
+        "graph_delta_sent_tokens": 0,
+        "graph_delta_sent_nodes": 0,
+        "graph_communication_events": 0,
+        "graph_delta_mandatory_roots": 0,
+        "graph_delta_optional_roots": 0,
+        "graph_delta_selected_optional_roots": 0,
+        "graph_delta_mandatory_root_tokens": 0,
+        "graph_delta_optional_root_tokens": 0,
+        "graph_delta_selected_optional_root_tokens": 0,
+    }
+    by_pair: Dict[str, Dict[str, int]] = {}
+    for record in records:
+        for action_log in record.get("runtime_summary", {}).get("records", []):
+            for event in action_log.get("communication", []):
+                pair = f"{event.get('sender', '')}->{event.get('receiver', '')}"
+                pair_totals = by_pair.setdefault(pair, {key: 0 for key in totals})
+                totals["graph_communication_events"] += 1
+                totals["graph_delta_candidate_tokens"] += int(event.get("candidate_tokens", 0) or 0)
+                totals["graph_delta_sent_tokens"] += int(event.get("sent_tokens", 0) or 0)
+                totals["graph_delta_sent_nodes"] += int(event.get("sent_count", 0) or 0)
+                totals["graph_delta_mandatory_roots"] += int(event.get("mandatory_root_count", 0) or 0)
+                totals["graph_delta_optional_roots"] += int(event.get("optional_root_count", 0) or 0)
+                totals["graph_delta_selected_optional_roots"] += int(event.get("selected_optional_root_count", 0) or 0)
+                totals["graph_delta_mandatory_root_tokens"] += int(event.get("mandatory_root_tokens", 0) or 0)
+                totals["graph_delta_optional_root_tokens"] += int(event.get("optional_root_tokens", 0) or 0)
+                totals["graph_delta_selected_optional_root_tokens"] += int(event.get("selected_optional_root_tokens", 0) or 0)
+                pair_totals["graph_communication_events"] += 1
+                pair_totals["graph_delta_candidate_tokens"] += int(event.get("candidate_tokens", 0) or 0)
+                pair_totals["graph_delta_sent_tokens"] += int(event.get("sent_tokens", 0) or 0)
+                pair_totals["graph_delta_sent_nodes"] += int(event.get("sent_count", 0) or 0)
+                pair_totals["graph_delta_mandatory_roots"] += int(event.get("mandatory_root_count", 0) or 0)
+                pair_totals["graph_delta_optional_roots"] += int(event.get("optional_root_count", 0) or 0)
+                pair_totals["graph_delta_selected_optional_roots"] += int(event.get("selected_optional_root_count", 0) or 0)
+                pair_totals["graph_delta_mandatory_root_tokens"] += int(event.get("mandatory_root_tokens", 0) or 0)
+                pair_totals["graph_delta_optional_root_tokens"] += int(event.get("optional_root_tokens", 0) or 0)
+                pair_totals["graph_delta_selected_optional_root_tokens"] += int(event.get("selected_optional_root_tokens", 0) or 0)
+    totals["graph_delta_by_pair"] = by_pair  # type: ignore[assignment]
+    return totals
+
+
+def action_token_totals(records: List[Dict[str, Any]]) -> Dict[str, int]:
+    totals = {
+        "direct_a2a_text_tokens": 0,
+        "graph_update_tokens": 0,
+        "graph_read_context_tokens": 0,
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
+        "total_model_tokens": 0,
+        "physical_input_tokens": 0,
+        "logical_input_tokens": 0,
+        "agent_output_tokens": 0,
+        "forward_calls": 0,
+        "peak_context_tokens": 0,
+    }
+    for record in records:
+        runtime = record.get("runtime_summary", {})
+        totals["direct_a2a_text_tokens"] += int(runtime.get("a2a_text_tokens", 0) or 0)
+        for action_log in runtime.get("records", []):
+            telemetry = action_log.get("telemetry", {}) if isinstance(action_log, dict) else {}
+            physical_input = int(telemetry.get("physical_input_tokens", 0) or 0)
+            logical_input = int(telemetry.get("logical_input_tokens", action_log.get("logical_context_tokens", 0)) or 0)
+            output_tokens = int(telemetry.get("output_tokens", 0) or 0)
+            context_tokens = int(
+                telemetry.get(
+                    "graph_read_context_tokens",
+                    action_log.get("context_tokens", action_log.get("logical_context_tokens", 0)),
+                )
+                or 0
+            )
+            graph_update = int(telemetry.get("graph_update_tokens", action_log.get("graph_update_tokens", 0)) or 0)
+            totals["physical_input_tokens"] += physical_input
+            totals["logical_input_tokens"] += logical_input
+            totals["total_input_tokens"] += physical_input
+            totals["total_output_tokens"] += output_tokens
+            totals["agent_output_tokens"] += output_tokens
+            totals["graph_read_context_tokens"] += context_tokens
+            totals["graph_update_tokens"] += graph_update
+            totals["forward_calls"] += int(telemetry.get("forward_calls", 0) or 0)
+            totals["peak_context_tokens"] = max(totals["peak_context_tokens"], context_tokens)
+    totals["total_model_tokens"] = totals["total_input_tokens"] + totals["total_output_tokens"]
+    return totals
+
+
+def optional_consumption_totals(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    totals: Dict[str, Any] = {
+        "optional_transmitted_roots": 0,
+        "optional_transmitted_root_tokens": 0,
+        "optional_consumed_roots": 0,
+        "optional_consumed_root_tokens": 0,
+        "optional_consumption_rate": 0.0,
+        "optimization_headroom": 0.0,
+        "oracle_saving_upper_bound": 0.0,
+        "optional_consumption_by_pair": {},
+    }
+    total_context_tokens = 0
+    total_model_input_tokens = 0
+    by_pair: Dict[str, Dict[str, Any]] = {}
+
+    for record in records:
+        logs = record.get("runtime_summary", {}).get("records", [])
+        for log in logs:
+            total_context_tokens += int(log.get("context_tokens", 0) or 0)
+            telemetry = log.get("telemetry", {}) if isinstance(log, dict) else {}
+            total_model_input_tokens += int(telemetry.get("physical_input_tokens", 0) or 0)
+
+        for index, log in enumerate(logs):
+            for event in log.get("communication", []):
+                receiver = str(event.get("receiver", ""))
+                pair = f"{event.get('sender', '')}->{receiver}"
+                pair_totals = by_pair.setdefault(pair, {
+                    "optional_transmitted_roots": 0,
+                    "optional_transmitted_root_tokens": 0,
+                    "optional_consumed_roots": 0,
+                    "optional_consumed_root_tokens": 0,
+                    "consumed_node_ids": [],
+                    "transmitted_node_ids": [],
+                })
+                selected = list(event.get("selected_optional_root_node_ids", []))
+                token_by_node = event.get("selected_optional_root_token_by_node", {})
+                if not isinstance(token_by_node, dict):
+                    token_by_node = {}
+                future_context_nodes: set[str] = set()
+                for future in logs[index + 1:]:
+                    if future.get("role") != receiver:
+                        continue
+                    future_context_nodes.update(str(node_id) for node_id in future.get("context_slice_node_ids", []))
+                consumed = [node_id for node_id in selected if node_id in future_context_nodes]
+                transmitted_tokens = sum(int(token_by_node.get(node_id, 0) or 0) for node_id in selected)
+                consumed_tokens = sum(int(token_by_node.get(node_id, 0) or 0) for node_id in consumed)
+
+                totals["optional_transmitted_roots"] += len(selected)
+                totals["optional_transmitted_root_tokens"] += transmitted_tokens
+                totals["optional_consumed_roots"] += len(consumed)
+                totals["optional_consumed_root_tokens"] += consumed_tokens
+                pair_totals["optional_transmitted_roots"] += len(selected)
+                pair_totals["optional_transmitted_root_tokens"] += transmitted_tokens
+                pair_totals["optional_consumed_roots"] += len(consumed)
+                pair_totals["optional_consumed_root_tokens"] += consumed_tokens
+                pair_totals["transmitted_node_ids"].extend(selected)
+                pair_totals["consumed_node_ids"].extend(consumed)
+
+    if totals["optional_transmitted_roots"]:
+        totals["optional_consumption_rate"] = (
+            totals["optional_consumed_roots"] / totals["optional_transmitted_roots"]
+        )
+    if total_context_tokens:
+        totals["optimization_headroom"] = totals["optional_consumed_root_tokens"] / total_context_tokens
+    if total_model_input_tokens:
+        totals["oracle_saving_upper_bound"] = totals["optional_consumed_root_tokens"] / total_model_input_tokens
+    for pair_totals in by_pair.values():
+        transmitted = int(pair_totals["optional_transmitted_roots"])
+        pair_totals["optional_consumption_rate"] = (
+            int(pair_totals["optional_consumed_roots"]) / transmitted if transmitted else 0.0
+        )
+        pair_totals["transmitted_node_ids"] = sorted(set(pair_totals["transmitted_node_ids"]))
+        pair_totals["consumed_node_ids"] = sorted(set(pair_totals["consumed_node_ids"]))
+    totals["optional_consumption_by_pair"] = by_pair
+    return totals
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--domain", choices=("gsm8k", "tatqa", "hotpotqa", "mbpp", "humaneval", "mmlu_pro"), required=True)
+    parser.add_argument("--data-path", required=True)
+    parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--max-rounds", type=int, default=3)
+    parser.add_argument("--execution-mode", choices=("optimized", "native_langgraph"), default="optimized")
+    parser.add_argument(
+        "--communication-policy",
+        choices=(
+            "send_all",
+            "minimal_no_feedback",
+            "minimal_sendall_fallback",
+            "minimal_targeted_feedback",
+            "random_keep_75",
+            "random_keep_50",
+            "random_keep_25",
+            "closure_aware_heuristic",
+        ),
+        default="closure_aware_heuristic",
+    )
+    parser.add_argument("--communication-seed", type=int, default=0)
+    parser.add_argument("--communication-budget-tokens", type=int, default=None)
+    parser.add_argument("--output", default="")
+    args = parser.parse_args()
+
+    from langgraph.checkpoint.memory import MemorySaver
+    from workflow_runtime.communication import make_communication_policy
+    from workflow_runtime.langgraph_workflow import LangGraphWorkflow, NativeLangGraphWorkflow
+    from workflow_runtime.model_backend import DirectTransformersModel, TransformersModel
+    import main as workflow
+
+    model = (
+        DirectTransformersModel(args.model_path)
+        if args.execution_mode == "native_langgraph"
+        else TransformersModel(args.model_path)
+    )
+
+    rows = read(Path(args.data_path), args.domain, args.limit)
+    if not rows:
+        raise SystemExit("No evaluation rows loaded")
+    records: List[Dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        sample_id = f"eval_{args.domain}_{index}"
+        task = f"[domain={row['task_type']}]\n{row['question']}"
+        graph = None
+        if args.execution_mode == "native_langgraph":
+            langgraph_workflow = NativeLangGraphWorkflow(
+                model=model,
+                task_id=sample_id,
+                task=render_native_task(row),
+                task_type=row["task_type"],
+                max_rounds=args.max_rounds,
+            )
+        else:
+            graph = workflow.init_workflow_graph(task, task_id=sample_id, task_type=row["task_type"])
+            add_source_nodes(workflow, graph, row, sample_id)
+            langgraph_workflow = LangGraphWorkflow(
+                store=graph,
+                model=model,
+                task_id=sample_id,
+                task_type=row["task_type"],
+                tokenizer=model.tokenizer,
+                max_rounds=args.max_rounds,
+                communication_policy=make_communication_policy(args.communication_policy, seed=args.communication_seed),
+                communication_budget_tokens=args.communication_budget_tokens,
+            )
+        failure = ""
+        started = time.time()
+        run_result: Dict[str, Any] = {}
+        try:
+            app = langgraph_workflow.compile(checkpointer=MemorySaver())
+            run_result = app.invoke(
+                langgraph_workflow.initial_state(),
+                {"configurable": {"thread_id": sample_id}},
+            )
+        except Exception as exc:
+            failure = str(exc)
+        if failure:
+            scores = {"correct": False, "predicted_answer": None}
+        elif args.execution_mode == "native_langgraph":
+            scores = score_prediction(row, run_result.get("final_answer"))
+        else:
+            assert graph is not None
+            scores = score_record(workflow, row, graph)
+        records.append({
+            "sample_id": sample_id,
+            "domain": args.domain,
+            "correct": bool(not failure and scores.get("correct")),
+            "scores": scores,
+            "gold_answer": row.get("gold_answer"),
+            "failure": failure,
+            "latency_sec": time.time() - started,
+            "runtime_summary": {
+                "records": run_result.get("logs", []),
+            },
+            "graph_nodes": len(graph.snapshot().nodes) if graph is not None else 0,
+            "graph_edges": len(graph.snapshot().edges) if graph is not None else 0,
+        })
+        print(f"{index + 1}/{len(rows)} correct={records[-1]['correct']} failure={failure or '-'}", flush=True)
+
+    correct = sum(int(item["correct"]) for item in records)
+    metric_values: Dict[str, float] = {}
+    for key in ("exact_match", "f1", "pass_at_1"):
+        values = [float(item["scores"][key]) for item in records if key in item.get("scores", {})]
+        if values:
+            metric_values[key] = sum(values) / len(values)
+    graph_comm = communication_totals(records)
+    token_totals = action_token_totals(records)
+    optional_consumption = optional_consumption_totals(records)
+    report = {
+        "domain": args.domain,
+        "data_path": args.data_path,
+        "execution_mode": args.execution_mode,
+        "count": len(records),
+        "accuracy_or_pass_at_1": correct / len(records),
+        **metric_values,
+        "failure_count": sum(bool(item["failure"]) for item in records),
+        **token_totals,
+        **graph_comm,
+        **optional_consumption,
+        "records": records,
+    }
+    if args.output:
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({k: v for k, v in report.items() if k != "records"}, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
