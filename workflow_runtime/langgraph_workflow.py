@@ -16,6 +16,7 @@ from .delta_closure import dependency_closure
 from .delta_extractor import extract_delta_candidates
 from .delta_scoring import estimate_edge_tokens, estimate_node_tokens
 from .domain_executors import execute_domain
+from .feedback_controller import FeedbackAction, decide_feedback_action
 from .graph_delta import DeltaCandidate, GraphDelta
 from .graph_store import GraphStore
 from .semantic_fragments import (
@@ -27,10 +28,22 @@ from .semantic_fragments import (
     node_id_from_fragment,
 )
 from .semantic_contract import default_semantic_contract
-from .semantic_feedback import build_semantic_feedback, is_ack, is_nack
+from .semantic_feedback import (
+    build_semantic_feedback,
+    is_feedback_request,
+    is_ack,
+    is_hard_nack,
+    is_nack,
+    is_quality_nack,
+    is_soft_nack,
+    is_verification_nack,
+    nack_level,
+    nack_missing_semantics,
+)
 from .semantic_innovation import detect_innovations
 from .semantic_packet import build_initial_semantic_packet
 from .semantic_resolver import SemanticResolver
+from .receiver_need import diagnose_receiver_need
 from .refinement_planner import plan_refinement
 from .protocol import (
     PROTOCOL_VERSION,
@@ -40,6 +53,7 @@ from .protocol import (
 )
 from .tools import ToolRegistry
 from .telemetry import WorkflowTelemetry
+from .task_verifier import apply_verification_signal, verify_task_candidate
 from .native_agents import AgentConfig, NativeAgent
 from .message_bus import MessageBus, MessageEnvelope
 from .native_tooling import (
@@ -220,7 +234,7 @@ class LangGraphWorkflow:
             session_id = state.get("session_id", self.session_id)
 
             for action_index in range(self.max_actions_per_role):
-                if not self._completion_errors(role):
+                if not self._completion_errors(role, mode=mode):
                     completed = True
                     break
                 view_store = self.agent_views.visible_store(role)
@@ -243,8 +257,16 @@ class LangGraphWorkflow:
                 session_prompt = self._session_prompt(role, mode, prompt)
                 graph_read_context_tokens = self._token_count(prompt)
                 logical_input_tokens = self._token_count(session_prompt)
+                context_costs = self._context_cost_breakdown(
+                    role=role,
+                    mode=mode,
+                    context_slice=context_slice,
+                    graph_state=graph_state,
+                    graph_read_context_tokens=graph_read_context_tokens,
+                    logical_input_tokens=logical_input_tokens,
+                )
                 action_constraint = (
-                    self._action_constraint(role, state.get("branch_id", self.branch_id))
+                    self._action_constraint(role, state.get("branch_id", self.branch_id), mode=mode)
                     if self.enable_action_constraints else None
                 )
                 action, generation = self._generate_action(
@@ -258,8 +280,21 @@ class LangGraphWorkflow:
                     logical_input_tokens=logical_input_tokens,
                     graph_read_context_tokens=graph_read_context_tokens,
                     context_slice_tokens=context_slice.token_count,
+                    context_costs=context_costs,
                     action_constraint=action_constraint,
                 )
+                if role == "critic" and action.get("op") == "verify":
+                    verification_signal = verify_task_candidate(
+                        self.task_type,
+                        self.store,
+                        task_id=self.task_id,
+                        branch_id=state.get("branch_id", self.branch_id),
+                    )
+                    action = apply_verification_signal(action, verification_signal)
+                    generation = {
+                        **generation,
+                        "task_verification": verification_signal.as_dict(),
+                    }
                 try:
                     self.compiler.set_node_ref_context(self._node_ref_context(context_slice))
                     result = self.compiler.apply(role, action)
@@ -294,7 +329,7 @@ class LangGraphWorkflow:
                     branch_id=state.get("branch_id", self.branch_id),
                 )
                 if result.done:
-                    completion_errors = self._completion_errors(role)
+                    completion_errors = self._completion_errors(role, mode=mode)
                     if completion_errors:
                         error = ActionCompilationError(
                             f"{role} cannot finish workflow stage: {'; '.join(completion_errors)}"
@@ -317,7 +352,7 @@ class LangGraphWorkflow:
                     completed = True
                 else:
                     last_action = action
-                    if not self._completion_errors(role):
+                    if not self._completion_errors(role, mode=mode):
                         completed = True
 
                 if self.telemetry is not None:
@@ -405,6 +440,7 @@ class LangGraphWorkflow:
         logical_input_tokens: int,
         graph_read_context_tokens: int,
         context_slice_tokens: int,
+        context_costs: dict[str, Any],
         action_constraint: Optional[ActionConstraint],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         attempts = 0
@@ -441,6 +477,7 @@ class LangGraphWorkflow:
                         "logical_input_tokens": logical_input_tokens,
                         "graph_read_context_tokens": graph_read_context_tokens,
                         "context_slice_tokens": context_slice_tokens,
+                        **context_costs,
                         "action_constraint": action_constraint.as_dict() if action_constraint else None,
                     }
                 action = parse_action(str(raw).strip(), role=role, task_type=self.task_type)
@@ -452,6 +489,7 @@ class LangGraphWorkflow:
                     "logical_input_tokens": logical_input_tokens,
                     "graph_read_context_tokens": graph_read_context_tokens,
                     "context_slice_tokens": context_slice_tokens,
+                    **context_costs,
                     "action_constraint": action_constraint.as_dict() if action_constraint else None,
                 }
             except ValueError as error:
@@ -467,6 +505,7 @@ class LangGraphWorkflow:
                             "logical_input_tokens": logical_input_tokens,
                             "graph_read_context_tokens": graph_read_context_tokens,
                             "context_slice_tokens": context_slice_tokens,
+                            **context_costs,
                             "raw_output": raw_text,
                         })
                     raise ValueError(
@@ -501,6 +540,61 @@ class LangGraphWorkflow:
                 return len(self.tokenizer.encode(text))
         return len(text.split())
 
+    def _context_cost_breakdown(
+        self,
+        *,
+        role: str,
+        mode: str,
+        context_slice: Any,
+        graph_state: Any,
+        graph_read_context_tokens: int,
+        logical_input_tokens: int,
+    ) -> dict[str, Any]:
+        """Separate reusable task prefix from policy-controlled context.
+
+        The current local Transformers backend is stateless, so physical input
+        still includes the full prompt on every call.  These fields expose the
+        logical communication cost separately from the prefix/prefill cost that
+        a stateful backend or KV reuse layer could avoid in later rounds.
+        """
+        persistent_node_ids: list[str] = []
+        persistent_context_tokens = 0
+        for node_id in context_slice.visible_node_ids:
+            node = graph_state.nodes.get(node_id)
+            if node is None:
+                continue
+            if (
+                node.logical_id in MANDATORY_LOGICAL_IDS
+                or node.created_by_role in {"user", "dataset", ""}
+                or node.provenance.get("communication_scope") == "MANDATORY"
+            ):
+                persistent_node_ids.append(node_id)
+                persistent_context_tokens += estimate_node_tokens(node)
+        persistent_context_tokens = min(
+            max(0, persistent_context_tokens),
+            max(0, graph_read_context_tokens),
+        )
+        incremental_context_tokens = max(0, graph_read_context_tokens - persistent_context_tokens)
+        system_prompt_tokens = self._token_count(self._system_contract(role, mode))
+        reusable_prefix_tokens = min(
+            max(0, logical_input_tokens),
+            max(0, system_prompt_tokens + persistent_context_tokens),
+        )
+        prompt_wrapper_tokens = max(
+            0,
+            logical_input_tokens - graph_read_context_tokens - system_prompt_tokens,
+        )
+        return {
+            "persistent_context_tokens": persistent_context_tokens,
+            "incremental_context_tokens": incremental_context_tokens,
+            "logical_communication_tokens": incremental_context_tokens,
+            "system_prompt_tokens": system_prompt_tokens,
+            "prompt_wrapper_tokens": prompt_wrapper_tokens,
+            "reusable_prefix_tokens": reusable_prefix_tokens,
+            "persistent_context_node_ids": tuple(persistent_node_ids),
+            "reusable_prefix_key": f"{role}:{mode}:{self.task_type}",
+        }
+
     def _graph_update_tokens(self, node_ids: Sequence[str]) -> int:
         if not node_ids:
             return 0
@@ -516,7 +610,7 @@ class LangGraphWorkflow:
                 total += estimate_edge_tokens(edge)
         return total
 
-    def _action_constraint(self, role: str, branch_id: str) -> ActionConstraint:
+    def _action_constraint(self, role: str, branch_id: str, *, mode: str = "normal") -> ActionConstraint:
         task = self.store.latest_valid(self.task_id, branch_id, "task")
         existing = (
             node.logical_id
@@ -528,7 +622,7 @@ class LangGraphWorkflow:
         return build_action_constraint(
             role=role,
             task_type=self.task_type,
-            missing=self._completion_errors(role),
+            missing=self._completion_errors(role, mode=mode),
             task_text=str(task.content) if task is not None else "",
             existing_logical_ids=existing,
         )
@@ -571,16 +665,29 @@ class LangGraphWorkflow:
             "mode": mode,
             "action_index": action_index,
             "action_type": action.get("type", action.get("op")),
+            "action": dict(action),
             "attempts": int(generation.get("attempts", 1)),
             "validation_errors": list(generation.get("validation_errors", [])),
             "action_constraint": generation.get("action_constraint"),
             "logical_input_tokens": logical_input,
             "physical_input_tokens": physical_input,
+            "physical_llm_input_tokens": physical_input,
             "output_tokens": output_tokens,
+            "prefill_cost_tokens": physical_input,
+            "decode_cost_tokens": output_tokens,
             "forward_calls": int(backend.get("forward_calls", 0)),
             "graph_read_context_tokens": int(generation.get("graph_read_context_tokens", 0) or 0),
             "context_slice_tokens": int(generation.get("context_slice_tokens", 0) or 0),
+            "persistent_context_tokens": int(generation.get("persistent_context_tokens", 0) or 0),
+            "incremental_context_tokens": int(generation.get("incremental_context_tokens", 0) or 0),
+            "logical_communication_tokens": int(generation.get("logical_communication_tokens", 0) or 0),
+            "system_prompt_tokens": int(generation.get("system_prompt_tokens", 0) or 0),
+            "prompt_wrapper_tokens": int(generation.get("prompt_wrapper_tokens", 0) or 0),
+            "reusable_prefix_tokens": int(generation.get("reusable_prefix_tokens", 0) or 0),
+            "persistent_context_node_ids": list(generation.get("persistent_context_node_ids", ())),
+            "reusable_prefix_key": generation.get("reusable_prefix_key", f"{role}:{mode}:{self.task_type}"),
             "graph_update_tokens": int(generation.get("graph_update_tokens", 0) or 0),
+            "task_verification": generation.get("task_verification"),
             "protocol_valid": protocol_valid,
             "compile_success": compile_success,
             "stage_complete": stage_complete,
@@ -605,6 +712,7 @@ class LangGraphWorkflow:
         for receiver in self._communication_receivers(sender):
             receiver_view = self.agent_views.view(receiver)
             receiver_visible_before = sorted(receiver_view.visible_node_ids)
+            receiver_visible_before_fragments = sorted(receiver_view.visible_fragment_ids)
             candidates = extract_delta_candidates(
                 state,
                 node_ids=node_ids,
@@ -646,6 +754,7 @@ class LangGraphWorkflow:
             semantic_event: dict[str, Any] = {}
             fallback_delta = None
             targeted_deltas: list[GraphDelta] = []
+            targeted_fragment_level_by_id: dict[str, str] = {}
             semantic_minimal_policy = self.communication_policy.name in {
                 "minimal_no_feedback",
                 "minimal_sendall_fallback",
@@ -786,17 +895,39 @@ class LangGraphWorkflow:
                     round_index=0,
                     results=check_results,
                 )
+                initial_receiver_need = diagnose_receiver_need(
+                    sender=sender,
+                    receiver=receiver,
+                    stage=f"{sender}->{receiver}",
+                    round_index=0,
+                    results=check_results,
+                )
+                initial_feedback = feedback
                 fallback_feedback = None
                 targeted_feedback = None
+                fallback_receiver_need = None
+                targeted_receiver_need = None
                 targeted_plan = None
                 targeted_plans: list[dict[str, Any]] = []
                 targeted_feedbacks: list[dict[str, Any]] = []
+                targeted_receiver_needs: list[dict[str, Any]] = []
+                targeted_requested_fragment_ids: list[str] = []
+                feedback_decisions: list[dict[str, Any]] = []
+                targeted_refinement_skipped = False
+                targeted_refinement_skip_reason = ""
+                targeted_refinement_skipped_plan = None
                 refinement_rounds = 0
                 max_refinement_rounds = self.max_rounds
+                feedback_decision = decide_feedback_action(
+                    feedback,
+                    policy_name=self.communication_policy.name,
+                    round_index=refinement_rounds,
+                    max_rounds=max_refinement_rounds,
+                )
+                feedback_decisions.append(feedback_decision.as_dict())
                 while (
-                    is_nack(feedback)
+                    feedback_decision.action == FeedbackAction.TARGETED_REFINEMENT
                     and self.communication_policy.name == "minimal_targeted_feedback"
-                    and refinement_rounds < max_refinement_rounds
                 ):
                     targeted_plan = plan_refinement(
                         state,
@@ -804,10 +935,29 @@ class LangGraphWorkflow:
                         receiver=receiver,
                         sender_view=sender_view,
                         receiver_view=receiver_view,
-                        missing_semantics=feedback.missing_semantics,
+                        missing_semantics=nack_missing_semantics(feedback),
                     )
                     targeted_plans.append(targeted_plan.as_dict())
+                    targeted_requested_fragment_ids.extend(targeted_plan.requested_fragment_ids)
+                    for fragment_id in targeted_plan.requested_fragment_ids:
+                        targeted_fragment_level_by_id[str(fragment_id)] = targeted_plan.request_level
                     if targeted_plan.is_unresolvable or targeted_plan.is_empty:
+                        feedback_decision = decide_feedback_action(
+                            feedback,
+                            policy_name=self.communication_policy.name,
+                            round_index=max_refinement_rounds,
+                            max_rounds=max_refinement_rounds,
+                        )
+                        feedback_decisions.append(feedback_decision.as_dict())
+                        break
+                    if (
+                        targeted_plan.request_level == "quality"
+                        and self.communication_budget_tokens is not None
+                        and targeted_plan.estimated_cost > self.communication_budget_tokens
+                    ):
+                        targeted_refinement_skipped = True
+                        targeted_refinement_skip_reason = "quality_refinement_budget_exceeded"
+                        targeted_refinement_skipped_plan = targeted_plan.as_dict()
                         break
                     targeted_delta = dependency_closure(
                         state,
@@ -834,7 +984,7 @@ class LangGraphWorkflow:
                                 receiver=receiver,
                                 node_ids=targeted_delta.node_ids,
                                 mandatory_root_node_ids=targeted_plan.root_node_ids,
-                                selected_optional_fragment_ids=(),
+                                selected_optional_fragment_ids=targeted_plan.requested_fragment_ids,
                             ),
                             delta_id=f"{sender}->{receiver}:{len(receiver_view.received_delta_ids) + 1}:targeted",
                             packet_id=targeted_packet_id,
@@ -846,11 +996,26 @@ class LangGraphWorkflow:
                         round_index=refinement_rounds + 1,
                         results=targeted_results,
                     )
+                    targeted_receiver_need = diagnose_receiver_need(
+                        sender=sender,
+                        receiver=receiver,
+                        stage=f"{sender}->{receiver}",
+                        round_index=refinement_rounds + 1,
+                        results=targeted_results,
+                    )
                     targeted_feedbacks.append(targeted_feedback.as_dict())
+                    targeted_receiver_needs.append(targeted_receiver_need.as_dict())
                     check_results = targeted_results
                     feedback = targeted_feedback
                     refinement_rounds += 1
-                if is_nack(feedback) and self.communication_policy.name in {"minimal_sendall_fallback", "minimal_targeted_feedback"}:
+                    feedback_decision = decide_feedback_action(
+                        feedback,
+                        policy_name=self.communication_policy.name,
+                        round_index=refinement_rounds,
+                        max_rounds=max_refinement_rounds,
+                    )
+                    feedback_decisions.append(feedback_decision.as_dict())
+                if feedback_decision.action == FeedbackAction.SEND_ALL_FALLBACK:
                     fallback_roots = [candidate.node_id for candidate in candidates if candidate.exportable]
                     fallback_delta = dependency_closure(
                         state,
@@ -885,8 +1050,29 @@ class LangGraphWorkflow:
                         round_index=refinement_rounds + 1,
                         results=fallback_results,
                     )
+                    fallback_receiver_need = diagnose_receiver_need(
+                        sender=sender,
+                        receiver=receiver,
+                        stage=f"{sender}->{receiver}",
+                        round_index=refinement_rounds + 1,
+                        results=fallback_results,
+                    )
                     check_results = fallback_results
                     feedback = fallback_feedback
+                    feedback_decision = decide_feedback_action(
+                        feedback,
+                        policy_name=self.communication_policy.name,
+                        round_index=refinement_rounds + 1,
+                        max_rounds=max_refinement_rounds,
+                    )
+                    feedback_decisions.append(feedback_decision.as_dict())
+                receiver_need = diagnose_receiver_need(
+                    sender=sender,
+                    receiver=receiver,
+                    stage=f"{sender}->{receiver}",
+                    round_index=refinement_rounds + (1 if fallback_feedback is not None else 0),
+                    results=check_results,
+                )
                 targeted_token_sum = sum(item.token_cost for item in targeted_deltas)
                 targeted_node_ids = tuple(dict.fromkeys(node_id for item in targeted_deltas for node_id in item.node_ids))
                 targeted_edge_ids = tuple(dict.fromkeys(edge_id for item in targeted_deltas for edge_id in item.edge_ids))
@@ -896,13 +1082,74 @@ class LangGraphWorkflow:
                     "semantic_recoverable_count": sum(1 for result in check_results if result.status.value == "RECOVERABLE"),
                     "semantic_missing_count": sum(1 for result in check_results if result.status.value == "MISSING"),
                     "semantic_feedback": feedback.as_dict(),
+                    "semantic_feedback_decision": feedback_decision.as_dict(),
+                    "semantic_feedback_decisions": feedback_decisions,
+                    "semantic_initial_feedback": initial_feedback.as_dict(),
+                    "semantic_receiver_need": receiver_need.as_dict(),
+                    "semantic_initial_receiver_need": initial_receiver_need.as_dict(),
+                    "semantic_feedback_level": nack_level(feedback),
+                    "semantic_initial_feedback_level": nack_level(initial_feedback),
                     "semantic_ack": is_ack(feedback),
                     "semantic_nack": is_nack(feedback),
-                    "semantic_nack_unresolved": is_nack(feedback),
+                    "semantic_feedback_request": is_feedback_request(feedback),
+                    "semantic_hard_nack": is_hard_nack(feedback),
+                    "semantic_soft_nack": is_soft_nack(feedback),
+                    "semantic_verification_nack": is_verification_nack(feedback),
+                    "semantic_quality_nack": is_quality_nack(feedback),
+                    "semantic_nack_unresolved": is_hard_nack(feedback),
                     "semantic_final_contract_satisfied": is_ack(feedback),
+                    "semantic_hard_contract_satisfied": not is_hard_nack(feedback),
+                    "semantic_initial_nack": is_nack(initial_feedback),
+                    "semantic_initial_feedback_request": is_feedback_request(initial_feedback),
+                    "semantic_initial_hard_nack": is_hard_nack(initial_feedback),
+                    "semantic_initial_soft_nack": is_soft_nack(initial_feedback),
+                    "semantic_initial_verification_nack": is_verification_nack(initial_feedback),
+                    "semantic_initial_quality_nack": is_quality_nack(initial_feedback),
+                    "semantic_initial_missing_count": len(getattr(initial_feedback, "missing_semantics", ())),
+                    "semantic_initial_hard_missing_count": len(getattr(initial_feedback, "hard_missing_semantics", ())),
+                    "semantic_initial_soft_missing_count": len(getattr(initial_feedback, "soft_missing_semantics", ())),
+                    "semantic_initial_verification_missing_count": len(getattr(initial_feedback, "verification_missing_semantics", ())),
+                    "semantic_initial_quality_gap_count": len(getattr(initial_feedback, "quality_gaps", ())),
+                    "semantic_final_missing_count": len(getattr(feedback, "missing_semantics", ())),
+                    "semantic_final_hard_missing_count": len(getattr(feedback, "hard_missing_semantics", ())),
+                    "semantic_final_soft_missing_count": len(getattr(feedback, "soft_missing_semantics", ())),
+                    "semantic_final_verification_missing_count": len(getattr(feedback, "verification_missing_semantics", ())),
+                    "semantic_final_quality_gap_count": len(getattr(feedback, "quality_gaps", ())),
+                    "semantic_hard_repaired_count": max(
+                        0,
+                        len(getattr(initial_feedback, "hard_missing_semantics", ()))
+                        - len(getattr(feedback, "hard_missing_semantics", ())),
+                    ),
+                    "semantic_verification_repaired_count": max(
+                        0,
+                        len(getattr(initial_feedback, "verification_missing_semantics", ()))
+                        - len(getattr(feedback, "verification_missing_semantics", ())),
+                    ),
+                    "semantic_quality_repaired_count": max(
+                        0,
+                        len(getattr(initial_feedback, "quality_gaps", ()))
+                        - len(getattr(feedback, "quality_gaps", ())),
+                    ),
+                    "semantic_soft_repaired_count": max(
+                        0,
+                        len(getattr(initial_feedback, "soft_missing_semantics", ()))
+                        - len(getattr(feedback, "soft_missing_semantics", ())),
+                    ),
+                    "semantic_missing_repaired_count": max(
+                        0,
+                        len(getattr(initial_feedback, "missing_semantics", ()))
+                        - len(getattr(feedback, "missing_semantics", ())),
+                    ),
                     "refinement_rounds": refinement_rounds,
                     "max_refinement_rounds": max_refinement_rounds,
                     "targeted_refinement": bool(targeted_plans),
+                    "targeted_refinement_skipped": targeted_refinement_skipped,
+                    "targeted_refinement_skipped_count": int(targeted_refinement_skipped),
+                    "targeted_refinement_skip_reason": targeted_refinement_skip_reason,
+                    "quality_refinement_budget_exceeded_count": int(
+                        targeted_refinement_skip_reason == "quality_refinement_budget_exceeded"
+                    ),
+                    "targeted_refinement_skipped_plan": targeted_refinement_skipped_plan,
                     "targeted_refinement_tokens": targeted_token_sum,
                     "targeted_refinement_node_ids": list(targeted_node_ids),
                     "targeted_refinement_edge_ids": list(targeted_edge_ids),
@@ -910,6 +1157,13 @@ class LangGraphWorkflow:
                     "targeted_refinement_plans": targeted_plans,
                     "targeted_refinement_feedback": targeted_feedback.as_dict() if targeted_feedback is not None else None,
                     "targeted_refinement_feedbacks": targeted_feedbacks,
+                    "targeted_refinement_receiver_need": (
+                        targeted_receiver_need.as_dict() if targeted_receiver_need is not None else None
+                    ),
+                    "targeted_refinement_receiver_needs": targeted_receiver_needs,
+                    "targeted_refinement_requested_fragment_ids": (
+                        list(dict.fromkeys(targeted_requested_fragment_ids))
+                    ),
                     "fallback_send_all": fallback_delta is not None,
                     "fallback_tokens": fallback_delta.token_cost if fallback_delta is not None else 0,
                     "fallback_node_ids": list(fallback_delta.node_ids) if fallback_delta is not None else [],
@@ -919,10 +1173,14 @@ class LangGraphWorkflow:
                         if fallback_delta is not None else 0
                     ),
                     "fallback_feedback": fallback_feedback.as_dict() if fallback_feedback is not None else None,
+                    "fallback_receiver_need": (
+                        fallback_receiver_need.as_dict() if fallback_receiver_need is not None else None
+                    ),
                 })
             receiver_visible_after = sorted(receiver_view.visible_node_ids)
             rendered_context_tokens = 0
             rendered_context_node_ids: list[str] = []
+            rendered_context_fragment_ids: list[str] = []
             try:
                 receiver_view_store = self.agent_views.visible_store(receiver)
                 receiver_context_slice = build_context_slice(
@@ -944,9 +1202,11 @@ class LangGraphWorkflow:
                 )
                 rendered_context_tokens = self._token_count(rendered_context)
                 rendered_context_node_ids = list(receiver_context_slice.visible_node_ids)
+                rendered_context_fragment_ids = list(receiver_context_slice.visible_fragment_ids)
             except Exception:
                 rendered_context_tokens = 0
                 rendered_context_node_ids = []
+                rendered_context_fragment_ids = []
             active_targeted_deltas = targeted_deltas if semantic_minimal_policy else []
             total_sent_node_ids = tuple(dict.fromkeys([
                 *delta.node_ids,
@@ -975,7 +1235,7 @@ class LangGraphWorkflow:
                     receiver=receiver,
                     node_ids=item.node_ids,
                     mandatory_root_node_ids=item.root_node_ids,
-                    selected_optional_fragment_ids=(),
+                    selected_optional_fragment_ids=targeted_requested_fragment_ids,
                 )
             ))
             fallback_sent_fragment_ids = (
@@ -996,6 +1256,14 @@ class LangGraphWorkflow:
                 *fallback_sent_fragment_ids,
             ]))
             sent_edge_tokens = sum(estimate_edge_tokens(edge) for edge in state.edges if edge.edge_id in set(total_sent_edge_ids))
+            sent_fragment_token_by_id = {
+                fragment_id: fragment_token_cost((fragment_id,), state.nodes)
+                for fragment_id in total_sent_fragment_ids
+            }
+            sent_fragment_name_by_id = {
+                fragment_id: str(fragment_id).split("#", 1)[1] if "#" in str(fragment_id) else ""
+                for fragment_id in total_sent_fragment_ids
+            }
             initial_sent_tokens = fragment_token_cost(initial_sent_fragment_ids, state.nodes) + sum(
                 estimate_edge_tokens(edge) for edge in state.edges if edge.edge_id in set(delta.edge_ids)
             )
@@ -1009,17 +1277,123 @@ class LangGraphWorkflow:
                 )
                 if fallback_delta is not None else 0
             )
+            feedback_sent_fragment_ids = tuple(dict.fromkeys([
+                *targeted_sent_fragment_ids,
+                *fallback_sent_fragment_ids,
+            ]))
+            feedback_newly_visible_fragment_ids = tuple(
+                fragment_id for fragment_id in feedback_sent_fragment_ids
+                if fragment_id in receiver_view.visible_fragment_ids
+                and fragment_id not in set(receiver_visible_before_fragments)
+            )
+            feedback_newly_rendered_fragment_ids = tuple(
+                fragment_id for fragment_id in feedback_newly_visible_fragment_ids
+                if fragment_id in set(rendered_context_fragment_ids)
+            )
+            feedback_sent_tokens = targeted_sent_tokens + fallback_sent_tokens
+            feedback_newly_visible_tokens = fragment_token_cost(feedback_newly_visible_fragment_ids, state.nodes)
+            feedback_newly_rendered_tokens = fragment_token_cost(feedback_newly_rendered_fragment_ids, state.nodes)
+            feedback_utilization = (
+                feedback_newly_rendered_tokens / feedback_sent_tokens
+                if feedback_sent_tokens else 0.0
+            )
             total_sent_tokens = fragment_token_cost(total_sent_fragment_ids, state.nodes) + sent_edge_tokens
+            core_comm_tokens = 0
+            delta_comm_tokens = 0
+            verification_comm_tokens = 0
+            quality_comm_tokens = 0
+            receiver_seen_hit_count = 0
+            repeated_comm_tokens = 0
+            unique_comm_tokens = sent_edge_tokens
+            seen_before_fragments = set(receiver_visible_before_fragments)
+            quality_fragment_names = {
+                "full_plan", "rationale", "result_metadata", "calculation_trace",
+                "full_feedback", "repair_hint", "error_type", "error_location",
+                "execution_detail",
+            }
+            verification_fragment_names = {"dependencies", "key_operation", "task_input"}
+            for fragment_id, token_cost in sent_fragment_token_by_id.items():
+                if fragment_id in seen_before_fragments:
+                    receiver_seen_hit_count += 1
+                    repeated_comm_tokens += token_cost
+                else:
+                    unique_comm_tokens += token_cost
+                targeted_level = targeted_fragment_level_by_id.get(fragment_id, "")
+                fragment_name = sent_fragment_name_by_id.get(fragment_id, "")
+                if targeted_level == "verification":
+                    verification_comm_tokens += token_cost
+                elif targeted_level == "quality":
+                    quality_comm_tokens += token_cost
+                elif fragment_scope_by_id.get(fragment_id) == MANDATORY_FRAGMENT:
+                    core_comm_tokens += token_cost
+                elif fragment_name in verification_fragment_names:
+                    verification_comm_tokens += token_cost
+                elif fragment_name in quality_fragment_names:
+                    quality_comm_tokens += token_cost
+                else:
+                    delta_comm_tokens += token_cost
+            control_comm_tokens = sent_edge_tokens
+            total_comm_tokens = total_sent_tokens
+            full_state_equivalent_tokens = candidate_tokens + sent_edge_tokens
+            state_delta_tokens = total_comm_tokens
+            duplicate_ratio = repeated_comm_tokens / total_comm_tokens if total_comm_tokens else 0.0
+            incremental_saving = (
+                1.0 - (state_delta_tokens / full_state_equivalent_tokens)
+                if full_state_equivalent_tokens else 0.0
+            )
+            communication_token_breakdown_ok = total_comm_tokens == (
+                core_comm_tokens
+                + delta_comm_tokens
+                + verification_comm_tokens
+                + quality_comm_tokens
+                + control_comm_tokens
+            )
+            unique_repeated_accounting_ok = total_comm_tokens == unique_comm_tokens + repeated_comm_tokens
+            feedback_render_accounting_ok = feedback_sent_tokens >= feedback_newly_rendered_tokens
+            revision_success_count = int(
+                bool(semantic_minimal_policy)
+                and bool(semantic_event.get("semantic_initial_feedback_request", False))
+                and bool(semantic_event.get("semantic_ack", False))
+            )
+            revision_regression_count = int(
+                bool(semantic_minimal_policy)
+                and bool(semantic_event.get("semantic_initial_feedback_request", False))
+                and bool(semantic_event.get("semantic_hard_nack", False))
+            )
+            early_stop_round = (
+                int(semantic_event.get("refinement_rounds", 0) or 0)
+                if semantic_minimal_policy and bool(semantic_event.get("semantic_ack", False))
+                else None
+            )
             total_closure_added = len(delta.closure_added_node_ids) + (
                 sum(len(item.closure_added_node_ids) for item in active_targeted_deltas)
             ) + (
                 len(fallback_delta.closure_added_node_ids) if fallback_delta is not None else 0
             )
             if semantic_minimal_policy:
+                repaired_count = int(semantic_event.get("semantic_missing_repaired_count", 0) or 0)
+                hard_repaired_count = int(semantic_event.get("semantic_hard_repaired_count", 0) or 0)
+                soft_repaired_count = int(semantic_event.get("semantic_soft_repaired_count", 0) or 0)
                 semantic_event.update({
                     "semantic_packet_tokens": initial_sent_tokens,
                     "targeted_refinement_tokens": targeted_sent_tokens,
                     "fallback_tokens": fallback_sent_tokens,
+                    "feedback_transport_tokens": feedback_sent_tokens,
+                    "feedback_sent_tokens": feedback_sent_tokens,
+                    "feedback_newly_visible_tokens": feedback_newly_visible_tokens,
+                    "feedback_newly_rendered_tokens": feedback_newly_rendered_tokens,
+                    "feedback_utilization": feedback_utilization,
+                    "feedback_newly_visible_fragment_ids": list(feedback_newly_visible_fragment_ids),
+                    "feedback_newly_rendered_fragment_ids": list(feedback_newly_rendered_fragment_ids),
+                    "feedback_nack_repair_efficiency": (
+                        repaired_count / feedback_sent_tokens if feedback_sent_tokens else 0.0
+                    ),
+                    "feedback_hard_repair_efficiency": (
+                        hard_repaired_count / feedback_sent_tokens if feedback_sent_tokens else 0.0
+                    ),
+                    "feedback_soft_repair_efficiency": (
+                        soft_repaired_count / feedback_sent_tokens if feedback_sent_tokens else 0.0
+                    ),
                     "wasted_pre_fallback_tokens": (
                         initial_sent_tokens + targeted_sent_tokens
                         if fallback_delta is not None else 0
@@ -1055,6 +1429,25 @@ class LangGraphWorkflow:
                 "communication_token_accounting_ok": total_sent_tokens == (
                     initial_sent_tokens + targeted_sent_tokens + fallback_sent_tokens
                 ),
+                "total_comm_tokens": total_comm_tokens,
+                "core_comm_tokens": core_comm_tokens,
+                "delta_comm_tokens": delta_comm_tokens,
+                "verification_comm_tokens": verification_comm_tokens,
+                "quality_comm_tokens": quality_comm_tokens,
+                "control_comm_tokens": control_comm_tokens,
+                "communication_token_breakdown_ok": communication_token_breakdown_ok,
+                "unique_comm_tokens": unique_comm_tokens,
+                "repeated_comm_tokens": repeated_comm_tokens,
+                "duplicate_ratio": duplicate_ratio,
+                "unique_repeated_accounting_ok": unique_repeated_accounting_ok,
+                "receiver_seen_hit_count": receiver_seen_hit_count,
+                "state_delta_tokens": state_delta_tokens,
+                "full_state_equivalent_tokens": full_state_equivalent_tokens,
+                "incremental_saving": incremental_saving,
+                "feedback_render_accounting_ok": feedback_render_accounting_ok,
+                "revision_success_count": revision_success_count,
+                "revision_regression_count": revision_regression_count,
+                "early_stop_round": early_stop_round,
                 "initial_packet_tokens": initial_sent_tokens,
                 "initial_sent_tokens": initial_sent_tokens,
                 "targeted_sent_tokens": targeted_sent_tokens,
@@ -1063,7 +1456,7 @@ class LangGraphWorkflow:
                 "initial_sent_edge_ids": list(delta.edge_ids),
                 "rendered_context_tokens": rendered_context_tokens,
                 "rendered_context_node_ids": rendered_context_node_ids,
-                "rendered_context_fragment_ids": sorted(receiver_view.visible_fragment_ids),
+                "rendered_context_fragment_ids": sorted(rendered_context_fragment_ids),
                 "closure_added_count": total_closure_added,
                 "candidate_node_ids": [candidate.node_id for candidate in candidates],
                 "candidate_token_by_node": {candidate.node_id: candidate.token_cost for candidate in candidates},
@@ -1099,6 +1492,8 @@ class LangGraphWorkflow:
                 "sent_edge_ids": list(total_sent_edge_ids),
                 "receiver_visible_before_node_ids": receiver_visible_before,
                 "receiver_visible_after_node_ids": receiver_visible_after,
+                "receiver_visible_before_fragment_ids": receiver_visible_before_fragments,
+                "receiver_visible_after_fragment_ids": sorted(receiver_view.visible_fragment_ids),
                 "receiver_visible_before_count": len(receiver_visible_before),
                 "receiver_visible_after_count": len(receiver_visible_after),
             }
@@ -1342,11 +1737,30 @@ class LangGraphWorkflow:
             + action_contract(role, self.task_type)
         )
 
+    def _latest_repair_diagnosis(self) -> dict[str, Any]:
+        verification = self.store.latest_valid(self.task_id, self.branch_id, "verification")
+        if verification is None or verification.status not in {"need_fix", "uncertain"}:
+            return {}
+        content = verification.content if isinstance(verification.content, dict) else {}
+        return {
+            "target": content.get("target", "result"),
+            "error_type": content.get("error_type", ""),
+            "error_location": content.get("error_location", ""),
+            "reason": content.get("reason", ""),
+            "repair_instruction": content.get("repair_instruction", ""),
+            "preserve": list(content.get("preserve", [])) if isinstance(content.get("preserve", []), list) else [],
+            "requested_fragments": (
+                list(content.get("requested_fragments", []))
+                if isinstance(content.get("requested_fragments", []), list)
+                else []
+            ),
+        }
+
     def _action_role_suffix(self, role: str, mode: str) -> str:
         """Give the small local model an explicit, state-aware next-action target."""
         if not self.enable_action_constraints:
             return "Emit exactly one Action JSON object now."
-        missing = self._completion_errors(role)
+        missing = self._completion_errors(role, mode=mode)
         if missing:
             boundary = "; ".join(missing)
             instruction = f"Current stage is incomplete. Missing boundaries: {boundary}."
@@ -1407,6 +1821,53 @@ class LangGraphWorkflow:
                     "SUPPORTING_FACT evidence. Emit exactly one JSON object and nothing else, "
                     'for example: {"op":"set_result","id":"answer","value":"short answer"}.'
                 )
+        if role == "solver" and mode == "repair":
+            diagnosis = self._latest_repair_diagnosis()
+            diagnosis_text = json.dumps(diagnosis, ensure_ascii=False, separators=(",", ":"))
+            repair_directive = (
+                f"Use this critic diagnosis exactly: {diagnosis_text}. "
+                "Modify only the faulty part identified by error_location. "
+                "Preserve every item listed in preserve. Do not repeat the same failed repair; "
+                "the new artifact must address repair_instruction."
+            )
+            if self.task_type == "code_generation":
+                return (
+                    "The critic requested repair. "
+                    + repair_directive
+                    + " Emit revised Python code as exactly one JSON "
+                    'object, for example: {"op":"emit_code","code":"def solution(...):\\n    ..."} . '
+                    "Do not emit done until revised code exists after the latest need_fix verification."
+                )
+            if self.task_type in {"multiple_choice", "multihop_qa"}:
+                return (
+                    "The critic requested repair. "
+                    + repair_directive
+                    + " Emit a revised result as exactly one JSON object "
+                    "using set_result. Do not emit done until revised result exists after the "
+                    "latest need_fix verification."
+                )
+            return (
+                "The critic requested repair. "
+                + repair_directive
+                + " Emit exactly one revised result with set_result. Do not emit calculate, "
+                "do not rebuild the full solution, and do not emit done until the revised result "
+                "exists after the latest need_fix verification."
+            )
+        if role == "critic" and missing:
+            if self.task_type == "code_generation":
+                return (
+                    "Verify the latest execution/result for the latest code. If tests pass, emit "
+                    '{"op":"verify","target":"result","status":"verified","error_type":"",'
+                    '"error_location":"","reason":"","repair_instruction":"","preserve":[],'
+                    '"requested_fragments":[]}. If tests fail, emit need_fix with non-empty '
+                    "error_type, error_location, and repair_instruction. The instruction must say "
+                    "what to change and what to preserve; do not emit a bare need_fix flag."
+                )
+            return (
+                "Verify the latest result. If correct, emit verify with status=verified and empty "
+                "diagnostic fields. If incorrect, emit need_fix with non-empty error_type, "
+                "error_location, and repair_instruction; do not emit a bare need_fix flag."
+            )
         return f"{instruction} Emit exactly one new Action JSON object now."
 
     def _numeric_fact_ids(self) -> list[str]:
@@ -1426,9 +1887,49 @@ class LangGraphWorkflow:
 
         return sorted(set(ids), key=key)
 
-    def _completion_errors(self, role: str) -> list[str]:
+    def _completion_errors(self, role: str, *, mode: str = "normal") -> list[str]:
         def exists(logical_id: str) -> bool:
             return self.store.latest_valid(self.task_id, self.branch_id, logical_id) is not None
+
+        def latest(logical_id: str):
+            return self.store.latest_valid(self.task_id, self.branch_id, logical_id)
+
+        def newer_than(node: Any, reference: Any) -> bool:
+            if node is None or reference is None:
+                return False
+            return (
+                float(getattr(node, "created_at", 0.0) or 0.0),
+                int(getattr(node, "version", 0) or 0),
+                str(getattr(node, "node_id", "")),
+            ) > (
+                float(getattr(reference, "created_at", 0.0) or 0.0),
+                int(getattr(reference, "version", 0) or 0),
+                str(getattr(reference, "node_id", "")),
+            )
+
+        def repair_anchor():
+            verification = latest("verification")
+            if verification is not None and verification.status in {"need_fix", "uncertain"}:
+                state = self.store.snapshot()
+                target_edge = next(
+                    (
+                        edge for edge in state.edges
+                        if edge.source == verification.node_id
+                        and edge.relation == "contradicts"
+                    ),
+                    None,
+                )
+                if target_edge is not None:
+                    target = state.nodes.get(target_edge.target)
+                    if target is not None:
+                        return target
+                return verification
+            return latest("error")
+
+        def current_critic_target():
+            if self.task_type == "code_generation":
+                return latest("result") or latest("execution") or latest("code")
+            return latest("result")
 
         errors: list[str] = []
         if role == "planner":
@@ -1452,18 +1953,47 @@ class LangGraphWorkflow:
             if self.task_type == "multiple_choice" and not any(node.type == "choice" for node in nodes):
                 errors.append("missing choice")
         elif role == "solver":
+            anchor = repair_anchor() if mode == "repair" else None
             if self.task_type == "code_generation":
-                errors.append("missing code") if not exists("code") else None
+                code = latest("code")
+                if mode == "repair":
+                    errors.append("missing revised code") if not newer_than(code, anchor) else None
+                else:
+                    errors.append("missing code") if code is None else None
             elif self.task_type in {"multiple_choice", "multihop_qa"}:
-                errors.append("missing result") if not exists("result") else None
+                result = latest("result")
+                if mode == "repair":
+                    errors.append("missing revised result") if not newer_than(result, anchor) else None
+                else:
+                    errors.append("missing result") if result is None else None
             elif self.task_type not in {"marble_research", "marble_bargaining", "marble_database"}:
-                errors.append("missing calculation") if not exists("calculation") else None
-            if self.task_type != "code_generation":
-                errors.append("missing result") if not exists("result") else None
+                calculation = latest("calculation")
+                result = latest("result")
+                if mode == "repair":
+                    errors.append("missing revised result") if not newer_than(result, anchor) else None
+                else:
+                    errors.append("missing calculation") if calculation is None else None
+                    errors.append("missing result") if result is None else None
+            else:
+                result = latest("result")
+                if mode == "repair":
+                    errors.append("missing revised result") if not newer_than(result, anchor) else None
+                else:
+                    errors.append("missing result") if result is None else None
         elif role == "critic":
-            errors.append("missing verification") if not exists("verification") else None
+            verification = latest("verification")
+            target = current_critic_target()
+            if verification is None:
+                errors.append("missing verification")
+            elif target is not None and not newer_than(verification, target):
+                errors.append("missing updated verification")
         elif role == "final_solver":
-            errors.append("missing final_answer") if not exists("final_answer") else None
+            final_answer = latest("final_answer")
+            verification = latest("verification")
+            if final_answer is None:
+                errors.append("missing final_answer")
+            elif verification is not None and verification.status == "verified" and not newer_than(final_answer, verification):
+                errors.append("missing updated final_answer")
         return errors
 
     def _tool_node(self, state: WorkflowState) -> dict[str, Any]:
@@ -1513,7 +2043,7 @@ class LangGraphWorkflow:
 
     def _route_after_critic(self, state: WorkflowState) -> str:
         verification = self.store.latest_valid(self.task_id, state.get("branch_id", self.branch_id), "verification")
-        if verification is not None and verification.status == "verified":
+        if verification is not None and verification.status == "verified" and not self._completion_errors("critic"):
             return "finalizer"
         if int(state.get("round_id", 0)) >= self.max_rounds:
             return "finalizer"

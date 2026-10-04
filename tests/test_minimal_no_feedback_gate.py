@@ -96,7 +96,7 @@ def test_phase6_minimal_insufficient_returns_unresolved_nack_without_fallback(tm
     assert event["semantic_ack"] is False
     assert event["semantic_nack"] is True
     assert event["semantic_nack_unresolved"] is True
-    assert event["semantic_feedback"]["type"] == "NACK"
+    assert event["semantic_feedback"]["type"] == "HARD_NACK"
     assert event["semantic_feedback"]["missing_semantics"] == ["validation_signal"]
     assert event["fallback_send_all"] is False
     assert event["fallback_tokens"] == 0

@@ -211,19 +211,19 @@ def build_action_constraint(
             reason = "domain-specific planner boundary is incomplete"
             fixed_actions = ()
     elif role == "solver" and task_type in {"numeric_solve", "numeric_comparison"}:
-        if "missing calculation" in missing_set:
+        if any("calculation" in item for item in missing_set):
             allowed, reason = ("calculate",), "calculation is missing"
-        elif "missing result" in missing_set:
+        elif any("result" in item for item in missing_set):
             allowed, reason = ("set_result",), "result is missing after calculation"
         else:
             allowed, reason = ("done",), "solver boundaries are complete"
     elif role == "solver" and task_type == "code_generation":
-        if "missing code" in missing_set:
+        if any("code" in item for item in missing_set):
             allowed, reason = ("emit_code",), "the coding artifact is missing"
         else:
             allowed, reason = ("done",), "the coding artifact is complete"
     elif role == "solver" and task_type in {"multiple_choice", "multihop_qa", "marble_research", "marble_bargaining", "marble_database"}:
-        if "missing result" in missing_set:
+        if any("result" in item for item in missing_set):
             allowed, reason = ("set_result",), "the domain result artifact is missing"
         else:
             allowed, reason = ("done",), "solver boundaries are complete"

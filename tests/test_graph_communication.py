@@ -114,6 +114,9 @@ def test_policy_factory_selects_supported_policies():
     assert make_communication_policy("random_keep_50").name == "random_keep_50"
     assert make_communication_policy("random_keep_25").name == "random_keep_25"
     assert make_communication_policy("closure_aware_heuristic").name == "closure_aware_heuristic"
+    assert make_communication_policy("random_same_budget").name == "random_same_budget"
+    assert make_communication_policy("static_utility").name == "static_utility"
+    assert make_communication_policy("receiver_aware_heuristic").name == "receiver_aware_heuristic"
     for removed in ("novelty_only", "novelty_closure", "budgeted_graph_heuristic", "random_keep_100"):
         with pytest.raises(ValueError):
             make_communication_policy(removed)

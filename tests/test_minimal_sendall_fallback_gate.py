@@ -142,7 +142,7 @@ def test_phase7_stage_mandatory_result_is_sent_before_critic_context(tmp_path) -
     assert result.node_id in event["semantic_packet_root_node_ids"]
 
 
-def test_phase7_fallback_rechecks_contract_and_can_remain_nack(tmp_path) -> None:
+def test_phase7_soft_nack_does_not_trigger_sendall_fallback(tmp_path) -> None:
     store = _base_store()
     result = store.add_node(
         task_id="t",
@@ -160,15 +160,21 @@ def test_phase7_fallback_rechecks_contract_and_can_remain_nack(tmp_path) -> None
         branch_id="main",
     )[0]
 
-    assert event["fallback_send_all"] is True
-    assert event["fallback_feedback"]["type"] == "NACK"
-    assert event["fallback_feedback"]["round_index"] == 1
-    assert event["fallback_feedback"]["missing_semantics"] == ["support_dependencies"]
-    assert event["semantic_feedback"] == event["fallback_feedback"]
+    assert event["fallback_send_all"] is False
+    assert event["fallback_feedback"] is None
     assert event["semantic_ack"] is False
-    assert event["semantic_nack"] is True
-    assert event["semantic_nack_unresolved"] is True
+    assert event["semantic_feedback_request"] is True
+    assert event["semantic_nack"] is False
+    assert event["semantic_hard_nack"] is False
+    assert event["semantic_soft_nack"] is True
+    assert event["semantic_verification_nack"] is True
+    assert event["semantic_nack_unresolved"] is False
+    assert event["semantic_hard_contract_satisfied"] is True
     assert event["semantic_final_contract_satisfied"] is False
+    assert event["semantic_feedback"]["type"] == "VERIFICATION_REQUEST"
+    assert event["semantic_feedback"]["soft_missing_semantics"] == ["support_dependencies"]
+    assert event["semantic_feedback_decision"]["action"] == "REPORT_INSUFFICIENT"
+    assert event["semantic_feedback_decision"]["allow_fallback"] is False
 
 
 def test_phase7_fallback_is_not_hidden_in_parser_compiler_slicer_or_closure() -> None:

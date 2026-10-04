@@ -63,3 +63,15 @@ def test_done_operation_is_constrained_to_a_complete_json_object():
     constraint.bind(CharTokenizer())
     done_ids = [ord(char) for char in '{"op":"done"}']
     assert constraint.is_complete(done_ids)
+
+
+def test_numeric_repair_is_constrained_to_revised_result_only():
+    constraint = build_action_constraint(
+        role="solver",
+        task_type="numeric_solve",
+        missing=["missing revised result"],
+        task_text="A has 2 and B has 3.",
+        existing_logical_ids=("task", "query_spec", "facts", "plan", "plan_steps", "calculation", "result", "verification"),
+    )
+
+    assert constraint.allowed_ops == ("set_result",)

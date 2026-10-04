@@ -40,7 +40,7 @@ def test_phase3_contract_satisfied_builds_ack() -> None:
     )
 
     assert isinstance(feedback, SemanticACK)
-    assert feedback.as_dict()["type"] == "ACK"
+    assert feedback.as_dict()["type"] == "NONE"
     assert feedback.satisfied_requirements == ("final_candidate",)
     assert feedback.recoverable_requirements == ("validation_signal",)
 
@@ -64,7 +64,7 @@ def test_phase3_one_missing_semantic_builds_nack() -> None:
     )
 
     assert isinstance(feedback, SemanticNACK)
-    assert feedback.as_dict()["type"] == "NACK"
+    assert feedback.as_dict()["type"] == "HARD_NACK"
     assert feedback.missing_semantics == ("validation_signal",)
 
 
@@ -142,7 +142,7 @@ def test_phase3_gate_metrics_are_clean() -> None:
         )
     ]
 
-    semantic_missing_to_nack_rate = sum(isinstance(item, SemanticNACK) for item in feedbacks) / len(feedbacks)
+    semantic_missing_to_nack_rate = sum(item.as_dict()["type"] == "HARD_NACK" for item in feedbacks) / len(feedbacks)
     legacy_missing_node_failure = 0
     nack_side_effect = 0
 

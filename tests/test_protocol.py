@@ -37,6 +37,24 @@ def test_action_fields_are_exact_and_task_is_not_an_operation() -> None:
     assert validate_action("solver", {"op": "set_execution", "content": {}, "success": "true"}, task_type="code_generation")
 
 
+def test_need_fix_verify_requires_structured_repair_feedback() -> None:
+    bare = {"op": "verify", "target": "result", "status": "need_fix"}
+    assert validate_action("critic", bare, task_type="code_generation")
+
+    detailed = {
+        "op": "verify",
+        "target": "result",
+        "status": "need_fix",
+        "error_type": "boundary_condition",
+        "error_location": "function body",
+        "reason": "The empty input case raises an index error.",
+        "repair_instruction": "Handle the empty list before reading the last element.",
+        "preserve": ["function signature"],
+        "requested_fragments": ["code#function_body"],
+    }
+    assert validate_action("critic", detailed, task_type="code_generation") == []
+
+
 def test_action_contract_is_role_scoped() -> None:
     contract = action_contract("planner", "numeric_solve")
     assert "add_fact" in contract

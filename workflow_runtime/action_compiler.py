@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .graph_store import GraphStore
-from .protocol import require_exact_copy, validate_action
+from .protocol import normalize_action_payload, require_exact_copy, validate_action
 from .tools import ToolError, ToolRegistry
 
 
@@ -49,6 +49,7 @@ class ActionCompiler:
         self._node_ref_context = copy.deepcopy(context or {})
 
     def apply(self, role: str, action: dict[str, Any]) -> CompilationResult:
+        action = normalize_action_payload(action)
         errors = validate_action(role, action, task_type=self.task_type)
         if errors:
             raise ActionCompilationError(f"invalid {role} Action: {'; '.join(errors)}")
@@ -427,14 +428,31 @@ class ActionCompiler:
             raise ActionCompilationError(f"verify target does not exist: {action['target']}")
         target_logical_id = target.logical_id
         content = {"target": target_logical_id, "status": action["status"]}
+        if not verified:
+            content.update({
+                "error_type": action["error_type"],
+                "error_location": action["error_location"],
+                "reason": action.get("reason", ""),
+                "repair_instruction": action["repair_instruction"],
+                "preserve": list(action.get("preserve", [])),
+                "requested_fragments": list(action.get("requested_fragments", [])),
+            })
         if self._same_latest_content("verification", content):
-            return ()
+            latest_verification = self.store.latest_valid(self.task_id, self.branch_id, "verification")
+            state = self.store.snapshot()
+            if latest_verification is not None and any(
+                edge.source == latest_verification.node_id
+                and edge.target == target.node_id
+                and edge.relation in {"verifies", "contradicts"}
+                for edge in state.edges
+            ):
+                return ()
         verification_id = self._add_node(
             role,
             logical_id="verification",
             node_type="verification",
             content=content,
-            status="verified" if verified else "need_fix",
+            status="verified" if verified else action["status"],
         )
         relation = "verifies" if verified else "contradicts"
         self.store.add_edge(source=verification_id, target=target.node_id, relation=relation, created_by_role=role)

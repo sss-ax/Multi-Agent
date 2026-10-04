@@ -18,6 +18,12 @@ class SemanticStatus(str, Enum):
     MISSING = "MISSING"
 
 
+class SemanticRequirementSeverity(str, Enum):
+    HARD = "hard"
+    VERIFICATION = "verification"
+    REFINEMENT = "refinement"
+
+
 @dataclass(frozen=True)
 class SemanticRequirement:
     """A structured semantic object the receiver must have or recover."""
@@ -29,17 +35,22 @@ class SemanticRequirement:
     acceptable_logical_ids: tuple[str, ...] = ()
     acceptable_types: tuple[str, ...] = ()
     description: str = ""
+    severity: str = SemanticRequirementSeverity.HARD.value
 
     def __post_init__(self) -> None:
         if not self.kind.strip():
             raise ValueError("semantic requirement kind must be non-empty")
         if self.min_count < 1:
             raise ValueError("semantic requirement min_count must be positive")
+        severity = str(self.severity).strip().lower()
+        if severity not in {item.value for item in SemanticRequirementSeverity}:
+            raise ValueError(f"unknown semantic requirement severity: {self.severity}")
         object.__setattr__(self, "kind", self.kind.strip())
         object.__setattr__(self, "target_logical_id", _clean_optional(self.target_logical_id))
         object.__setattr__(self, "required_type", _clean_optional(self.required_type))
         object.__setattr__(self, "acceptable_logical_ids", _clean_tuple(self.acceptable_logical_ids))
         object.__setattr__(self, "acceptable_types", _clean_tuple(self.acceptable_types))
+        object.__setattr__(self, "severity", severity)
 
     def candidate_logical_ids(self) -> tuple[str, ...]:
         values = []
@@ -83,6 +94,7 @@ class SemanticRequirement:
             "acceptable_logical_ids": list(self.acceptable_logical_ids),
             "acceptable_types": list(self.acceptable_types),
             "description": self.description,
+            "severity": self.severity,
         }
 
 
@@ -341,6 +353,7 @@ _DEFAULT_REQUIREMENTS_BY_PAIR: dict[tuple[str, str], tuple[SemanticRequirement, 
             kind="support_dependencies",
             acceptable_types=("calculation", "plan_steps", "fact", "facts", "requirements", "test"),
             description="direct support needed to inspect the candidate",
+            severity=SemanticRequirementSeverity.VERIFICATION.value,
         ),
     ),
     ("critic", "final_solver"): (

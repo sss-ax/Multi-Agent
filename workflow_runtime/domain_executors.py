@@ -7,6 +7,7 @@ operate on nodes already present in the graph slice.
 
 from __future__ import annotations
 
+import ast
 import json
 import math
 import re
@@ -68,7 +69,257 @@ def _python_code(value: Any) -> str:
     fenced = re.search(r"```(?:python|py)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
     if fenced:
         text = fenced.group(1)
-    return text.strip()
+    return strip_top_level_candidate_tests(text.strip())
+
+
+def strip_top_level_candidate_tests(code: str) -> str:
+    """Remove model-generated top-level tests from a candidate program.
+
+    Benchmark tests must come from the dataset adapter.  Top-level asserts in
+    model output are self-generated tests and must not run during candidate
+    setup; assertions inside functions/classes are preserved as implementation.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
+    kept = [
+        node for node in tree.body
+        if not isinstance(node, ast.Assert) and not _is_main_guard(node)
+    ]
+    if len(kept) == len(tree.body):
+        return code
+    if not kept:
+        return code
+    tree.body = kept
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree)
+
+
+def _is_main_guard(node: ast.AST) -> bool:
+    if not isinstance(node, ast.If):
+        return False
+    test = node.test
+    return (
+        isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Name)
+        and test.left.id == "__name__"
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.Eq)
+        and len(test.comparators) == 1
+        and isinstance(test.comparators[0], ast.Constant)
+        and test.comparators[0].value == "__main__"
+    )
+
+
+def _requirement_imports(graph: Any) -> str:
+    imports: List[str] = []
+    for node in _nodes(graph, "requirements"):
+        value = _json(node.content)
+        text = value.get("text", value) if isinstance(value, dict) else value
+        for line in str(text or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("import ", "from ")) and stripped not in imports:
+                imports.append(stripped)
+    return "\n".join(imports)
+
+
+def execute_python_tests_detailed(
+    *,
+    code: str,
+    tests: Iterable[Any],
+    setup: str = "",
+    timeout: int = 5,
+) -> DomainExecution:
+    """Execute Python code against tests and return structured failure detail."""
+    test_text = [str(test.get("text", test)) if isinstance(test, dict) else str(test) for test in tests]
+    code = strip_top_level_candidate_tests(code)
+    harness = {"setup": setup, "code": code, "tests": test_text}
+    script = r'''
+import ast
+import json
+import sys
+import traceback
+
+payload = json.loads(sys.stdin.read())
+ns = {}
+
+def safe_repr(value):
+    try:
+        return repr(value)
+    except Exception:
+        return f"<unreprable {type(value).__name__}>"
+
+def function_name(expr):
+    if isinstance(expr, ast.Call):
+        fn = expr.func
+        if isinstance(fn, ast.Name):
+            return fn.id
+        if isinstance(fn, ast.Attribute):
+            return fn.attr
+    for node in ast.walk(expr):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            if isinstance(fn, ast.Name):
+                return fn.id
+            if isinstance(fn, ast.Attribute):
+                return fn.attr
+    return ""
+
+def call_input_repr(expr):
+    if not isinstance(expr, ast.Call):
+        return ""
+    parts = []
+    for arg in expr.args:
+        try:
+            parts.append(ast.unparse(arg))
+        except Exception:
+            parts.append("<arg>")
+    for kw in expr.keywords:
+        try:
+            parts.append(f"{kw.arg}={ast.unparse(kw.value)}")
+        except Exception:
+            parts.append(f"{kw.arg}=<arg>")
+    return ", ".join(parts)
+
+def classify(exc):
+    name = type(exc).__name__
+    if isinstance(exc, SyntaxError):
+        return "syntax_error"
+    if isinstance(exc, ImportError):
+        return "import_error"
+    if isinstance(exc, NameError):
+        return "name_error"
+    if isinstance(exc, TypeError):
+        return "type_error"
+    if isinstance(exc, AssertionError):
+        return "assertion_failure"
+    return "runtime_exception"
+
+try:
+    setup = payload.get("setup") or ""
+    if setup:
+        exec(setup, ns)
+    exec(payload["code"], ns)
+except Exception as exc:
+    print(json.dumps({
+        "stage": "compile_or_setup",
+        "kind": classify(exc),
+        "exception_type": type(exc).__name__,
+        "exception": str(exc),
+        "traceback": traceback.format_exc()[-2000:],
+    }))
+    sys.exit(1)
+
+for index, test in enumerate(payload.get("tests") or []):
+    source = str(test)
+    try:
+        parsed = ast.parse(source)
+    except SyntaxError as exc:
+        print(json.dumps({
+            "stage": "test_parse",
+            "kind": "syntax_error",
+            "failed_test_index": index,
+            "failed_test": source,
+            "exception_type": type(exc).__name__,
+            "exception": str(exc),
+            "traceback": traceback.format_exc()[-2000:],
+        }))
+        sys.exit(1)
+    stmt = parsed.body[0] if parsed.body else None
+    if (
+        isinstance(stmt, ast.Assert)
+        and isinstance(stmt.test, ast.Compare)
+        and len(stmt.test.ops) == 1
+        and isinstance(stmt.test.ops[0], ast.Eq)
+        and len(stmt.test.comparators) == 1
+    ):
+        try:
+            actual = eval(compile(ast.Expression(stmt.test.left), "<mbpp-left>", "eval"), ns)
+            expected = eval(compile(ast.Expression(stmt.test.comparators[0]), "<mbpp-right>", "eval"), ns)
+        except Exception as exc:
+            print(json.dumps({
+                "stage": "test",
+                "kind": classify(exc),
+                "failed_test_index": index,
+                "test_id": f"test_{index}",
+                "failed_test": source,
+                "test_expression": source[6:].strip() if source.strip().startswith("assert ") else source,
+                "function_name": function_name(stmt.test.left),
+                "input_repr": call_input_repr(stmt.test.left),
+                "exception_type": type(exc).__name__,
+                "exception": str(exc),
+                "traceback": traceback.format_exc()[-2000:],
+            }))
+            sys.exit(1)
+        if actual != expected:
+            print(json.dumps({
+                "stage": "test",
+                "kind": "assertion_failure",
+                "failed_test_index": index,
+                "test_id": f"test_{index}",
+                "failed_test": source,
+                "test_expression": source[6:].strip() if source.strip().startswith("assert ") else source,
+                "function_name": function_name(stmt.test.left),
+                "input_repr": call_input_repr(stmt.test.left),
+                "expected": safe_repr(expected),
+                "actual": safe_repr(actual),
+                "exception_type": "AssertionError",
+                "exception": "",
+                "traceback": "",
+            }))
+            sys.exit(1)
+        continue
+    try:
+        exec(source, ns)
+    except Exception as exc:
+        print(json.dumps({
+            "stage": "test",
+            "kind": classify(exc),
+            "failed_test_index": index,
+            "failed_test": source,
+            "exception_type": type(exc).__name__,
+            "exception": str(exc),
+            "traceback": traceback.format_exc()[-2000:],
+        }))
+        sys.exit(1)
+
+print(json.dumps({"stage": "tests", "kind": "passed", "status": "passed", "tests": len(payload.get("tests") or [])}))
+'''
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-I", "-c", script],
+            input=json.dumps(harness),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        execution = {"domain": "mbpp", "status": "timeout", "kind": "timeout", "tests": len(test_text)}
+        return DomainExecution(False, execution=execution, errors=["python test execution timed out"])
+    raw = (completed.stdout or completed.stderr or "").strip()
+    try:
+        detail = json.loads(raw.splitlines()[-1]) if raw else {}
+    except json.JSONDecodeError:
+        detail = {
+            "stage": "unknown",
+            "kind": "runtime_exception",
+            "stderr": completed.stderr[-2000:],
+            "stdout": completed.stdout[-2000:],
+        }
+    detail["domain"] = "mbpp"
+    detail["status"] = "passed" if completed.returncode == 0 else "failed"
+    detail["tests"] = len(test_text)
+    detail["returncode"] = completed.returncode
+    if completed.returncode != 0:
+        error = (
+            detail.get("failed_test")
+            or detail.get("exception")
+            or detail.get("kind")
+            or "MBPP tests failed"
+        )
+        return DomainExecution(False, execution=detail, errors=[str(error)])
+    return DomainExecution(True, {"code": code, "tests_passed": True}, detail)
 
 
 def _table_cells(graph: Any) -> Dict[str, Any]:
@@ -167,16 +418,8 @@ def execute_mbpp(graph: Any, payload: Mapping[str, Any]) -> DomainExecution:
     if not isinstance(code, str) or not code.strip():
         return DomainExecution(False, execution={"domain": "mbpp", "status": "failed"}, errors=["no executable code node"])
     setup = "\n".join(str(item.get("setup", "")) for item in tests if isinstance(item, dict))
-    test_text = [item.get("text", item) if isinstance(item, dict) else item for item in tests]
-    script = setup + "\n" + code + "\n" + "\n".join(str(test) for test in test_text)
-    try:
-        completed = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True, text=True, timeout=5)
-    except subprocess.TimeoutExpired:
-        return DomainExecution(False, execution={"domain": "mbpp", "status": "timeout", "tests": len(tests)}, errors=["python test execution timed out"])
-    execution = {"domain": "mbpp", "status": "passed" if completed.returncode == 0 else "failed", "tests": len(tests), "returncode": completed.returncode, "stderr": completed.stderr[-2000:]}
-    if completed.returncode != 0:
-        return DomainExecution(False, execution=execution, errors=[completed.stderr[-2000:] or "MBPP tests failed"])
-    return DomainExecution(True, {"code": code, "tests_passed": True}, execution)
+    full_setup = "\n".join(part for part in (_requirement_imports(graph), setup) if part)
+    return execute_python_tests_detailed(code=code, tests=tests, setup=full_setup)
 
 
 def execute_domain(task_type: str, graph: Any, payload: Mapping[str, Any]) -> DomainExecution:

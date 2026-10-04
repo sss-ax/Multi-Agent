@@ -283,7 +283,11 @@ def add_source_nodes(workflow: Any, graph: Any, row: Dict[str, Any], sample_id: 
         for index, link in enumerate(row.get("evidence_links", []), start=1):
             add(f"evidence_link_{index}", "evidence_link", link)
     elif task_type == "multiple_choice":
-        for index, choice in enumerate(row.get("choices", []), start=1):
+        choices = row.get("choices", [])
+        add("choice_schema", "choice_schema", {
+            "allowed_labels": [str(choice.get("label", "")).strip().upper() for choice in choices if isinstance(choice, dict)],
+        })
+        for index, choice in enumerate(choices, start=1):
             add(f"choice_{index}", "choice", choice)
     elif task_type == "code_generation":
         add("requirements", "requirements", row.get("requirements", {"text": row["question"]}))
@@ -473,7 +477,7 @@ def score_prediction(row: Dict[str, Any], predicted: Any) -> Dict[str, Any]:
     return {"correct": correct, "exact_match": float(correct), "predicted_answer": predicted}
 
 
-def communication_totals(records: List[Dict[str, Any]]) -> Dict[str, int]:
+def communication_totals(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     totals = {
         "graph_delta_candidate_tokens": 0,
         "graph_delta_sent_tokens": 0,
@@ -485,8 +489,46 @@ def communication_totals(records: List[Dict[str, Any]]) -> Dict[str, int]:
         "graph_delta_mandatory_root_tokens": 0,
         "graph_delta_optional_root_tokens": 0,
         "graph_delta_selected_optional_root_tokens": 0,
+        "semantic_nack_count": 0,
+        "semantic_hard_nack_count": 0,
+        "semantic_soft_nack_count": 0,
+        "semantic_verification_nack_count": 0,
+        "semantic_quality_nack_count": 0,
+        "semantic_initial_nack_count": 0,
+        "semantic_initial_hard_nack_count": 0,
+        "semantic_initial_soft_nack_count": 0,
+        "semantic_initial_verification_nack_count": 0,
+        "semantic_initial_quality_nack_count": 0,
+        "semantic_missing_repaired_count": 0,
+        "semantic_hard_repaired_count": 0,
+        "semantic_soft_repaired_count": 0,
+        "semantic_verification_repaired_count": 0,
+        "semantic_quality_repaired_count": 0,
+        "feedback_sent_tokens": 0,
+        "feedback_transport_tokens": 0,
+        "feedback_newly_visible_tokens": 0,
+        "feedback_newly_rendered_tokens": 0,
+        "total_comm_tokens": 0,
+        "core_comm_tokens": 0,
+        "delta_comm_tokens": 0,
+        "verification_comm_tokens": 0,
+        "quality_comm_tokens": 0,
+        "control_comm_tokens": 0,
+        "unique_comm_tokens": 0,
+        "repeated_comm_tokens": 0,
+        "receiver_seen_hit_count": 0,
+        "state_delta_tokens": 0,
+        "full_state_equivalent_tokens": 0,
+        "revision_success_count": 0,
+        "revision_regression_count": 0,
+        "communication_token_accounting_errors": 0,
+        "communication_token_breakdown_errors": 0,
+        "feedback_render_accounting_errors": 0,
+        "unique_repeated_accounting_errors": 0,
+        "targeted_refinement_skipped_count": 0,
+        "quality_refinement_budget_exceeded_count": 0,
     }
-    by_pair: Dict[str, Dict[str, int]] = {}
+    by_pair: Dict[str, Dict[str, Any]] = {}
     for record in records:
         for action_log in record.get("runtime_summary", {}).get("records", []):
             for event in action_log.get("communication", []):
@@ -502,6 +544,51 @@ def communication_totals(records: List[Dict[str, Any]]) -> Dict[str, int]:
                 totals["graph_delta_mandatory_root_tokens"] += int(event.get("mandatory_root_tokens", 0) or 0)
                 totals["graph_delta_optional_root_tokens"] += int(event.get("optional_root_tokens", 0) or 0)
                 totals["graph_delta_selected_optional_root_tokens"] += int(event.get("selected_optional_root_tokens", 0) or 0)
+                totals["semantic_nack_count"] += int(bool(event.get("semantic_nack", False)))
+                totals["semantic_hard_nack_count"] += int(bool(event.get("semantic_hard_nack", False)))
+                totals["semantic_soft_nack_count"] += int(bool(event.get("semantic_soft_nack", False)))
+                totals["semantic_verification_nack_count"] += int(bool(event.get("semantic_verification_nack", False)))
+                totals["semantic_quality_nack_count"] += int(bool(event.get("semantic_quality_nack", False)))
+                totals["semantic_initial_nack_count"] += int(bool(event.get("semantic_initial_nack", False)))
+                totals["semantic_initial_hard_nack_count"] += int(bool(event.get("semantic_initial_hard_nack", False)))
+                totals["semantic_initial_soft_nack_count"] += int(bool(event.get("semantic_initial_soft_nack", False)))
+                totals["semantic_initial_verification_nack_count"] += int(bool(event.get("semantic_initial_verification_nack", False)))
+                totals["semantic_initial_quality_nack_count"] += int(bool(event.get("semantic_initial_quality_nack", False)))
+                for key in (
+                    "semantic_missing_repaired_count",
+                    "semantic_hard_repaired_count",
+                    "semantic_soft_repaired_count",
+                    "semantic_verification_repaired_count",
+                    "semantic_quality_repaired_count",
+                    "feedback_sent_tokens",
+                    "feedback_transport_tokens",
+                    "feedback_newly_visible_tokens",
+                    "feedback_newly_rendered_tokens",
+                    "total_comm_tokens",
+                    "core_comm_tokens",
+                    "delta_comm_tokens",
+                    "verification_comm_tokens",
+                    "quality_comm_tokens",
+                    "control_comm_tokens",
+                    "unique_comm_tokens",
+                    "repeated_comm_tokens",
+                    "receiver_seen_hit_count",
+                    "state_delta_tokens",
+                    "full_state_equivalent_tokens",
+                    "revision_success_count",
+                    "revision_regression_count",
+                    "targeted_refinement_skipped_count",
+                    "quality_refinement_budget_exceeded_count",
+                ):
+                    totals[key] += int(event.get(key, 0) or 0)
+                if not bool(event.get("communication_token_accounting_ok", True)):
+                    totals["communication_token_accounting_errors"] += 1
+                if not bool(event.get("communication_token_breakdown_ok", True)):
+                    totals["communication_token_breakdown_errors"] += 1
+                if not bool(event.get("feedback_render_accounting_ok", True)):
+                    totals["feedback_render_accounting_errors"] += 1
+                if not bool(event.get("unique_repeated_accounting_ok", True)):
+                    totals["unique_repeated_accounting_errors"] += 1
                 pair_totals["graph_communication_events"] += 1
                 pair_totals["graph_delta_candidate_tokens"] += int(event.get("candidate_tokens", 0) or 0)
                 pair_totals["graph_delta_sent_tokens"] += int(event.get("sent_tokens", 0) or 0)
@@ -512,7 +599,159 @@ def communication_totals(records: List[Dict[str, Any]]) -> Dict[str, int]:
                 pair_totals["graph_delta_mandatory_root_tokens"] += int(event.get("mandatory_root_tokens", 0) or 0)
                 pair_totals["graph_delta_optional_root_tokens"] += int(event.get("optional_root_tokens", 0) or 0)
                 pair_totals["graph_delta_selected_optional_root_tokens"] += int(event.get("selected_optional_root_tokens", 0) or 0)
-    totals["graph_delta_by_pair"] = by_pair  # type: ignore[assignment]
+                pair_totals["semantic_nack_count"] += int(bool(event.get("semantic_nack", False)))
+                pair_totals["semantic_hard_nack_count"] += int(bool(event.get("semantic_hard_nack", False)))
+                pair_totals["semantic_soft_nack_count"] += int(bool(event.get("semantic_soft_nack", False)))
+                pair_totals["semantic_verification_nack_count"] += int(bool(event.get("semantic_verification_nack", False)))
+                pair_totals["semantic_quality_nack_count"] += int(bool(event.get("semantic_quality_nack", False)))
+                pair_totals["semantic_initial_nack_count"] += int(bool(event.get("semantic_initial_nack", False)))
+                pair_totals["semantic_initial_hard_nack_count"] += int(bool(event.get("semantic_initial_hard_nack", False)))
+                pair_totals["semantic_initial_soft_nack_count"] += int(bool(event.get("semantic_initial_soft_nack", False)))
+                pair_totals["semantic_initial_verification_nack_count"] += int(bool(event.get("semantic_initial_verification_nack", False)))
+                pair_totals["semantic_initial_quality_nack_count"] += int(bool(event.get("semantic_initial_quality_nack", False)))
+                for key in (
+                    "semantic_missing_repaired_count",
+                    "semantic_hard_repaired_count",
+                    "semantic_soft_repaired_count",
+                    "semantic_verification_repaired_count",
+                    "semantic_quality_repaired_count",
+                    "feedback_sent_tokens",
+                    "feedback_transport_tokens",
+                    "feedback_newly_visible_tokens",
+                    "feedback_newly_rendered_tokens",
+                    "total_comm_tokens",
+                    "core_comm_tokens",
+                    "delta_comm_tokens",
+                    "verification_comm_tokens",
+                    "quality_comm_tokens",
+                    "control_comm_tokens",
+                    "unique_comm_tokens",
+                    "repeated_comm_tokens",
+                    "receiver_seen_hit_count",
+                    "state_delta_tokens",
+                    "full_state_equivalent_tokens",
+                    "revision_success_count",
+                    "revision_regression_count",
+                    "targeted_refinement_skipped_count",
+                    "quality_refinement_budget_exceeded_count",
+                ):
+                    pair_totals[key] += int(event.get(key, 0) or 0)
+                if not bool(event.get("communication_token_accounting_ok", True)):
+                    pair_totals["communication_token_accounting_errors"] += 1
+                if not bool(event.get("communication_token_breakdown_ok", True)):
+                    pair_totals["communication_token_breakdown_errors"] += 1
+                if not bool(event.get("feedback_render_accounting_ok", True)):
+                    pair_totals["feedback_render_accounting_errors"] += 1
+                if not bool(event.get("unique_repeated_accounting_ok", True)):
+                    pair_totals["unique_repeated_accounting_errors"] += 1
+    feedback_sent = int(totals.get("feedback_sent_tokens", 0) or 0)
+    totals["feedback_utilization"] = (
+        int(totals.get("feedback_newly_rendered_tokens", 0) or 0) / feedback_sent
+        if feedback_sent else 0.0
+    )
+    totals["feedback_nack_repair_efficiency"] = (
+        int(totals.get("semantic_missing_repaired_count", 0) or 0) / feedback_sent
+        if feedback_sent else 0.0
+    )
+    totals["feedback_hard_repair_efficiency"] = (
+        int(totals.get("semantic_hard_repaired_count", 0) or 0) / feedback_sent
+        if feedback_sent else 0.0
+    )
+    totals["feedback_soft_repair_efficiency"] = (
+        int(totals.get("semantic_soft_repaired_count", 0) or 0) / feedback_sent
+        if feedback_sent else 0.0
+    )
+    totals["feedback_verification_repair_efficiency"] = (
+        int(totals.get("semantic_verification_repaired_count", 0) or 0) / feedback_sent
+        if feedback_sent else 0.0
+    )
+    totals["feedback_quality_repair_efficiency"] = (
+        int(totals.get("semantic_quality_repaired_count", 0) or 0) / feedback_sent
+        if feedback_sent else 0.0
+    )
+    total_comm = int(totals.get("total_comm_tokens", 0) or 0)
+    repeated_comm = int(totals.get("repeated_comm_tokens", 0) or 0)
+    state_delta = int(totals.get("state_delta_tokens", 0) or 0)
+    full_state = int(totals.get("full_state_equivalent_tokens", 0) or 0)
+    totals["duplicate_ratio"] = repeated_comm / total_comm if total_comm else 0.0
+    totals["incremental_saving"] = 1.0 - (state_delta / full_state) if full_state else 0.0
+    totals["communication_token_breakdown_ok"] = total_comm == sum(
+        int(totals.get(key, 0) or 0)
+        for key in (
+            "core_comm_tokens",
+            "delta_comm_tokens",
+            "verification_comm_tokens",
+            "quality_comm_tokens",
+            "control_comm_tokens",
+        )
+    )
+    totals["feedback_render_accounting_ok"] = (
+        int(totals.get("feedback_sent_tokens", 0) or 0)
+        >= int(totals.get("feedback_newly_rendered_tokens", 0) or 0)
+    )
+    totals["unique_repeated_accounting_ok"] = total_comm == (
+        int(totals.get("unique_comm_tokens", 0) or 0)
+        + int(totals.get("repeated_comm_tokens", 0) or 0)
+    )
+    totals["communication_round_count"] = int(totals.get("graph_communication_events", 0) or 0)
+    totals["communication_cost_tokens"] = int(totals.get("total_comm_tokens", 0) or 0)
+    for pair_totals in by_pair.values():
+        pair_feedback_sent = int(pair_totals.get("feedback_sent_tokens", 0) or 0)
+        pair_totals["feedback_utilization"] = (
+            int(pair_totals.get("feedback_newly_rendered_tokens", 0) or 0) / pair_feedback_sent
+            if pair_feedback_sent else 0.0
+        )
+        pair_totals["feedback_nack_repair_efficiency"] = (
+            int(pair_totals.get("semantic_missing_repaired_count", 0) or 0) / pair_feedback_sent
+            if pair_feedback_sent else 0.0
+        )
+        pair_totals["feedback_hard_repair_efficiency"] = (
+            int(pair_totals.get("semantic_hard_repaired_count", 0) or 0) / pair_feedback_sent
+            if pair_feedback_sent else 0.0
+        )
+        pair_totals["feedback_soft_repair_efficiency"] = (
+            int(pair_totals.get("semantic_soft_repaired_count", 0) or 0) / pair_feedback_sent
+            if pair_feedback_sent else 0.0
+        )
+        pair_totals["feedback_verification_repair_efficiency"] = (
+            int(pair_totals.get("semantic_verification_repaired_count", 0) or 0) / pair_feedback_sent
+            if pair_feedback_sent else 0.0
+        )
+        pair_totals["feedback_quality_repair_efficiency"] = (
+            int(pair_totals.get("semantic_quality_repaired_count", 0) or 0) / pair_feedback_sent
+            if pair_feedback_sent else 0.0
+        )
+        pair_total_comm = int(pair_totals.get("total_comm_tokens", 0) or 0)
+        pair_repeated_comm = int(pair_totals.get("repeated_comm_tokens", 0) or 0)
+        pair_state_delta = int(pair_totals.get("state_delta_tokens", 0) or 0)
+        pair_full_state = int(pair_totals.get("full_state_equivalent_tokens", 0) or 0)
+        pair_totals["duplicate_ratio"] = (
+            pair_repeated_comm / pair_total_comm if pair_total_comm else 0.0
+        )
+        pair_totals["incremental_saving"] = (
+            1.0 - (pair_state_delta / pair_full_state) if pair_full_state else 0.0
+        )
+        pair_totals["communication_token_breakdown_ok"] = pair_total_comm == sum(
+            int(pair_totals.get(key, 0) or 0)
+            for key in (
+                "core_comm_tokens",
+                "delta_comm_tokens",
+                "verification_comm_tokens",
+                "quality_comm_tokens",
+                "control_comm_tokens",
+            )
+        )
+        pair_totals["feedback_render_accounting_ok"] = (
+            int(pair_totals.get("feedback_sent_tokens", 0) or 0)
+            >= int(pair_totals.get("feedback_newly_rendered_tokens", 0) or 0)
+        )
+        pair_totals["unique_repeated_accounting_ok"] = pair_total_comm == (
+            int(pair_totals.get("unique_comm_tokens", 0) or 0)
+            + int(pair_totals.get("repeated_comm_tokens", 0) or 0)
+        )
+        pair_totals["communication_round_count"] = int(pair_totals.get("graph_communication_events", 0) or 0)
+        pair_totals["communication_cost_tokens"] = int(pair_totals.get("total_comm_tokens", 0) or 0)
+    totals["graph_delta_by_pair"] = by_pair
     return totals
 
 
@@ -525,19 +764,60 @@ def action_token_totals(records: List[Dict[str, Any]]) -> Dict[str, int]:
         "total_output_tokens": 0,
         "total_model_tokens": 0,
         "physical_input_tokens": 0,
+        "physical_llm_input_tokens": 0,
         "logical_input_tokens": 0,
         "agent_output_tokens": 0,
+        "prefill_cost_tokens": 0,
+        "decode_cost_tokens": 0,
         "forward_calls": 0,
         "peak_context_tokens": 0,
+        "reasoning_round_count": 0,
+        "solver_revision_round_count": 0,
+        "critic_need_fix_count": 0,
+        "critic_verified_count": 0,
+        "final_round_id_sum": 0,
+        "max_final_round_id": 0,
+        "persistent_context_tokens": 0,
+        "incremental_context_tokens": 0,
+        "logical_communication_tokens": 0,
+        "system_prompt_tokens": 0,
+        "prompt_wrapper_tokens": 0,
+        "reusable_prefix_tokens": 0,
+        "unique_prefix_tokens": 0,
+        "repeated_prefix_tokens": 0,
+        "simulated_context_reuse_input_tokens": 0,
     }
     for record in records:
         runtime = record.get("runtime_summary", {})
+        final_round_id = int(record.get("final_round_id", 0) or 0)
+        totals["final_round_id_sum"] += final_round_id
+        totals["max_final_round_id"] = max(totals["max_final_round_id"], final_round_id)
         totals["direct_a2a_text_tokens"] += int(runtime.get("a2a_text_tokens", 0) or 0)
+        seen_reusable_prefix_keys: set[str] = set()
         for action_log in runtime.get("records", []):
+            totals["reasoning_round_count"] += 1
+            if action_log.get("role") == "solver" and action_log.get("mode") == "repair":
+                totals["solver_revision_round_count"] += 1
+            action = action_log.get("action", {})
+            if action_log.get("role") == "critic" and isinstance(action, dict):
+                if action.get("op") == "verify" and action.get("status") == "need_fix":
+                    totals["critic_need_fix_count"] += 1
+                if action.get("op") == "verify" and action.get("status") == "verified":
+                    totals["critic_verified_count"] += 1
             telemetry = action_log.get("telemetry", {}) if isinstance(action_log, dict) else {}
             physical_input = int(telemetry.get("physical_input_tokens", 0) or 0)
             logical_input = int(telemetry.get("logical_input_tokens", action_log.get("logical_context_tokens", 0)) or 0)
             output_tokens = int(telemetry.get("output_tokens", 0) or 0)
+            reusable_prefix_tokens = int(telemetry.get("reusable_prefix_tokens", 0) or 0)
+            reusable_prefix_key = str(telemetry.get("reusable_prefix_key", ""))
+            repeated_prefix_tokens = 0
+            if reusable_prefix_key:
+                if reusable_prefix_key in seen_reusable_prefix_keys:
+                    repeated_prefix_tokens = reusable_prefix_tokens
+                    totals["repeated_prefix_tokens"] += repeated_prefix_tokens
+                else:
+                    seen_reusable_prefix_keys.add(reusable_prefix_key)
+                    totals["unique_prefix_tokens"] += reusable_prefix_tokens
             context_tokens = int(
                 telemetry.get(
                     "graph_read_context_tokens",
@@ -547,15 +827,52 @@ def action_token_totals(records: List[Dict[str, Any]]) -> Dict[str, int]:
             )
             graph_update = int(telemetry.get("graph_update_tokens", action_log.get("graph_update_tokens", 0)) or 0)
             totals["physical_input_tokens"] += physical_input
+            totals["physical_llm_input_tokens"] += int(
+                telemetry.get("physical_llm_input_tokens", physical_input) or 0
+            )
             totals["logical_input_tokens"] += logical_input
             totals["total_input_tokens"] += physical_input
             totals["total_output_tokens"] += output_tokens
             totals["agent_output_tokens"] += output_tokens
+            totals["prefill_cost_tokens"] += int(telemetry.get("prefill_cost_tokens", physical_input) or 0)
+            totals["decode_cost_tokens"] += int(telemetry.get("decode_cost_tokens", output_tokens) or 0)
             totals["graph_read_context_tokens"] += context_tokens
+            for key in (
+                "persistent_context_tokens",
+                "incremental_context_tokens",
+                "logical_communication_tokens",
+                "system_prompt_tokens",
+                "prompt_wrapper_tokens",
+                "reusable_prefix_tokens",
+            ):
+                totals[key] += int(telemetry.get(key, 0) or 0)
+            totals["simulated_context_reuse_input_tokens"] += max(
+                0,
+                physical_input - min(physical_input, repeated_prefix_tokens),
+            )
             totals["graph_update_tokens"] += graph_update
             totals["forward_calls"] += int(telemetry.get("forward_calls", 0) or 0)
             totals["peak_context_tokens"] = max(totals["peak_context_tokens"], context_tokens)
     totals["total_model_tokens"] = totals["total_input_tokens"] + totals["total_output_tokens"]
+    totals["avg_final_round_id"] = (
+        totals["final_round_id_sum"] / len(records) if records else 0.0
+    )
+    totals["communication_cost_tokens"] = int(totals.get("total_comm_tokens", 0) or 0)
+    totals["semantic_communication_cost_tokens"] = int(totals.get("logical_communication_tokens", 0) or 0)
+    totals["inference_prefill_cost_tokens"] = int(totals.get("prefill_cost_tokens", 0) or 0)
+    totals["inference_decode_cost_tokens"] = int(totals.get("decode_cost_tokens", 0) or 0)
+    totals["phase8_total_cost_tokens"] = (
+        totals["communication_cost_tokens"]
+        + totals["inference_prefill_cost_tokens"]
+        + totals["inference_decode_cost_tokens"]
+    )
+    totals["context_reuse_saving_ratio"] = (
+        int(totals.get("repeated_prefix_tokens", 0) or 0) / totals["total_input_tokens"]
+        if totals["total_input_tokens"] else 0.0
+    )
+    totals["logical_vs_physical_input_gap_tokens"] = (
+        totals["total_input_tokens"] - int(totals.get("logical_communication_tokens", 0) or 0)
+    )
     return totals
 
 
@@ -655,11 +972,22 @@ def main() -> None:
             "random_keep_50",
             "random_keep_25",
             "closure_aware_heuristic",
+            "random_same_budget",
+            "static_utility",
+            "receiver_aware_heuristic",
+            "fragment_ablation_core_only",
+            "fragment_ablation_support_dependencies",
+            "fragment_ablation_full_plan",
+            "fragment_ablation_result_metadata",
+            "fragment_ablation_calculation_trace",
+            "fragment_ablation_full_feedback",
         ),
         default="closure_aware_heuristic",
     )
     parser.add_argument("--communication-seed", type=int, default=0)
     parser.add_argument("--communication-budget-tokens", type=int, default=None)
+    parser.add_argument("--fragment-utility-table", default="")
+    parser.add_argument("--task-family", default="")
     parser.add_argument("--output", default="")
     args = parser.parse_args()
 
@@ -701,7 +1029,12 @@ def main() -> None:
                 task_type=row["task_type"],
                 tokenizer=model.tokenizer,
                 max_rounds=args.max_rounds,
-                communication_policy=make_communication_policy(args.communication_policy, seed=args.communication_seed),
+                communication_policy=make_communication_policy(
+                    args.communication_policy,
+                    seed=args.communication_seed,
+                    utility_table_path=args.fragment_utility_table or None,
+                    task_family=args.task_family or args.domain,
+                ),
                 communication_budget_tokens=args.communication_budget_tokens,
             )
         failure = ""
@@ -733,6 +1066,7 @@ def main() -> None:
             "runtime_summary": {
                 "records": run_result.get("logs", []),
             },
+            "final_round_id": int(run_result.get("round_id", 0) or 0),
             "graph_nodes": len(graph.snapshot().nodes) if graph is not None else 0,
             "graph_edges": len(graph.snapshot().edges) if graph is not None else 0,
         })
@@ -747,6 +1081,17 @@ def main() -> None:
     graph_comm = communication_totals(records)
     token_totals = action_token_totals(records)
     optional_consumption = optional_consumption_totals(records)
+    phase8_costs = {
+        "communication_cost_tokens": int(graph_comm.get("communication_cost_tokens", 0) or 0),
+        "semantic_communication_cost_tokens": int(token_totals.get("logical_communication_tokens", 0) or 0),
+        "inference_prefill_cost_tokens": int(token_totals.get("prefill_cost_tokens", 0) or 0),
+        "inference_decode_cost_tokens": int(token_totals.get("decode_cost_tokens", 0) or 0),
+    }
+    phase8_costs["phase8_total_cost_tokens"] = (
+        phase8_costs["communication_cost_tokens"]
+        + phase8_costs["inference_prefill_cost_tokens"]
+        + phase8_costs["inference_decode_cost_tokens"]
+    )
     report = {
         "domain": args.domain,
         "data_path": args.data_path,
@@ -757,6 +1102,7 @@ def main() -> None:
         "failure_count": sum(bool(item["failure"]) for item in records),
         **token_totals,
         **graph_comm,
+        **phase8_costs,
         **optional_consumption,
         "records": records,
     }

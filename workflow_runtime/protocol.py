@@ -55,7 +55,10 @@ ACTION_FIELDS = {
     "set_execution": frozenset({"op", "content", "success"}),
     "set_test_result": frozenset({"op", "id", "content"}),
     "call_tool": frozenset({"op", "call_id", "name", "arguments"}),
-    "verify": frozenset({"op", "target", "status"}),
+    "verify": frozenset({
+        "op", "target", "status", "error_type", "error_location",
+        "reason", "repair_instruction", "preserve", "requested_fragments",
+    }),
     "report_error": frozenset({"op", "content"}),
     "answer": frozenset({"op", "source", "value"}),
     "done": frozenset({"op"}),
@@ -71,12 +74,21 @@ def normalize_action_payload(payload: Any) -> Any:
     """
     if not isinstance(payload, dict):
         return payload
-    if payload.get("op") != "emit_code":
-        return payload
-    if "code" in payload:
-        return {"op": "emit_code", "code": payload["code"]}
-    if "content" in payload:
-        return {"op": "emit_code", "code": payload["content"]}
+    op = payload.get("op")
+    if op == "emit_code":
+        if "code" in payload:
+            return {"op": "emit_code", "code": payload["code"]}
+        if "content" in payload:
+            return {"op": "emit_code", "code": payload["content"]}
+    if op == "verify":
+        normalized = dict(payload)
+        normalized.setdefault("error_type", "")
+        normalized.setdefault("error_location", "")
+        normalized.setdefault("reason", "")
+        normalized.setdefault("repair_instruction", "")
+        normalized.setdefault("preserve", [])
+        normalized.setdefault("requested_fragments", [])
+        return normalized
     return payload
 
 
@@ -140,8 +152,19 @@ def validate_action(role: str, payload: Any, *, task_type: str) -> List[str]:
             errors.append("call_tool.name must be a non-empty string")
         if not isinstance(payload.get("arguments"), dict):
             errors.append("call_tool.arguments must be an object")
-    if op == "verify" and payload.get("status") not in {"verified", "need_fix"}:
-        errors.append("verify.status must be verified or need_fix")
+    if op == "verify" and payload.get("status") not in {"verified", "need_fix", "uncertain"}:
+        errors.append("verify.status must be verified, need_fix, or uncertain")
+    if op == "verify":
+        for key in ("error_type", "error_location", "reason", "repair_instruction"):
+            if not isinstance(payload.get(key), str):
+                errors.append(f"verify.{key} must be a string")
+        for key in ("preserve", "requested_fragments"):
+            if not isinstance(payload.get(key), list) or not all(isinstance(item, str) for item in payload.get(key, [])):
+                errors.append(f"verify.{key} must be an array of strings")
+        if payload.get("status") == "need_fix":
+            for key in ("error_type", "error_location", "repair_instruction"):
+                if not str(payload.get(key, "")).strip():
+                    errors.append(f"need_fix verify.{key} must be non-empty")
     return errors
 
 
@@ -161,7 +184,7 @@ def action_contract(role: str, task_type: str) -> str:
     examples = {
         "planner": '{"op":"add_fact","id":"A","value":2}',
         "solver": '{"op":"calculate","id":"R1","expression":"2+3","value":5}',
-        "critic": '{"op":"verify","target":"result","status":"verified"}',
+        "critic": '{"op":"verify","target":"result","status":"verified","error_type":"","error_location":"","reason":"","repair_instruction":"","preserve":[],"requested_fragments":[]}',
         "final_solver": '{"op":"answer","source":"result","value":5}',
     }
     solver_rule = (
@@ -182,7 +205,11 @@ def action_contract(role: str, task_type: str) -> str:
             "for the operation and operands before finishing."
         ),
         "solver": solver_rule,
-        "critic": "Critic must verify an existing result or report an error; it must not create a result.",
+        "critic": (
+            "Critic must verify an existing result or report an error; it must not create a result. "
+            "For status=need_fix, include actionable diagnostic fields: error_type, "
+            "error_location, repair_instruction, preserve, and requested_fragments."
+        ),
         "final_solver": "Finalizer must copy an existing verified result using answer; it must not recalculate.",
     }[role]
     return (

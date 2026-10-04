@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import json
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -73,10 +74,20 @@ def test_minimal_no_feedback_records_unresolved_semantic_nack(tmp_path):
     event = events[0]
     assert event["policy"] == "minimal_no_feedback"
     assert event["semantic_packet_root_node_ids"] == [result.node_id]
-    assert event["semantic_nack"] is True
-    assert event["semantic_nack_unresolved"] is True
+    assert event["semantic_feedback_request"] is True
+    assert event["semantic_nack"] is False
+    assert event["semantic_nack_unresolved"] is False
+    assert event["semantic_hard_nack"] is False
+    assert event["semantic_soft_nack"] is True
+    assert event["semantic_verification_nack"] is True
+    assert event["semantic_hard_contract_satisfied"] is True
     assert event["semantic_final_contract_satisfied"] is False
+    assert event["semantic_feedback"]["type"] == "VERIFICATION_REQUEST"
     assert event["semantic_feedback"]["missing_semantics"] == ["support_dependencies"]
+    assert event["semantic_feedback"]["soft_missing_semantics"] == ["support_dependencies"]
+    assert event["semantic_initial_receiver_need"]["level"] == "verification"
+    assert event["semantic_initial_receiver_need"]["verification_missing"] == ["support_dependencies"]
+    assert event["semantic_receiver_need"]["level"] == "verification"
     assert result.node_id in event["sent_node_ids"]
 
 
@@ -313,6 +324,179 @@ def test_langgraph_runs_incremental_actions_to_final_answer(tmp_path):
     assert telemetry.summary()["graph_delta_sent_nodes"] > 0
     assert (tmp_path / "workflow.jsonl").read_text().count('"event":"model_action"') == len(requests)
     assert '"event":"graph_delta_communication"' in (tmp_path / "workflow.jsonl").read_text()
+
+
+def test_optimized_workflow_runs_solver_revision_after_need_fix_critic(tmp_path):
+    store = GraphStore()
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="task",
+        node_type="task",
+        content="A has 2 items and B has 3 items.",
+        owner="user",
+    )
+    queues = {
+        ("planner", "normal"): [
+            {"op": "declare_query", "content": {"question": "total", "task_type": "numeric_solve"}},
+            {"op": "add_fact", "id": "A", "value": 2},
+            {"op": "add_fact", "id": "B", "value": 3},
+            {"op": "add_plan_step", "id": "R1", "operation": "add", "inputs": ["A", "B"]},
+            {"op": "done"},
+        ],
+        ("solver", "normal"): [
+            {"op": "calculate", "id": "R1", "expression": "2+3", "value": 6},
+            {"op": "set_result", "id": "R1", "value": 6},
+            {"op": "done"},
+        ],
+        ("critic", "normal"): [
+            {
+                "op": "verify",
+                "target": "result",
+                "status": "need_fix",
+                "error_type": "arithmetic",
+                "error_location": "calculation R1",
+                "reason": "2+3 was recorded as 6.",
+                "repair_instruction": "Recompute R1 as 2+3=5 and update the result.",
+                "preserve": ["facts", "plan"],
+                "requested_fragments": ["calculation#final_value"],
+            },
+            {"op": "verify", "target": "result", "status": "verified"},
+        ],
+        ("solver", "repair"): [
+            {"op": "set_result", "id": "R1", "value": 5},
+            {"op": "done"},
+        ],
+        ("final_solver", "finalization"): [
+            {"op": "answer", "source": "result", "value": 5},
+            {"op": "done"},
+        ],
+    }
+    requests = []
+
+    def model(request):
+        requests.append((request.role, request.mode, request.action_constraint.allowed_ops))
+        return queues[(request.role, request.mode)].pop(0)
+
+    telemetry = WorkflowTelemetry(tmp_path / "workflow.jsonl")
+    workflow = LangGraphWorkflow(
+        store=store,
+        model=model,
+        task_id="t",
+        task_type="numeric_solve",
+        max_rounds=3,
+        max_actions_per_role=8,
+        telemetry=telemetry,
+    )
+    try:
+        from langgraph.checkpoint.memory import MemorySaver
+    except ImportError:  # pragma: no cover
+        pytest.skip("LangGraph is not installed")
+
+    result = workflow.compile(checkpointer=MemorySaver()).invoke(
+        workflow.initial_state(),
+        {"configurable": {"thread_id": "t-repair"}},
+    )
+
+    assert result["status"] == "running"
+    assert store.latest_valid("t", "main", "result").content == {"id": "R1", "value": 5}
+    assert store.latest_valid("t", "main", "verification").status == "verified"
+    assert store.latest_valid("t", "main", "final_answer").content == 5
+    assert ("solver", "repair", ("set_result",)) in requests
+    assert [item for item in requests if item[0] == "critic"] == [
+        ("critic", "normal", ("verify",)),
+        ("critic", "normal", ("verify",)),
+    ]
+    assert result["round_id"] >= 2
+    assert telemetry.summary()["reasoning_round_count"] == len(requests)
+
+
+def test_task_verifier_overrides_false_positive_code_verified(tmp_path):
+    store = GraphStore()
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="task",
+        node_type="task",
+        content="Write f so that f() returns 1.",
+        owner="user",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="requirements",
+        node_type="requirements",
+        content={"text": "def f():\n"},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="test_1",
+        node_type="test",
+        content={"setup": "", "text": "assert f() == 1"},
+        owner="dataset",
+    )
+    queues = {
+        ("planner", "normal"): [
+            {"op": "declare_query", "content": {"question": "return one", "task_type": "code_generation"}},
+            {"op": "add_plan_step", "id": "M1", "operation": "synthesize", "inputs": ["task"]},
+            {"op": "done"},
+        ],
+        ("solver", "normal"): [
+            {"op": "emit_code", "code": "def f():\n    return 2\n"},
+            {"op": "done"},
+        ],
+        ("critic", "normal"): [
+            {"op": "verify", "target": "result", "status": "verified"},
+            {"op": "verify", "target": "result", "status": "verified"},
+        ],
+        ("solver", "repair"): [
+            {"op": "emit_code", "code": "def f():\n    return 1\n"},
+            {"op": "done"},
+        ],
+        ("final_solver", "finalization"): [
+            {"op": "answer", "source": "code", "value": "ignored"},
+            {"op": "done"},
+        ],
+    }
+
+    def model(request):
+        return queues[(request.role, request.mode)].pop(0)
+
+    telemetry = WorkflowTelemetry(tmp_path / "workflow.jsonl")
+    workflow = LangGraphWorkflow(
+        store=store,
+        model=model,
+        task_id="t",
+        task_type="code_generation",
+        max_rounds=3,
+        max_actions_per_role=6,
+        telemetry=telemetry,
+    )
+    try:
+        from langgraph.checkpoint.memory import MemorySaver
+    except ImportError:  # pragma: no cover
+        pytest.skip("LangGraph is not installed")
+
+    workflow.compile(checkpointer=MemorySaver()).invoke(
+        workflow.initial_state(),
+        {"configurable": {"thread_id": "t-code-verifier"}},
+    )
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "workflow.jsonl").read_text().splitlines()
+        if json.loads(line).get("event") == "model_action"
+    ]
+    critic_actions = [item["action"] for item in records if item.get("role") == "critic"]
+    assert critic_actions[0]["status"] == "need_fix"
+    assert critic_actions[0]["error_type"] == "wrong_value"
+    assert "must return 1" in critic_actions[0]["repair_instruction"]
+    assert critic_actions[1]["status"] == "verified"
+    assert telemetry.summary()["critic_need_fix_count"] == 1
+    assert telemetry.summary()["solver_revision_round_count"] == 1
+    assert store.latest_valid("t", "main", "result").validation["execution_valid"] is True
 
 
 def test_native_langgraph_accepts_free_form_messages_without_action_protocol(tmp_path):

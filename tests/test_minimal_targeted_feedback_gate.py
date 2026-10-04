@@ -11,7 +11,13 @@ from workflow_runtime.langgraph_workflow import LangGraphWorkflow
 from workflow_runtime.telemetry import WorkflowTelemetry
 
 
-def _workflow(store: GraphStore, tmp_path: Path, *, max_rounds: int = 3) -> LangGraphWorkflow:
+def _workflow(
+    store: GraphStore,
+    tmp_path: Path,
+    *,
+    max_rounds: int = 3,
+    communication_budget_tokens: int | None = None,
+) -> LangGraphWorkflow:
     return LangGraphWorkflow(
         store=store,
         model=lambda request: {},
@@ -20,6 +26,7 @@ def _workflow(store: GraphStore, tmp_path: Path, *, max_rounds: int = 3) -> Lang
         telemetry=WorkflowTelemetry(tmp_path / "minimal_targeted_feedback.jsonl"),
         communication_policy=make_communication_policy("minimal_targeted_feedback"),
         max_rounds=max_rounds,
+        communication_budget_tokens=communication_budget_tokens,
     )
 
 
@@ -271,8 +278,115 @@ def test_phase9_exceeding_max_rounds_triggers_fallback(monkeypatch, tmp_path) ->
 
     assert event["refinement_rounds"] == 0
     assert event["fallback_send_all"] is True
-    assert event["fallback_feedback"]["type"] == "NACK"
+    assert event["fallback_feedback"]["type"] == "HARD_NACK"
+    assert [item["action"] for item in event["semantic_feedback_decisions"][:2]] == [
+        "TARGETED_REFINEMENT",
+        "SEND_ALL_FALLBACK",
+    ]
+    assert event["semantic_feedback_decisions"][1]["allow_fallback"] is True
     assert event["semantic_nack_unresolved"] is True
+
+
+def test_phase9_requested_fragments_are_rendered_for_active_targeted_request(monkeypatch, tmp_path) -> None:
+    import workflow_runtime.langgraph_workflow as workflow_module
+
+    original_contract = workflow_module.default_semantic_contract
+
+    def quality_contract(sender: str, receiver: str, *, task_type: str = "") -> SemanticContract:
+        if (sender, receiver) != ("critic", "solver"):
+            return original_contract(sender, receiver, task_type=task_type)
+        return SemanticContract(
+            sender_role=sender,
+            receiver_role=receiver,
+            task_type=task_type,
+            requirements=(
+                SemanticRequirement(
+                    kind="full_feedback",
+                    severity="refinement",
+                    description="quality request for full feedback",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(workflow_module, "default_semantic_contract", quality_contract)
+    store = _base_store()
+    verification = store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="verification",
+        node_type="verification",
+        content={"status": "uncertain", "repair_hint": "show derivation"},
+        owner="critic",
+        created_by_role="critic",
+    )
+    workflow = _workflow(store, tmp_path, max_rounds=2)
+    workflow.agent_views.grant("critic", node_ids=[verification.node_id], local=True)
+
+    event = workflow._communicate_nodes(
+        sender="critic",
+        node_ids=[verification.node_id],
+        branch_id="main",
+    )[0]
+
+    requested = set(event["targeted_refinement_requested_fragment_ids"])
+    assert requested == {f"{verification.node_id}#full_feedback"}
+    assert requested <= set(event["rendered_context_fragment_ids"])
+    assert requested <= set(event["feedback_newly_rendered_fragment_ids"])
+    assert event["semantic_feedback_decisions"][0]["action"] == "TARGETED_REFINEMENT"
+    assert event["semantic_feedback_decisions"][0]["level"] == "quality"
+    assert event["semantic_feedback_decisions"][0]["allow_fallback"] is False
+
+
+def test_phase5_quality_request_can_be_budget_skipped_without_fallback(monkeypatch, tmp_path) -> None:
+    import workflow_runtime.langgraph_workflow as workflow_module
+
+    original_contract = workflow_module.default_semantic_contract
+
+    def quality_contract(sender: str, receiver: str, *, task_type: str = "") -> SemanticContract:
+        if (sender, receiver) != ("critic", "solver"):
+            return original_contract(sender, receiver, task_type=task_type)
+        return SemanticContract(
+            sender_role=sender,
+            receiver_role=receiver,
+            task_type=task_type,
+            requirements=(
+                SemanticRequirement(
+                    kind="full_feedback",
+                    severity="refinement",
+                    description="quality request for full feedback",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(workflow_module, "default_semantic_contract", quality_contract)
+    store = _base_store()
+    verification = store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="verification",
+        node_type="verification",
+        content={"status": "uncertain", "repair_hint": "show full derivation"},
+        owner="critic",
+        created_by_role="critic",
+    )
+    workflow = _workflow(store, tmp_path, max_rounds=2, communication_budget_tokens=0)
+    workflow.agent_views.grant("critic", node_ids=[verification.node_id], local=True)
+
+    event = workflow._communicate_nodes(
+        sender="critic",
+        node_ids=[verification.node_id],
+        branch_id="main",
+    )[0]
+
+    assert event["semantic_feedback_decisions"][0]["action"] == "TARGETED_REFINEMENT"
+    assert event["targeted_refinement_skipped"] is True
+    assert event["targeted_refinement_skipped_count"] == 1
+    assert event["targeted_refinement_skip_reason"] == "quality_refinement_budget_exceeded"
+    assert event["quality_refinement_budget_exceeded_count"] == 1
+    assert event["fallback_send_all"] is False
+    assert event["feedback_sent_tokens"] == 0
+    assert event["feedback_newly_rendered_tokens"] == 0
+    assert event["semantic_quality_nack"] is True
 
 
 def test_phase9_communication_and_model_token_accounting(tmp_path) -> None:

@@ -9,6 +9,7 @@ import pytest
 
 from workflow_runtime import GraphStore
 from workflow_runtime.action_compiler import ActionCompilationError, ActionCompiler
+from workflow_runtime.domain_executors import execute_domain
 
 
 def make_compiler() -> tuple[GraphStore, ActionCompiler]:
@@ -148,6 +149,33 @@ def test_code_generation_uses_code_as_answer_boundary() -> None:
     assert store.latest_valid("t", "main", "final_answer").content == "def f():\n    return 1\n"
 
 
+def test_need_fix_verify_stores_structured_repair_feedback() -> None:
+    store = GraphStore()
+    store.add_node(task_id="t", branch_id="main", logical_id="code", node_type="code", content="def f():\n    return 2\n", owner="solver")
+    compiler = ActionCompiler(store, task_id="t", task_type="code_generation")
+
+    compiler.apply(
+        "critic",
+        {
+            "op": "verify",
+            "target": "code",
+            "status": "need_fix",
+            "error_type": "wrong_return",
+            "error_location": "return statement",
+            "reason": "The function returns 2 instead of 1.",
+            "repair_instruction": "Change the return value to 1 and preserve the signature.",
+            "preserve": ["function signature"],
+            "requested_fragments": ["code#function_body"],
+        },
+    )
+
+    verification = store.latest_valid("t", "main", "verification")
+    assert verification.status == "need_fix"
+    assert verification.content["error_type"] == "wrong_return"
+    assert verification.content["repair_instruction"].startswith("Change the return value")
+    assert verification.content["preserve"] == ["function signature"]
+
+
 def test_code_generation_final_answer_falls_back_from_local_source_alias() -> None:
     store = GraphStore()
     code = store.add_node(
@@ -256,3 +284,32 @@ def test_unknown_tool_is_recorded_as_a_recoverable_tool_error():
     tool_result = store.latest_valid("t", "main", "tool_result_bad-1")
     assert tool_result.status == "need_fix"
     assert tool_result.content["ok"] is False
+
+
+def test_code_executor_prepends_imports_from_requirements() -> None:
+    store = GraphStore()
+    store.add_node(task_id="t", branch_id="main", logical_id="task", node_type="task", content="write first", owner="user")
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="requirements",
+        node_type="requirements",
+        content={"text": "from typing import List\n\ndef first(xs: List[int]) -> int:\n"},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="test_1",
+        node_type="test",
+        content={"setup": "", "text": "assert first([3, 4]) == 3"},
+        owner="dataset",
+    )
+
+    execution = execute_domain(
+        "code_generation",
+        store,
+        {"code": "def first(xs: List[int]) -> int:\n    return xs[0]\n"},
+    )
+
+    assert execution.success
