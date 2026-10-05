@@ -64,13 +64,49 @@ def test_critic_verify_accepts_answer_alias_for_result() -> None:
     assert verification.content == {"target": "result", "status": "verified"}
 
 
-def test_final_answer_rejects_local_source_alias() -> None:
+def test_final_answer_falls_back_from_pseudo_source_alias() -> None:
     store, compiler = make_compiler()
     compiler.apply("solver", {"op": "set_result", "id": "R1", "value": 5})
-    with pytest.raises(ActionCompilationError, match="answer source does not exist"):
-        compiler.apply("final_solver", {"op": "answer", "source": "n10", "value": 5})
-    with pytest.raises(ActionCompilationError, match="answer source does not exist"):
-        compiler.apply("final_solver", {"op": "answer", "source": "R1", "value": 5})
+    result = store.latest_valid("t", "main", "result")
+
+    compiler.apply("final_solver", {"op": "answer", "source": "n10", "value": 5})
+
+    final = store.latest_valid("t", "main", "final_answer")
+    assert final.content == 5
+    assert final.provenance["declared_answer_source"] == "n10"
+    assert final.provenance["resolved_answer_source"] == result.node_id
+    assert final.provenance["answer_source_fallback"] is True
+
+
+def test_final_answer_falls_back_from_hotpot_pseudo_source() -> None:
+    store = GraphStore()
+    result = store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="result",
+        node_type="result",
+        content={"id": "answer", "value": "bridge entity"},
+        owner="solver",
+    )
+    compiler = ActionCompiler(store, task_id="t", task_type="multihop_qa")
+
+    compiler.apply("final_solver", {"op": "answer", "source": "R.id.n3", "value": "ignored"})
+
+    final = store.latest_valid("t", "main", "final_answer")
+    assert final.content == "bridge entity"
+    assert final.provenance["declared_answer_source"] == "R.id.n3"
+    assert final.provenance["resolved_answer_source"] == result.node_id
+    assert final.provenance["answer_source_fallback"] is True
+
+
+def test_solver_null_result_value_reuses_latest_valid_result() -> None:
+    store, compiler = make_compiler()
+    compiler.apply("solver", {"op": "set_result", "id": "R1", "value": 9})
+
+    compiler.apply("solver", {"op": "set_result", "id": "R2", "value": None})
+
+    result = store.latest_valid("t", "main", "result")
+    assert result.content == {"id": "R2", "value": 9}
 
 
 def test_final_answer_resolves_fragment_alias_to_canonical_node() -> None:

@@ -411,6 +411,183 @@ def test_optimized_workflow_runs_solver_revision_after_need_fix_critic(tmp_path)
     assert telemetry.summary()["reasoning_round_count"] == len(requests)
 
 
+def test_numeric_solver_with_existing_result_deterministically_completes_without_done(tmp_path):
+    store = GraphStore()
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="task",
+        node_type="task",
+        content="A has 2 items and B has 3 items.",
+        owner="user",
+    )
+    queues = {
+        ("planner", "normal"): [
+            {"op": "declare_query", "content": {"question": "total", "task_type": "numeric_solve"}},
+            {"op": "add_fact", "id": "A", "value": 2},
+            {"op": "add_fact", "id": "B", "value": 3},
+            {"op": "add_plan_step", "id": "R1", "operation": "add", "inputs": ["A", "B"]},
+            {"op": "done"},
+        ],
+        ("solver", "normal"): [
+            {"op": "calculate", "id": "R1", "expression": "2+3", "value": 5},
+            {"op": "set_result", "id": "R1", "value": 5},
+        ],
+        ("critic", "normal"): [
+            {"op": "verify", "target": "result", "status": "verified"},
+        ],
+        ("final_solver", "finalization"): [
+            {"op": "answer", "source": "result", "value": 5},
+        ],
+    }
+    requests = []
+
+    def model(request):
+        requests.append((request.role, request.mode, request.action_constraint.allowed_ops))
+        return queues[(request.role, request.mode)].pop(0)
+
+    workflow = LangGraphWorkflow(
+        store=store,
+        model=model,
+        task_id="t",
+        task_type="numeric_solve",
+        max_rounds=1,
+        max_actions_per_role=8,
+        telemetry=WorkflowTelemetry(tmp_path / "workflow.jsonl"),
+    )
+    try:
+        from langgraph.checkpoint.memory import MemorySaver
+    except ImportError:  # pragma: no cover
+        pytest.skip("LangGraph is not installed")
+
+    result = workflow.compile(checkpointer=MemorySaver()).invoke(
+        workflow.initial_state(),
+        {"configurable": {"thread_id": "t-result-stop"}},
+    )
+
+    assert result["status"] == "running"
+    assert store.latest_valid("t", "main", "final_answer").content == 5
+    assert [item for item in requests if item[0] == "solver"] == [
+        ("solver", "normal", ("calculate",)),
+        ("solver", "normal", ("set_result",)),
+    ]
+
+
+def test_solver_null_result_is_recovered_before_generation_validation(tmp_path):
+    store = GraphStore()
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="task",
+        node_type="task",
+        content="A has 2 items and B has 3 items.",
+        owner="user",
+    )
+    queues = {
+        ("planner", "normal"): [
+            {"op": "declare_query", "content": {"question": "total", "task_type": "numeric_solve"}},
+            {"op": "add_fact", "id": "A", "value": 2},
+            {"op": "add_fact", "id": "B", "value": 3},
+            {"op": "add_plan_step", "id": "R1", "operation": "add", "inputs": ["A", "B"]},
+            {"op": "done"},
+        ],
+        ("solver", "normal"): [
+            {"op": "calculate", "id": "R1", "expression": "2+3", "value": 5},
+            {"op": "set_result", "id": "R1", "value": None},
+        ],
+        ("critic", "normal"): [
+            {"op": "verify", "target": "result", "status": "verified"},
+        ],
+        ("final_solver", "finalization"): [
+            {"op": "answer", "source": "result", "value": 5},
+        ],
+    }
+
+    def model(request):
+        return queues[(request.role, request.mode)].pop(0)
+
+    workflow = LangGraphWorkflow(
+        store=store,
+        model=model,
+        task_id="t",
+        task_type="numeric_solve",
+        max_rounds=1,
+        max_actions_per_role=8,
+        telemetry=WorkflowTelemetry(tmp_path / "workflow.jsonl"),
+    )
+    try:
+        from langgraph.checkpoint.memory import MemorySaver
+    except ImportError:  # pragma: no cover
+        pytest.skip("LangGraph is not installed")
+
+    workflow.compile(checkpointer=MemorySaver()).invoke(
+        workflow.initial_state(),
+        {"configurable": {"thread_id": "t-null-recover"}},
+    )
+
+    assert store.latest_valid("t", "main", "result").content == {"id": "R1", "value": 5}
+    assert store.latest_valid("t", "main", "final_answer").content == 5
+
+
+def test_numeric_solver_exhaustion_auto_sets_result_from_latest_calculation(tmp_path):
+    store = GraphStore()
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="task",
+        node_type="task",
+        content="A has 2 items and B has 3 items.",
+        owner="user",
+    )
+    queues = {
+        ("planner", "normal"): [
+            {"op": "declare_query", "content": {"question": "total", "task_type": "numeric_solve"}},
+            {"op": "add_fact", "id": "A", "value": 2},
+            {"op": "add_fact", "id": "B", "value": 3},
+            {"op": "add_plan_step", "id": "R1", "operation": "add", "inputs": ["A", "B"]},
+            {"op": "done"},
+        ],
+        ("solver", "normal"): [
+            {"op": "calculate", "id": "R1", "expression": "2+3", "value": 5},
+            {"op": "calculate", "id": "R1", "expression": "2+3", "value": 5},
+            {"op": "calculate", "id": "R1", "expression": "2+3", "value": 5},
+            {"op": "calculate", "id": "R1", "expression": "2+3", "value": 5},
+            {"op": "calculate", "id": "R1", "expression": "2+3", "value": 5},
+        ],
+        ("critic", "normal"): [
+            {"op": "verify", "target": "result", "status": "verified"},
+        ],
+        ("final_solver", "finalization"): [
+            {"op": "answer", "source": "result", "value": 5},
+        ],
+    }
+
+    def model(request):
+        return queues[(request.role, request.mode)].pop(0)
+
+    workflow = LangGraphWorkflow(
+        store=store,
+        model=model,
+        task_id="t",
+        task_type="numeric_solve",
+        max_rounds=1,
+        max_actions_per_role=5,
+        telemetry=WorkflowTelemetry(tmp_path / "workflow.jsonl"),
+    )
+    try:
+        from langgraph.checkpoint.memory import MemorySaver
+    except ImportError:  # pragma: no cover
+        pytest.skip("LangGraph is not installed")
+
+    workflow.compile(checkpointer=MemorySaver()).invoke(
+        workflow.initial_state(),
+        {"configurable": {"thread_id": "t-calc-exhaustion"}},
+    )
+
+    assert store.latest_valid("t", "main", "result").content == {"id": "R1", "value": 5}
+    assert store.latest_valid("t", "main", "final_answer").content == 5
+
+
 def test_task_verifier_overrides_false_positive_code_verified(tmp_path):
     store = GraphStore()
     store.add_node(

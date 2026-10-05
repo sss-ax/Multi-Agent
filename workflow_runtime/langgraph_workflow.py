@@ -408,9 +408,50 @@ class LangGraphWorkflow:
                     break
 
             if not completed:
-                raise ActionCompilationError(
-                    f"{role} exceeded max_actions_per_role={self.max_actions_per_role} without done"
+                auto_result = self._auto_complete_exhausted_stage(
+                    role=role,
+                    mode=mode,
+                    branch_id=state.get("branch_id", self.branch_id),
                 )
+                if auto_result is not None:
+                    self.agent_views.grant_global_visibility()
+                    self.agent_views.grant(role, node_ids=auto_result.node_ids, local=True)
+                    communication_events = self._communicate_nodes(
+                        sender=role,
+                        node_ids=auto_result.node_ids,
+                        branch_id=state.get("branch_id", self.branch_id),
+                    )
+                    logs.append({
+                        "role": role,
+                        "mode": mode,
+                        "action_index": self.max_actions_per_role,
+                        "action": auto_result.action,
+                        "compiled_node_ids": list(auto_result.node_ids),
+                        "graph_update_tokens": self._graph_update_tokens(auto_result.node_ids),
+                        "communication": communication_events,
+                        "context_tokens": 0,
+                        "context_slice_tokens": 0,
+                        "context_slice_node_ids": [],
+                        "context_slice_edge_ids": [],
+                        "context_slice_fragment_ids": [],
+                        "context_slice_root_node_ids": [],
+                        "rendered_context_node_ids": [],
+                        "rendered_context_fragment_ids": [],
+                        "logical_context_tokens": 0,
+                        "generation": {
+                            "attempts": 0,
+                            "validation_errors": [],
+                            "auto_completed": True,
+                        },
+                        "telemetry": {},
+                        "session": self._session_snapshot(session_id),
+                        "latency_sec": time.time() - started,
+                    })
+                    completed = True
+                else:
+                    raise ActionCompilationError(
+                        f"{role} exceeded max_actions_per_role={self.max_actions_per_role} without done"
+                    )
             latest = self.store.snapshot()
             branch_id = state.get("branch_id", self.branch_id)
             return {
@@ -426,6 +467,30 @@ class LangGraphWorkflow:
             }
 
         return node
+
+    def _auto_complete_exhausted_stage(self, *, role: str, mode: str, branch_id: str):
+        if role != "solver" or mode != "normal":
+            return None
+        if self.task_type not in {"numeric_solve", "numeric_comparison"}:
+            return None
+        if not any("result" in item for item in self._completion_errors(role, mode=mode)):
+            return None
+        calculation = self.store.latest_valid(self.task_id, branch_id, "calculation")
+        if calculation is None:
+            return None
+        content = calculation.content if isinstance(calculation.content, dict) else {}
+        value = content.get("value") if isinstance(content, dict) else None
+        if value is None:
+            return None
+        result_id = content.get("id", "answer") if isinstance(content, dict) else "answer"
+        try:
+            self.compiler.set_node_ref_context({})
+            return self.compiler.apply(
+                role,
+                {"op": "set_result", "id": str(result_id or "answer"), "value": value},
+            )
+        except ActionCompilationError:
+            return None
 
     def _generate_action(
         self,
@@ -463,9 +528,7 @@ class LangGraphWorkflow:
             raw_text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False, default=str)
             try:
                 if isinstance(raw, dict):
-                    from .protocol import normalize_action_payload
-
-                    action = normalize_action_payload(raw)
+                    action = self._normalize_generated_action(role, raw)
                     errors = self._validate_action_dict(role, action)
                     if errors:
                         raise ValueError(f"invalid {role} Action: {'; '.join(errors)}")
@@ -480,7 +543,7 @@ class LangGraphWorkflow:
                         **context_costs,
                         "action_constraint": action_constraint.as_dict() if action_constraint else None,
                     }
-                action = parse_action(str(raw).strip(), role=role, task_type=self.task_type)
+                action = self._parse_generated_action(str(raw).strip(), role=role)
                 return action, {
                     "attempts": attempts,
                     "raw_output": raw_text,
@@ -526,6 +589,48 @@ class LangGraphWorkflow:
                 ))
                 call_metrics.append(self._last_call_metrics(session_id))
         raise AssertionError("unreachable")
+
+    def _parse_generated_action(self, text: str, *, role: str) -> dict[str, Any]:
+        from .protocol import normalize_action_payload
+
+        try:
+            value = json.loads(text)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError(f"{role} output must be exactly one Action JSON object") from exc
+        action = self._normalize_generated_action(role, normalize_action_payload(value))
+        errors = self._validate_action_dict(role, action)
+        if errors:
+            raise ValueError(f"invalid {role} Action: {'; '.join(errors)}")
+        return action
+
+    def _normalize_generated_action(self, role: str, payload: Any) -> Any:
+        from .protocol import normalize_action_payload
+
+        action = normalize_action_payload(payload)
+        if not isinstance(action, dict):
+            return action
+        if role != "solver" or action.get("op") != "set_result" or action.get("value") is not None:
+            return action
+        recovered = self._recover_set_result_value()
+        if recovered is None:
+            return action
+        repaired = dict(action)
+        repaired["value"] = recovered
+        return repaired
+
+    def _recover_set_result_value(self) -> Any:
+        def value_from(node: Any) -> Any:
+            if node is None:
+                return None
+            content = node.content
+            return content.get("value") if isinstance(content, dict) and "value" in content else content
+
+        for logical_id in ("calculation", "result"):
+            node = self.store.latest_valid(self.task_id, self.branch_id, logical_id)
+            value = value_from(node)
+            if value is not None:
+                return value
+        return None
 
     def _last_call_metrics(self, session_id: str) -> dict[str, Any]:
         snapshot = self._session_snapshot(session_id)
@@ -1931,6 +2036,15 @@ class LangGraphWorkflow:
                 return latest("result") or latest("execution") or latest("code")
             return latest("result")
 
+        def result_has_value() -> bool:
+            result = latest("result")
+            if result is None:
+                return False
+            content = result.content
+            if isinstance(content, dict) and "value" in content:
+                return content.get("value") is not None
+            return content is not None
+
         errors: list[str] = []
         if role == "planner":
             required = {
@@ -1972,8 +2086,11 @@ class LangGraphWorkflow:
                 if mode == "repair":
                     errors.append("missing revised result") if not newer_than(result, anchor) else None
                 else:
-                    errors.append("missing calculation") if calculation is None else None
-                    errors.append("missing result") if result is None else None
+                    if self.task_type in {"numeric_solve", "numeric_comparison"} and calculation is not None and result_has_value():
+                        pass
+                    elif not result_has_value():
+                        errors.append("missing calculation") if calculation is None else None
+                        errors.append("missing result") if result is None else None
             else:
                 result = latest("result")
                 if mode == "repair":

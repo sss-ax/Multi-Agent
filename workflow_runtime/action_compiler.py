@@ -50,6 +50,7 @@ class ActionCompiler:
 
     def apply(self, role: str, action: dict[str, Any]) -> CompilationResult:
         action = normalize_action_payload(action)
+        action = self._repair_invalid_action_before_validation(role, action)
         errors = validate_action(role, action, task_type=self.task_type)
         if errors:
             raise ActionCompilationError(f"invalid {role} Action: {'; '.join(errors)}")
@@ -62,6 +63,20 @@ class ActionCompiler:
             raise ActionCompilationError(f"no compiler for Action {op}")
         node_ids = tuple(handler(role, action))
         return CompilationResult(action=copy.deepcopy(action), node_ids=node_ids)
+
+    def _repair_invalid_action_before_validation(self, role: str, action: Any) -> Any:
+        """Deterministically repair narrow protocol edge cases before schema validation."""
+        if not isinstance(action, dict):
+            return action
+        if role == "solver" and action.get("op") == "set_result" and action.get("value") is None:
+            latest = self._latest_value_bearing_node()
+            if latest is None:
+                return action
+            repaired = dict(action)
+            repaired["value"] = self._value_from_node(latest)
+            repaired["_repaired_from_null_value"] = latest.node_id
+            return {key: value for key, value in repaired.items() if key != "_repaired_from_null_value"}
+        return action
 
     def _add_node(
         self,
@@ -130,6 +145,36 @@ class ActionCompiler:
                 return value
         return content.get("value") if isinstance(content, dict) and "value" in content else content
 
+    def _value_from_node(self, node: Any) -> Any:
+        if self.task_type == "code_generation":
+            return self._code_answer_value(node)
+        content = node.content
+        return content.get("value") if isinstance(content, dict) and "value" in content else content
+
+    def _latest_value_bearing_node(self):
+        preferred = (
+            ("code", "result", "final_answer", "execution")
+            if self.task_type == "code_generation"
+            else ("result", "final_answer")
+        )
+        direct = self._latest_node_any(*preferred)
+        if direct is not None and self._is_value_bearing_node(direct):
+            return direct
+        candidates = [
+            node for node in self.store.snapshot().nodes.values()
+            if node.task_id == self.task_id
+            and node.branch_id == self.branch_id
+            and node.is_operationally_valid()
+            and self._is_value_bearing_node(node)
+        ]
+        return max(candidates, key=lambda node: (node.version, node.created_at, node.node_id), default=None)
+
+    def _is_value_bearing_node(self, node: Any) -> bool:
+        if node.type not in FINAL_VALUE_SOURCE_TYPES:
+            return False
+        value = self._value_from_node(node)
+        return value is not None
+
     def _latest_with_prefix(self, prefix: str):
         candidates = [
             node for node in self.store.snapshot().nodes.values()
@@ -179,7 +224,7 @@ class ActionCompiler:
         if context_node is not None:
             return context_node
 
-        if re.fullmatch(r"n\d+", logical_id) or re.fullmatch(r"R\d+", logical_id):
+        if self._looks_like_pseudo_node_ref(logical_id):
             return None
 
         if expected_type and not logical_id:
@@ -199,6 +244,14 @@ class ActionCompiler:
                 return node
 
         return None
+
+    def _looks_like_pseudo_node_ref(self, ref: Any) -> bool:
+        text = str(ref).strip()
+        if not text:
+            return False
+        if re.fullmatch(r"n\d+", text) or re.fullmatch(r"R\d+", text):
+            return True
+        return bool(re.search(r"(?:^|[._:-])n\d+(?:$|[._:-])", text))
 
     def _resolve_node_ref_from_context(self, ref: str):
         key = str(ref).strip()
@@ -464,6 +517,9 @@ class ActionCompiler:
         used_fallback_source = False
         if source is None and self.task_type == "code_generation":
             source = self._code_answer_source()
+            used_fallback_source = source is not None
+        if source is None and self._looks_like_pseudo_node_ref(action["source"]):
+            source = self._latest_value_bearing_node()
             used_fallback_source = source is not None
         if source is None:
             raise ActionCompilationError(f"answer source does not exist: {action['source']}")
