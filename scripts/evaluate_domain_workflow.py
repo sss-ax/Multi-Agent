@@ -953,6 +953,55 @@ def optional_consumption_totals(records: List[Dict[str, Any]]) -> Dict[str, Any]
     return totals
 
 
+def evaluate_verifier_guided_candidates(
+    *,
+    rows: List[Dict[str, Any]],
+    domain: str,
+    model: Any,
+    candidate_count: int,
+    seed: int,
+    temperature: float,
+    top_p: float,
+    current_baseline: float,
+    data_path: str = "",
+) -> Dict[str, Any]:
+    if domain not in {"gsm8k", "humaneval", "mbpp"}:
+        raise ValueError("verifier_guided_candidates currently supports gsm8k, humaneval, and mbpp")
+    from scripts.run_reasoning_upper_bounds import run_verifier_select
+
+    report = run_verifier_select(
+        model,
+        rows,
+        domain=domain,
+        n=candidate_count,
+        seed=seed,
+        temperature=temperature,
+        top_p=top_p,
+        current_baseline=current_baseline,
+    )
+    records = list(report.get("records", []))
+    metric_values: Dict[str, float] = {}
+    for key in ("coverage@1", "coverage@2", "coverage@4", "coverage@8", "coverage@16"):
+        if key in report:
+            metric_values[key] = float(report[key])
+    return {
+        **report,
+        "domain": domain,
+        "data_path": data_path,
+        "execution_mode": "verifier_guided_candidates",
+        "candidate_count": candidate_count,
+        "count": len(records),
+        "accuracy_or_pass_at_1": float(report.get("verifier_select_at_n", 0.0) or 0.0),
+        **metric_values,
+        "failure_count": 0,
+        "candidate_graph_invariant_error_count": sum(
+            int(bool(record.get("candidate_graph", {}).get("invariant_errors")))
+            for record in records
+        ),
+        "records": records,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--domain", choices=("gsm8k", "tatqa", "hotpotqa", "mbpp", "humaneval", "mmlu_pro"), required=True)
@@ -960,7 +1009,12 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--max-rounds", type=int, default=3)
-    parser.add_argument("--execution-mode", choices=("optimized", "native_langgraph"), default="optimized")
+    parser.add_argument("--execution-mode", choices=("optimized", "native_langgraph", "verifier_guided_candidates"), default="optimized")
+    parser.add_argument("--candidate-count", type=int, default=4)
+    parser.add_argument("--current-baseline", type=float, default=0.0)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument(
         "--communication-policy",
         choices=(
@@ -991,6 +1045,38 @@ def main() -> None:
     parser.add_argument("--output", default="")
     args = parser.parse_args()
 
+    rows = read(Path(args.data_path), args.domain, args.limit)
+    if not rows:
+        raise SystemExit("No evaluation rows loaded")
+    if args.execution_mode == "verifier_guided_candidates":
+        from scripts.run_reasoning_upper_bounds import SamplingModel
+
+        model = SamplingModel(args.model_path, max_new_tokens=args.max_new_tokens)
+        report = evaluate_verifier_guided_candidates(
+            rows=rows,
+            domain=args.domain,
+            model=model,
+            candidate_count=args.candidate_count,
+            seed=args.communication_seed,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            current_baseline=args.current_baseline,
+            data_path=args.data_path,
+        )
+        report.update({
+            "model_path": args.model_path,
+            "limit": args.limit,
+            "seed": args.communication_seed,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "max_new_tokens": args.max_new_tokens,
+        })
+        if args.output:
+            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps({k: v for k, v in report.items() if k != "records"}, ensure_ascii=False, indent=2))
+        return
+
     from langgraph.checkpoint.memory import MemorySaver
     from workflow_runtime.communication import make_communication_policy
     from workflow_runtime.langgraph_workflow import LangGraphWorkflow, NativeLangGraphWorkflow
@@ -1002,10 +1088,6 @@ def main() -> None:
         if args.execution_mode == "native_langgraph"
         else TransformersModel(args.model_path)
     )
-
-    rows = read(Path(args.data_path), args.domain, args.limit)
-    if not rows:
-        raise SystemExit("No evaluation rows loaded")
     records: List[Dict[str, Any]] = []
     for index, row in enumerate(rows):
         sample_id = f"eval_{args.domain}_{index}"
