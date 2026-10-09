@@ -66,6 +66,8 @@ def apply_verification_signal(action: dict[str, Any], result: VerificationResult
     """Fuse verifier signal into a critic Action without weakening hard failures."""
     if action.get("op") != "verify":
         return action
+    if action.get("status") == "need_fix" and result.status == "uncertain":
+        return action
     if not result.needs_revision:
         if result.confidence < 1.0:
             return action
@@ -283,7 +285,8 @@ def _verify_choice(graph: Any, *, task_id: str, branch_id: str) -> VerificationR
         return VerificationResult(status="uncertain", confidence=0.2, verifier_source=("ChoiceVerifier",))
     content = _json_value(_node_content(result))
     value = content.get("value") if isinstance(content, dict) else content
-    label = str(value).strip().upper()[:1]
+    payload = _json_value(value)
+    label = _choice_label(payload)
     schema = _latest(graph, task_id, branch_id, "choice_schema")
     schema_content = _json_value(_node_content(schema))
     labels: set[str] = set()
@@ -316,11 +319,82 @@ def _verify_choice(graph: Any, *, task_id: str, branch_id: str) -> VerificationR
             preserve=("question", "choices"),
             requested_fragments=("result#final_value", "choice#label"),
         )
+
+    if not isinstance(payload, dict):
+        return _choice_structure_need_fix("Result must be a structured option-verification object.")
+    missing = [
+        key for key in ("answer", "solver_choice", "independent_choice", "option_analysis", "confidence")
+        if key not in payload
+    ]
+    option_analysis = payload.get("option_analysis")
+    if missing or not isinstance(option_analysis, dict) or not option_analysis:
+        reason = (
+            f"Structured option verification is incomplete; missing keys: {', '.join(missing)}."
+            if missing else
+            "Structured option verification requires a non-empty option_analysis object."
+        )
+        return _choice_structure_need_fix(reason)
+
+    independent = _choice_label(payload.get("independent_choice"))
+    solver_choice = _choice_label(payload.get("solver_choice"))
+    if solver_choice and solver_choice != label:
+        return VerificationResult(
+            status="need_fix",
+            consistency_checks=("solver_choice_answer_mismatch",),
+            confidence=1.0,
+            verifier_source=("ChoiceVerifier", "semantic_option_verifier"),
+            error_type="inconsistent_option_result",
+            error_location="solver_choice",
+            reason=f"Result answer is {label}, but solver_choice is {solver_choice}.",
+            repair_instruction="Make answer and solver_choice agree before verification.",
+            preserve=("question", "choices", "option_analysis"),
+            requested_fragments=("result#final_value", "choice#text"),
+        )
+    if labels and independent not in labels:
+        return VerificationResult(
+            status="need_fix",
+            consistency_checks=("invalid_independent_choice_label",),
+            confidence=1.0,
+            verifier_source=("ChoiceVerifier", "semantic_option_verifier"),
+            error_type="invalid_option_analysis",
+            error_location="independent_choice",
+            reason=f"Independent choice {independent!r} is not one of the available options.",
+            repair_instruction="Re-run option analysis and choose exactly one available option label.",
+            preserve=("question", "choices"),
+            requested_fragments=("result#final_value", "choice#label"),
+            metadata={"solver_choice": label, "independent_choice": independent},
+        )
+    if independent != label:
+        return VerificationResult(
+            status="need_fix",
+            consistency_checks=("independent_choice_disagrees",),
+            confidence=float(payload.get("confidence", 0.8) or 0.8),
+            verifier_source=("ChoiceVerifier", "semantic_option_verifier"),
+            error_type="semantic_disagreement",
+            error_location="final choice",
+            reason=f"Solver chose {label}, but independent option analysis chose {independent}.",
+            repair_instruction=(
+                "Revise the answer using the independent option analysis; include support "
+                "and contradiction for the competing options."
+            ),
+            preserve=("question", "choices", "option_analysis"),
+            requested_fragments=("result#final_value", "choice#text"),
+            metadata={
+                "solver_choice": label,
+                "independent_choice": independent,
+                "option_analysis_present": True,
+            },
+        )
     return VerificationResult(
         status="verified",
-        consistency_checks=("option_valid",),
-        confidence=0.55,
-        verifier_source=("ChoiceVerifier", "option_validity"),
+        consistency_checks=("option_valid", "independent_choice_agrees", "option_analysis_present"),
+        confidence=0.85,
+        verifier_source=("ChoiceVerifier", "semantic_option_verifier"),
+        metadata={
+            "solver_choice": label,
+            "independent_choice": independent,
+            "option_analysis_present": True,
+        },
     )
 
 
@@ -331,9 +405,9 @@ def _verify_evidence(graph: Any, *, task_id: str, branch_id: str) -> Verificatio
     ]
     if not facts:
         return VerificationResult(
-            status="uncertain",
+            status="need_fix",
             consistency_checks=("missing_evidence",),
-            confidence=0.3,
+            confidence=1.0,
             missing_evidence=("supporting_fact",),
             verifier_source=("EvidenceVerifier", "coverage"),
             error_type="evidence_insufficiency",
@@ -342,9 +416,192 @@ def _verify_evidence(graph: Any, *, task_id: str, branch_id: str) -> Verificatio
             repair_instruction="Request or use supporting evidence before finalizing the answer.",
             requested_fragments=("supporting_fact#content", "evidence_link#entity"),
         )
+    result = _latest(graph, task_id, branch_id, "result")
+    payload = _json_value(_node_content(result)) if result is not None else None
+    if isinstance(payload, dict) and "value" in payload:
+        payload = _json_value(payload.get("value"))
+    answer = _structured_answer(payload)
+    cited_ids = _string_list(payload.get("cited_fact_ids") if isinstance(payload, dict) else None)
+    bridge = str(payload.get("bridge_entity", "")).strip() if isinstance(payload, dict) else ""
+    chain = _string_list(payload.get("reasoning_chain") if isinstance(payload, dict) else None)
+    fact_index = _fact_index(facts)
+    required_missing = []
+    if not isinstance(payload, dict):
+        required_missing = ["answer", "bridge_entity", "cited_fact_ids", "reasoning_chain"]
+    else:
+        required_missing = [
+            key for key in ("answer", "bridge_entity", "cited_fact_ids", "reasoning_chain")
+            if key not in payload
+        ]
+        if not answer:
+            required_missing.append("answer_value")
+        if not cited_ids:
+            required_missing.append("cited_fact_ids_value")
+        if not bridge:
+            required_missing.append("bridge_entity_value")
+        if not chain:
+            required_missing.append("reasoning_chain_value")
+    if required_missing:
+        return VerificationResult(
+            status="need_fix",
+            consistency_checks=("evidence_present", "missing_structured_citations"),
+            confidence=1.0,
+            missing_evidence=tuple(dict.fromkeys(required_missing)),
+            verifier_source=("EvidenceVerifier", "coverage"),
+            error_type="missing_evidence_chain",
+            error_location="result",
+            reason="Evidence exists, but the candidate is missing the required structured evidence chain.",
+            repair_instruction=(
+                "Return a structured answer with answer, bridge_entity, cited_fact_ids, "
+                "and reasoning_chain grounded in visible supporting facts."
+            ),
+            preserve=("question", "visible evidence"),
+            requested_fragments=("result#final_value", "supporting_fact#content", "evidence_link#entity"),
+        )
+    missing = [fact_id for fact_id in cited_ids if fact_id not in fact_index]
+    if missing:
+        return VerificationResult(
+            status="need_fix",
+            consistency_checks=("invalid_citation",),
+            confidence=1.0,
+            missing_evidence=tuple(missing),
+            verifier_source=("EvidenceVerifier", "citation_validity"),
+            error_type="invalid_citation",
+            error_location="cited_fact_ids",
+            reason=f"Candidate cites unknown supporting facts: {', '.join(missing)}.",
+            repair_instruction="Cite only visible supporting_fact ids, titles, or title:sent_id references.",
+            preserve=("answer", "visible evidence"),
+            requested_fragments=("result#final_value", "supporting_fact#content"),
+        )
+    if len(cited_ids) < 2:
+        return VerificationResult(
+            status="need_fix",
+            consistency_checks=("citation_valid", "missing_second_hop"),
+            confidence=1.0,
+            missing_evidence=("second_hop",),
+            verifier_source=("EvidenceVerifier", "chain_completeness"),
+            error_type="missing_hop",
+            error_location="reasoning_chain",
+            reason="A multihop answer should cite at least two connected facts.",
+            repair_instruction="Add the missing hop and cite the fact that connects the bridge entity to the answer.",
+            preserve=("valid citations",),
+            requested_fragments=("supporting_fact#content", "evidence_link#entity"),
+        )
+    cited_text = " ".join(_fact_text(fact_index[fact_id]) for fact_id in cited_ids)
+    bridge_present = _contains_normalized(cited_text, bridge)
+    if not bridge_present:
+        return VerificationResult(
+            status="need_fix",
+            consistency_checks=("citation_valid", "incomplete_chain"),
+            confidence=1.0,
+            missing_evidence=("reasoning_chain",),
+            verifier_source=("EvidenceVerifier", "chain_completeness"),
+            error_type="incomplete_evidence_chain",
+            error_location="reasoning_chain",
+            reason="The cited facts do not clearly expose a bridge chain.",
+            repair_instruction="Show hop1 -> bridge and bridge -> answer using the cited facts.",
+            preserve=("valid citations",),
+            requested_fragments=("result#final_value", "supporting_fact#content"),
+        )
     return VerificationResult(
         status="verified",
-        consistency_checks=("evidence_present",),
-        confidence=0.5,
-        verifier_source=("EvidenceVerifier", "coverage"),
+        consistency_checks=("citation_valid", "chain_complete", "semantic_entailment_delegated_to_critic"),
+        confidence=0.0,
+        verifier_source=("EvidenceVerifier", "programmatic_structure_only"),
+        metadata={
+            "answer": answer,
+            "bridge_entity": bridge,
+            "cited_fact_ids": cited_ids,
+            "semantic_entailment_required_from": "critic",
+        },
     )
+
+
+def _choice_label(value: Any) -> str:
+    value = _json_value(value)
+    if isinstance(value, dict):
+        for key in ("solver_choice", "choice", "answer", "label", "value"):
+            label = _choice_label(value.get(key))
+            if label:
+                return label
+        return ""
+    text = str(value or "").strip().upper()
+    match = re.search(r"\b([A-J])\b", text)
+    return match.group(1) if match else text[:1]
+
+
+def _choice_structure_need_fix(reason: str) -> VerificationResult:
+    return VerificationResult(
+        status="need_fix",
+        consistency_checks=("missing_semantic_option_verification",),
+        confidence=1.0,
+        verifier_source=("ChoiceVerifier", "semantic_option_verifier"),
+        error_type="missing_semantic_option_verification",
+        error_location="option analysis",
+        reason=reason,
+        repair_instruction=(
+            "Return set_result.value as an object with answer, solver_choice, independent_choice, "
+            "option_analysis, and confidence; support or contradict each plausible option."
+        ),
+        preserve=("question", "choices"),
+        requested_fragments=("result#final_value", "choice#text"),
+    )
+
+
+def _structured_answer(value: Any) -> str:
+    value = _json_value(value)
+    if isinstance(value, dict):
+        for key in ("answer", "final_answer", "value"):
+            if key in value:
+                return _structured_answer(value[key])
+        return ""
+    return str(value or "").strip()
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _fact_index(facts: list[Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for node in facts:
+        content = _json_value(_node_content(node))
+        keys = {str(getattr(node, "logical_id", "")).strip(), str(getattr(node, "node_id", "")).strip()}
+        if isinstance(content, dict):
+            for key in ("id", "fact_id", "logical_id"):
+                if content.get(key):
+                    keys.add(str(content[key]).strip())
+            title = str(content.get("title", content.get("entity", ""))).strip()
+            sent_id = content.get("sent_id")
+            if title:
+                keys.add(title)
+                if sent_id is not None:
+                    keys.add(f"{title}:{sent_id}")
+                    keys.add(f"{title}#{sent_id}")
+        for key in keys:
+            if key:
+                result[key] = node
+    return result
+
+
+def _fact_text(node: Any) -> str:
+    content = _json_value(_node_content(node))
+    if isinstance(content, dict):
+        title = str(content.get("title", content.get("entity", ""))).strip()
+        text = str(content.get("text", content.get("sentence", ""))).strip()
+        return " ".join(part for part in (title, text) if part)
+    return str(content or "")
+
+
+def _normalize_for_match(value: Any) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", str(value).lower())).strip()
+
+
+def _contains_normalized(text: str, needle: str) -> bool:
+    normalized_text = _normalize_for_match(text)
+    normalized_needle = _normalize_for_match(needle)
+    return bool(normalized_needle and normalized_needle in normalized_text)

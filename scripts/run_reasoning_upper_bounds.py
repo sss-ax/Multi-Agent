@@ -42,11 +42,25 @@ from workflow_runtime.candidate_graph import (  # noqa: E402
     materialize_candidate_pool,
 )
 from workflow_runtime.candidate_selector import select_candidate_with_deployable_verifier  # noqa: E402
+from workflow_runtime.candidate_selector_communication import (  # noqa: E402
+    build_candidate_fragments,
+    rendered_fragment_tokens,
+    run_selector_with_fragments,
+    select_fragment_ids,
+)
 from workflow_runtime.graph_store import GraphStore  # noqa: E402
 from scripts.evaluate_deployable_candidate_selector import code_features, numeric_features  # noqa: E402
 
 
 DOMAINS = ("gsm8k", "humaneval", "mbpp")
+SELECTOR_COMMUNICATION_POLICIES = (
+    "deployable_full",
+    "selector_send_all",
+    "selector_core_only",
+    "selector_verifier_only",
+    "selector_receiver_aware",
+    "selector_random_same_budget",
+)
 
 
 @dataclass
@@ -373,7 +387,7 @@ def run_verifier_select(
             candidate_record(candidate, domain=domain, candidate_id=f"c{attempt}")
             for attempt, candidate in enumerate(candidates)
         ]
-        deployable_records = deployable_candidate_records(candidate_records, domain=domain)
+        deployable_records = deployable_candidate_records(candidate_records, domain=domain, row=row)
         selected, candidate_graph = record_deployable_selection_graph(
             row,
             domain=domain,
@@ -451,6 +465,7 @@ def run_select_repair(
     verifier_baseline: float = 0.0,
     experiment_name: str = "select_repair",
     min_repair_candidates: int = 4,
+    selector_communication_policy: str = "deployable_full",
 ) -> dict[str, Any]:
     records = []
     for index, row in enumerate(rows, start=1):
@@ -465,6 +480,7 @@ def run_select_repair(
         actions: list[str] = []
         controller_reasons: list[str] = []
         generate_count = 0
+        selector_communication_steps: list[dict[str, Any]] = []
 
         while len(candidates) < max(1, n):
             attempt = len(candidates)
@@ -485,13 +501,16 @@ def run_select_repair(
                 candidate_record(candidate, domain=domain, candidate_id=f"c{candidate_index}")
                 for candidate_index, candidate in enumerate(candidates)
             ]
-            deployable_records = deployable_candidate_records(candidate_records, domain=domain)
-            selected, candidate_graph = record_deployable_selection_graph(
-                row,
+            deployable_records = deployable_candidate_records(candidate_records, domain=domain, row=row)
+            selected, candidate_graph, selector_comm = select_candidate_for_adaptive_controller(
+                row=row,
                 domain=domain,
                 group_id=f"{row.get('sample_id', index)}_select_repair_{n}_step_{len(candidates)}",
                 candidates=deployable_records,
+                policy=selector_communication_policy,
+                seed=seed + index * 1009 + attempt,
             )
+            selector_communication_steps.append(selector_comm)
             selected_index = _candidate_index_from_id(selected.selected_candidate_id, len(candidates))
             selected_deployable = deployable_records[selected_index]
             decision = adaptive_controller_decision(
@@ -573,6 +592,7 @@ def run_select_repair(
             "candidate_graph": candidate_graph,
             "candidates": candidate_records,
             "feedback": repair_feedback,
+            "selector_communication_steps": selector_communication_steps,
         }
         if repair_attempt:
             record["repair"] = candidate_record(repair_attempt, domain=domain, candidate_id=f"{selected.selected_candidate_id}_repair_1")
@@ -631,7 +651,20 @@ def run_select_repair(
         ),
         "estimated_bruteforce_best_of_n_model_tokens": 0,
         "bruteforce_tokens_per_oracle_correct": None,
+        "selector_communication_policy": selector_communication_policy,
+        "selector_input_tokens": sum(
+            sum(int(step.get("selector_input_tokens", 0) or 0) for step in record.get("selector_communication_steps", []))
+            for record in records
+        ),
+        "selector_send_all_equivalent_tokens": sum(
+            sum(int(step.get("selector_send_all_equivalent_tokens", 0) or 0) for step in record.get("selector_communication_steps", []))
+            for record in records
+        ),
     })
+    report["selector_token_saving_vs_send_all"] = (
+        1.0 - report["selector_input_tokens"] / report["selector_send_all_equivalent_tokens"]
+        if report["selector_send_all_equivalent_tokens"] else 0.0
+    )
     generated_candidate_tokens = [
         int(candidate.get("model_tokens", 0) or 0)
         for record in records
@@ -834,7 +867,12 @@ def first_correct_candidate_id(candidates: list[dict[str, Any]]) -> str | None:
     return None
 
 
-def deployable_candidate_records(candidates: list[dict[str, Any]], *, domain: str) -> list[dict[str, Any]]:
+def deployable_candidate_records(
+    candidates: list[dict[str, Any]],
+    *,
+    domain: str,
+    row: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     answer_counts: dict[str, int] = {}
     if domain == "gsm8k":
         for candidate in candidates:
@@ -843,11 +881,12 @@ def deployable_candidate_records(candidates: list[dict[str, Any]], *, domain: st
                 answer_counts[value] = answer_counts.get(value, 0) + 1
     records = []
     for candidate in candidates:
-        signals = (
-            numeric_features(candidate, answer_counts, len(candidates))
-            if domain == "gsm8k"
-            else code_features(candidate)
-        )
+        if domain == "gsm8k":
+            signals = numeric_features(candidate, answer_counts, len(candidates))
+        else:
+            signals = code_features(candidate)
+            if domain == "mbpp" and row is not None:
+                signals = {**signals, **mbpp_allowed_test_features(row, candidate)}
         records.append({
             **candidate,
             "score": signals,
@@ -859,6 +898,52 @@ def deployable_candidate_records(candidates: list[dict[str, Any]], *, domain: st
             ),
         })
     return records
+
+
+def mbpp_allowed_test_features(row: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    code = str(candidate.get("artifact") or candidate.get("raw_tail") or "")
+    tests, setup = tests_for_row(row)
+    if not tests:
+        return {}
+    result = execute_python_tests_detailed(code=code, tests=tests, setup=setup, timeout=5)
+    detail = dict(result.execution)
+    if result.success:
+        return {
+            "tests_passed": True,
+            "public_tests_passed": True,
+            "verifier_pass": True,
+            "failed_test_count": 0,
+            "test_pass_rate": 1.0,
+            "confidence": 0.9,
+        }
+    kind = str(detail.get("kind") or "execution_failure")
+    features: dict[str, Any] = {
+        "tests_passed": False,
+        "public_tests_passed": False,
+        "tests_failed": True,
+        "failed_test_count": 1,
+        "test_pass_rate": 0.0,
+        "confidence": 0.1,
+        "failure_kind": kind,
+        "failed_test": detail.get("failed_test"),
+        "test_expression": detail.get("test_expression"),
+        "function_name": detail.get("function_name"),
+        "input_repr": detail.get("input_repr"),
+        "expected": detail.get("expected"),
+        "actual": detail.get("actual"),
+        "exception_type": detail.get("exception_type"),
+        "exception": detail.get("exception"),
+    }
+    if kind == "assertion_failure":
+        features["assertion_failure"] = True
+    elif kind == "timeout":
+        features["timeout"] = True
+    elif kind == "syntax_error":
+        features["syntax_error"] = True
+        features["compile_error"] = True
+    elif kind in {"type_error", "name_error", "import_error", "runtime_exception"}:
+        features["runtime_exception"] = True
+    return features
 
 
 def repair_transition(before_correct: bool, after_correct: bool) -> str:
@@ -972,6 +1057,8 @@ def _has_actionable_failure(domain: str, candidate: dict[str, Any]) -> bool:
             or score.get("constraint_inconsistency")
             or score.get("final_value_valid")
         )
+    if score.get("tests_passed") or score.get("verifier_pass") or score.get("public_tests_passed"):
+        return False
     return bool(
         score.get("assertion_failure")
         or score.get("runtime_exception")
@@ -980,7 +1067,6 @@ def _has_actionable_failure(domain: str, candidate: dict[str, Any]) -> bool:
         or score.get("syntax_error")
         or score.get("compile_error")
         or score.get("failed_test_count")
-        or not score.get("public_tests_passed", False)
     )
 
 
@@ -1093,6 +1179,65 @@ def record_deployable_selection_graph(
     }
 
 
+def select_candidate_for_adaptive_controller(
+    *,
+    row: dict[str, Any],
+    domain: str,
+    group_id: str,
+    candidates: list[dict[str, Any]],
+    policy: str,
+    seed: int,
+) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+    fragments = build_candidate_fragments(candidates)
+    send_all_ids = select_fragment_ids(fragments, policy="selector_send_all", seed=seed)
+    send_all_tokens = rendered_fragment_tokens(fragments, send_all_ids)
+    if policy == "deployable_full":
+        selection, candidate_graph = record_deployable_selection_graph(
+            row,
+            domain=domain,
+            group_id=group_id,
+            candidates=candidates,
+        )
+        return selection, candidate_graph, {
+            "policy": policy,
+            "selected_candidate_id": selection.selected_candidate_id,
+            "selector_input_tokens": send_all_tokens,
+            "selector_send_all_equivalent_tokens": send_all_tokens,
+            "token_saving_vs_send_all": 0.0,
+            "visible_fragment_ids": list(send_all_ids),
+        }
+
+    budget_tokens = None
+    if policy == "selector_random_same_budget":
+        receiver_aware_ids = select_fragment_ids(fragments, policy="selector_receiver_aware", seed=seed)
+        budget_tokens = rendered_fragment_tokens(fragments, receiver_aware_ids)
+    selection = run_selector_with_fragments(
+        candidates,
+        policy=policy,
+        seed=seed,
+        budget_tokens=budget_tokens,
+    )
+    candidate_graph = record_candidate_graph(
+        row,
+        domain=domain,
+        group_id=group_id,
+        candidates=candidates,
+        selector_policy=policy,
+        selected_candidate_id=selection.selected_candidate_id,
+        metadata=selection.as_dict(),
+    )
+    selector_input_tokens = int(selection.rendered_tokens)
+    return selection, candidate_graph, {
+        **selection.as_dict(),
+        "selector_input_tokens": selector_input_tokens,
+        "selector_send_all_equivalent_tokens": send_all_tokens,
+        "token_saving_vs_send_all": (
+            1.0 - selector_input_tokens / send_all_tokens
+            if send_all_tokens else 0.0
+        ),
+    }
+
+
 def summarize(records: list[dict[str, Any]], **metadata: Any) -> dict[str, Any]:
     count = len(records)
     correct = sum(int(bool(r.get("correct"))) for r in records)
@@ -1154,6 +1299,11 @@ def main() -> None:
     parser.add_argument("--current-baseline", type=float, default=0.0)
     parser.add_argument("--verifier-baseline", type=float, default=0.0)
     parser.add_argument("--min-repair-candidates", type=int, default=4)
+    parser.add_argument(
+        "--selector-communication-policy",
+        choices=SELECTOR_COMMUNICATION_POLICIES,
+        default="deployable_full",
+    )
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
@@ -1202,6 +1352,7 @@ def main() -> None:
             verifier_baseline=args.verifier_baseline,
             experiment_name=args.experiment,
             min_repair_candidates=args.min_repair_candidates,
+            selector_communication_policy=args.selector_communication_policy,
         )
     elif args.experiment == "oracle_repair":
         report = run_oracle_repair(

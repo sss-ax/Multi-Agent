@@ -140,7 +140,7 @@ def test_math_verifier_accepts_repaired_result_with_stale_calculation_trace() ->
     assert "calculation_trace_stale" in signal.deterministic_checks
 
 
-def test_choice_verifier_accepts_json_string_choice_schema_labels() -> None:
+def test_choice_verifier_rejects_bare_choice_label() -> None:
     store = GraphStore()
     store.add_node(task_id="t", branch_id="main", logical_id="task", node_type="task", content="mcq", owner="user")
     store.add_node(
@@ -170,4 +170,205 @@ def test_choice_verifier_accepts_json_string_choice_schema_labels() -> None:
 
     signal = verify_task_candidate("multiple_choice", store, task_id="t", branch_id="main")
 
+    assert signal.status == "need_fix"
+    assert signal.error_type == "missing_semantic_option_verification"
+
+
+def test_choice_verifier_uses_structured_independent_option_analysis() -> None:
+    store = GraphStore()
+    store.add_node(task_id="t", branch_id="main", logical_id="task", node_type="task", content="mcq", owner="user")
+    for label in ("A", "B"):
+        store.add_node(
+            task_id="t",
+            branch_id="main",
+            logical_id=f"choice_{label.lower()}",
+            node_type="choice",
+            content={"label": label, "text": f"option {label}"},
+            owner="dataset",
+        )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="result",
+        node_type="result",
+        content={
+            "id": "answer",
+            "value": {
+                "answer": "B",
+                "solver_choice": "B",
+                "independent_choice": "B",
+                "option_analysis": {
+                    "A": {"support": [], "contradiction": ["not supported"]},
+                    "B": {"support": ["supported"], "contradiction": []},
+                },
+                "confidence": 0.8,
+            },
+        },
+        owner="solver",
+    )
+
+    signal = verify_task_candidate("multiple_choice", store, task_id="t", branch_id="main")
+
     assert signal.status == "verified"
+    assert "independent_choice_agrees" in signal.consistency_checks
+    assert signal.metadata["independent_choice"] == "B"
+
+
+def test_choice_verifier_rejects_structured_disagreement() -> None:
+    store = GraphStore()
+    store.add_node(task_id="t", branch_id="main", logical_id="task", node_type="task", content="mcq", owner="user")
+    for label in ("A", "B"):
+        store.add_node(
+            task_id="t",
+            branch_id="main",
+            logical_id=f"choice_{label.lower()}",
+            node_type="choice",
+            content={"label": label, "text": f"option {label}"},
+            owner="dataset",
+        )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="result",
+        node_type="result",
+        content={
+            "id": "answer",
+            "value": {
+                "answer": "B",
+                "solver_choice": "B",
+                "independent_choice": "A",
+                "option_analysis": {
+                    "A": {"support": ["supported"], "contradiction": []},
+                    "B": {"support": [], "contradiction": ["not supported"]},
+                },
+                "confidence": 0.8,
+            },
+        },
+        owner="solver",
+    )
+
+    signal = verify_task_candidate("multiple_choice", store, task_id="t", branch_id="main")
+
+    assert signal.status == "need_fix"
+    assert signal.error_type == "semantic_disagreement"
+
+
+def test_hotpot_verifier_requires_structured_citations() -> None:
+    store = GraphStore()
+    store.add_node(task_id="t", branch_id="main", logical_id="task", node_type="task", content="qa", owner="user")
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="supporting_fact_1",
+        node_type="supporting_fact",
+        content={"title": "Ada", "sent_id": 0, "text": "Ada was born in London."},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="result",
+        node_type="result",
+        content={"id": "answer", "value": "London"},
+        owner="solver",
+    )
+
+    signal = verify_task_candidate("multihop_qa", store, task_id="t", branch_id="main")
+
+    assert signal.status == "need_fix"
+    assert signal.error_type == "missing_evidence_chain"
+
+
+def test_hotpot_verifier_accepts_structured_bridge_chain() -> None:
+    store = GraphStore()
+    store.add_node(task_id="t", branch_id="main", logical_id="task", node_type="task", content="qa", owner="user")
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="supporting_fact_1",
+        node_type="supporting_fact",
+        content={"title": "Ada", "sent_id": 0, "text": "Ada collaborated with Charles Babbage."},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="supporting_fact_2",
+        node_type="supporting_fact",
+        content={"title": "Charles Babbage", "sent_id": 0, "text": "Charles Babbage was born in London."},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="result",
+        node_type="result",
+        content={
+            "id": "answer",
+            "value": {
+                "answer": "London",
+                "bridge_entity": "Charles Babbage",
+                "cited_fact_ids": ["supporting_fact_1", "supporting_fact_2"],
+                "reasoning_chain": [
+                    "supporting_fact_1 -> Charles Babbage",
+                    "Charles Babbage + supporting_fact_2 -> London",
+                ],
+            },
+        },
+        owner="solver",
+    )
+
+    signal = verify_task_candidate("multihop_qa", store, task_id="t", branch_id="main")
+
+    assert signal.status == "verified"
+    assert "chain_complete" in signal.consistency_checks
+    assert "semantic_entailment_delegated_to_critic" in signal.consistency_checks
+    assert signal.confidence == 0.0
+    assert signal.metadata["answer"] == "London"
+    assert signal.metadata["semantic_entailment_required_from"] == "critic"
+
+
+def test_hotpot_verifier_does_not_use_lexical_answer_proxy() -> None:
+    store = GraphStore()
+    store.add_node(task_id="t", branch_id="main", logical_id="task", node_type="task", content="qa", owner="user")
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="supporting_fact_1",
+        node_type="supporting_fact",
+        content={"title": "Ada", "sent_id": 0, "text": "Ada collaborated with Charles Babbage."},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="supporting_fact_2",
+        node_type="supporting_fact",
+        content={"title": "Charles Babbage", "sent_id": 0, "text": "Charles Babbage designed the Analytical Engine."},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="result",
+        node_type="result",
+        content={
+            "id": "answer",
+            "value": {
+                "answer": "Paris",
+                "bridge_entity": "Charles Babbage",
+                "cited_fact_ids": ["supporting_fact_1", "supporting_fact_2"],
+                "reasoning_chain": [
+                    "supporting_fact_1 -> Charles Babbage",
+                    "Charles Babbage + supporting_fact_2 -> Paris",
+                ],
+            },
+        },
+        owner="solver",
+    )
+
+    signal = verify_task_candidate("multihop_qa", store, task_id="t", branch_id="main")
+
+    assert signal.status == "verified"
+    assert "semantic_entailment_delegated_to_critic" in signal.consistency_checks
+    assert signal.confidence == 0.0

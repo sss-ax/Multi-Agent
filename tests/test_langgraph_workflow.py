@@ -11,6 +11,7 @@ import pytest
 from workflow_runtime import GraphStore
 from workflow_runtime.communication import make_communication_policy
 from workflow_runtime.langgraph_workflow import LangGraphWorkflow, NativeLangGraphWorkflow
+from workflow_runtime.models import ContextSlice
 from workflow_runtime.telemetry import WorkflowTelemetry
 
 
@@ -38,6 +39,188 @@ def test_workflow_contract_requests_one_strict_action():
     contract = workflow._system_contract("planner", "normal")
     assert "one Action" in contract
     assert "GraphStore nodes" in contract
+
+
+def test_deduplicated_graph_context_refs_duplicate_source_content():
+    store = GraphStore()
+    first = store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="evidence_1",
+        node_type="evidence",
+        content="same source text with several words",
+        owner="dataset",
+    )
+    second = store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="evidence_2",
+        node_type="evidence",
+        content="same source text with several words",
+        owner="dataset",
+    )
+    context = ContextSlice(
+        slice_id="s",
+        task_id="t",
+        branch_id="main",
+        target_role="planner",
+        policy="test",
+        root_node_ids=[first.node_id, second.node_id],
+        visible_node_ids=[first.node_id, second.node_id],
+        visible_edge_ids=[],
+        omitted_node_ids=[],
+        boundary_node_ids=[],
+        read_versions={},
+        dependency_digest="",
+        token_count=0,
+        render_mode="compact",
+    )
+
+    workflow = LangGraphWorkflow(
+        store=store,
+        model=lambda request: {},
+        task_id="t",
+        graph_context_mode="deduplicated",
+    )
+    rendered = workflow._render_graph_context(context, store.snapshot())
+    costs = workflow._rendered_graph_cost_breakdown(
+        role="planner",
+        mode="normal",
+        action_index=0,
+        context_slice=context,
+        graph_state=store.snapshot(),
+    )
+
+    assert rendered.count("same source text") == 1
+    assert "ref=n1" in rendered
+    assert costs["graph_source_duplicate_in_prompt_tokens"] == 0
+    assert costs["graph_source_duplicate_in_prompt_original_tokens"] > 0
+    assert costs["graph_source_deduplicated_prompt_saved_tokens"] > 0
+    assert costs["graph_source_context_records"][1]["deduplicated_in_prompt"] is True
+
+
+def test_source_state_split_renders_sources_separately_from_state():
+    store = GraphStore()
+    task = store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="task",
+        node_type="task",
+        content="question text",
+        owner="user",
+    )
+    result = store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="result",
+        node_type="result",
+        content={"value": "answer", "source": "task"},
+        owner="solver",
+    )
+    edge = store.add_edge(source=task.node_id, target=result.node_id, relation="depends_on", created_by_role="solver")
+    context = ContextSlice(
+        slice_id="s",
+        task_id="t",
+        branch_id="main",
+        target_role="critic",
+        policy="test",
+        root_node_ids=[task.node_id, result.node_id],
+        visible_node_ids=[task.node_id, result.node_id],
+        visible_edge_ids=[edge.edge_id],
+        omitted_node_ids=[],
+        boundary_node_ids=[],
+        read_versions={},
+        dependency_digest="",
+        token_count=0,
+        render_mode="compact",
+    )
+    workflow = LangGraphWorkflow(
+        store=store,
+        model=lambda request: {},
+        task_id="t",
+        graph_context_mode="source_state_split",
+    )
+
+    rendered = workflow._render_graph_context(context, store.snapshot())
+    costs = workflow._rendered_graph_cost_breakdown(
+        role="critic",
+        mode="normal",
+        action_index=0,
+        context_slice=context,
+        graph_state=store.snapshot(),
+    )
+
+    assert "<SRC>" in rendered
+    assert "<STATE>" in rendered
+    assert rendered.index("<SRC>") < rendered.index("<STATE>")
+    assert "question text" in rendered
+    assert "<R id=n2" in rendered
+    assert "n1 depends_on n2" in rendered
+    assert costs["graph_context_content_tokens_by_category"]["source_payload"] > 0
+    assert costs["graph_context_content_tokens_by_category"]["derived_reasoning"] > 0
+
+
+def test_role_aware_final_solver_refs_sources_and_keeps_final_state():
+    store = GraphStore()
+    task = store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="task",
+        node_type="task",
+        content="long source text that should not be expanded for finalization",
+        owner="user",
+    )
+    result = store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="result",
+        node_type="result",
+        content={"value": "42"},
+        owner="solver",
+    )
+    context = ContextSlice(
+        slice_id="s",
+        task_id="t",
+        branch_id="main",
+        target_role="final_solver",
+        policy="test",
+        root_node_ids=[task.node_id, result.node_id],
+        visible_node_ids=[task.node_id, result.node_id],
+        visible_edge_ids=[],
+        omitted_node_ids=[],
+        boundary_node_ids=[],
+        read_versions={},
+        dependency_digest="",
+        token_count=0,
+        render_mode="compact",
+    )
+    workflow = LangGraphWorkflow(
+        store=store,
+        model=lambda request: {},
+        task_id="t",
+        graph_context_mode="role_aware",
+    )
+
+    rendered = workflow._render_graph_context(
+        context,
+        store.snapshot(),
+        role="final_solver",
+        mode="finalization",
+        action_index=0,
+    )
+    costs = workflow._rendered_graph_cost_breakdown(
+        role="final_solver",
+        mode="finalization",
+        action_index=0,
+        context_slice=context,
+        graph_state=store.snapshot(),
+    )
+
+    assert "long source text" not in rendered
+    assert "source_ref" in rendered
+    assert '"value":"42"' in rendered
+    assert costs["graph_role_aware_source_ref_saved_tokens"] > 0
+    assert costs["graph_context_content_tokens_by_type"]["result"] > 0
 
 
 def test_minimal_no_feedback_records_unresolved_semantic_nack(tmp_path):

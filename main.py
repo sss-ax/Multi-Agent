@@ -131,6 +131,7 @@ def run_workflow(
     communication_policy: str = "closure_aware_heuristic",
     communication_seed: int = 0,
     communication_budget_tokens: int | None = None,
+    graph_context_mode: str = "baseline",
     task_id: str | None = None,
 ) -> dict[str, Any]:
     if execution_mode not in {"optimized", "native_langgraph"}:
@@ -164,6 +165,7 @@ def run_workflow(
             enable_action_constraints=bool(enable_action_constraints),
             communication_policy=make_communication_policy(communication_policy, seed=communication_seed),
             communication_budget_tokens=communication_budget_tokens,
+            graph_context_mode=graph_context_mode,
         )
     else:
         # Native is a separate baseline: same LangGraph topology, but no
@@ -296,6 +298,12 @@ def main() -> None:
         default=None,
         help="Optional root-selection token budget for budgeted graph communication",
     )
+    parser.add_argument(
+        "--graph-context-mode",
+        choices=("baseline", "deduplicated", "source_state_split", "role_aware"),
+        default="baseline",
+        help="Graph prompt rendering mode for optimized mode",
+    )
     args = parser.parse_args()
     print(json.dumps(run_workflow(
         args.task,
@@ -310,6 +318,7 @@ def main() -> None:
         communication_policy=args.communication_policy,
         communication_seed=args.communication_seed,
         communication_budget_tokens=args.communication_budget_tokens,
+        graph_context_mode=args.graph_context_mode,
     ), ensure_ascii=False, indent=2, default=str))
 
 

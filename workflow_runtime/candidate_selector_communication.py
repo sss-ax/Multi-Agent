@@ -46,6 +46,7 @@ class SelectorCommunicationResult:
     selected_candidate_id: str
     selection_score: float
     selection_reason: tuple[str, ...]
+    confidence: float
     visible_fragment_ids: tuple[str, ...]
     rendered_tokens: int
     trace: tuple[dict[str, Any], ...]
@@ -56,6 +57,7 @@ class SelectorCommunicationResult:
             "selected_candidate_id": self.selected_candidate_id,
             "selection_score": self.selection_score,
             "selection_reason": list(self.selection_reason),
+            "confidence": self.confidence,
             "visible_fragment_ids": list(self.visible_fragment_ids),
             "rendered_tokens": self.rendered_tokens,
             "trace": [dict(item) for item in self.trace],
@@ -219,8 +221,17 @@ def select_from_visible_fragments(
             "feature_score": score,
             "selection_reason": list(reasons),
         })
-    trace = sorted(trace, key=lambda item: (item["feature_score"], item["candidate_id"]), reverse=True)
+    trace = sorted(
+        trace,
+        key=lambda item: (
+            -float(item["feature_score"]),
+            int(item["features"].get("generation_index", 0) or 0),
+            str(item["candidate_id"]),
+        ),
+    )
     best = trace[0]
+    second_score = float(trace[1]["feature_score"]) if len(trace) > 1 else 0.0
+    confidence = max(0.0, min(1.0, float(best["feature_score"]) - second_score))
     rendered_tokens = rendered_fragment_tokens(
         build_candidate_fragments(_visible_to_candidate_records(visible)),
         visible_fragment_ids,
@@ -230,6 +241,7 @@ def select_from_visible_fragments(
         selected_candidate_id=str(best["candidate_id"]),
         selection_score=float(best["feature_score"]),
         selection_reason=tuple(best["selection_reason"]),
+        confidence=confidence,
         visible_fragment_ids=tuple(sorted(visible_fragment_ids)),
         rendered_tokens=rendered_tokens,
         trace=tuple(trace),
@@ -247,6 +259,11 @@ def rendered_fragment_tokens(
 def _features_from_visible(fragments: Mapping[str, Any]) -> dict[str, Any]:
     summary = fragments.get("verifier_summary") if isinstance(fragments.get("verifier_summary"), Mapping) else {}
     features = dict(summary)
+    status = fragments.get("status") if isinstance(fragments.get("status"), Mapping) else {}
+    if "generation_index" in status:
+        features["generation_index"] = int(status.get("generation_index") or 0)
+    if "artifact_type" in status:
+        features["artifact_type"] = str(status.get("artifact_type") or "")
     if "final_value" in fragments:
         features["final_value_valid"] = bool(str(fragments.get("final_value", "")).strip())
     cluster = fragments.get("answer_cluster") if isinstance(fragments.get("answer_cluster"), Mapping) else {}

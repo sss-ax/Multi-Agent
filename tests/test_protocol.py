@@ -37,6 +37,40 @@ def test_action_fields_are_exact_and_task_is_not_an_operation() -> None:
     assert validate_action("solver", {"op": "set_execution", "content": {}, "success": "true"}, task_type="code_generation")
 
 
+def test_domain_qa_solver_results_require_structured_verifier_inputs() -> None:
+    assert validate_action("solver", {"op": "set_result", "id": "answer", "value": "B"}, task_type="multiple_choice")
+    assert validate_action(
+        "solver",
+        {
+            "op": "set_result",
+            "id": "answer",
+            "value": {
+                "answer": "B",
+                "solver_choice": "B",
+                "independent_choice": "B",
+                "option_analysis": {"B": {"support": ["reason"], "contradiction": []}},
+                "confidence": 0.8,
+            },
+        },
+        task_type="multiple_choice",
+    ) == []
+    assert validate_action("solver", {"op": "set_result", "id": "answer", "value": "London"}, task_type="multihop_qa")
+    assert validate_action(
+        "solver",
+        {
+            "op": "set_result",
+            "id": "answer",
+            "value": {
+                "answer": "London",
+                "bridge_entity": "Charles Babbage",
+                "cited_fact_ids": ["supporting_fact_1", "supporting_fact_2"],
+                "reasoning_chain": ["hop 1", "hop 2"],
+            },
+        },
+        task_type="multihop_qa",
+    ) == []
+
+
 def test_need_fix_verify_requires_structured_repair_feedback() -> None:
     bare = {"op": "verify", "target": "result", "status": "need_fix"}
     assert validate_action("critic", bare, task_type="code_generation")

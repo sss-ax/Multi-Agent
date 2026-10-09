@@ -55,8 +55,8 @@ def test_phase5_gsm8k_does_not_repair_by_default():
 
 def test_phase5_mbpp_wrong_to_correct_repair_transition():
     model = QueueModel([
-        "def add_one(x):\n    return x",
-        "def add_one(x):\n    return x",
+        "def add_one(x):\n    return x\n\nassert add_one(1) == 2",
+        "def add_one(x):\n    return x\n\nassert add_one(1) == 2",
         "def add_one(x):\n    return x + 1",
     ])
 
@@ -82,7 +82,7 @@ def test_phase5_mbpp_wrong_to_correct_repair_transition():
 
 def test_phase5_mbpp_waits_for_min_repair_candidates():
     model = QueueModel([
-        "def add_one(x):\n    return x",
+        "def add_one(x):\n    return x\n\nassert add_one(1) == 2",
         "def add_one(x):\n    return x + 1",
         "def add_one(x):\n    return x + 1",
     ])
@@ -101,8 +101,8 @@ def test_phase5_mbpp_waits_for_min_repair_candidates():
 
     record = report["records"][0]
     assert record["generation_attempt_count"] == 2
-    assert record["action"] == "REPAIR"
-    assert record["actions"] == ["GENERATE", "GENERATE", "REPAIR"]
+    assert record["action"] == "SELECT"
+    assert record["actions"] == ["GENERATE", "GENERATE", "SELECT", "STOP"]
     assert record["controller_reasons"][0] == "insufficient_confidence_generate_more"
 
 
@@ -151,6 +151,57 @@ def test_phase5_correct_to_correct_selects_without_repair():
     assert record["transition"] == "C->C"
     assert report["repair_attempt_count"] == 0
     assert report["phase5_gate_select_repair_ge_verifier"] is True
+
+
+def test_phase5_can_use_receiver_aware_selector_communication():
+    model = QueueModel([
+        "2+2 = 4\nFinal answer: 4",
+        "2+2 = 5\nFinal answer: 5",
+    ])
+
+    report = run_select_repair(
+        model,
+        [_row()],
+        domain="gsm8k",
+        n=2,
+        seed=0,
+        temperature=0.7,
+        top_p=0.95,
+        verifier_baseline=0.0,
+        selector_communication_policy="selector_receiver_aware",
+    )
+
+    record = report["records"][0]
+    assert report["selector_communication_policy"] == "selector_receiver_aware"
+    assert report["selector_input_tokens"] > 0
+    assert report["selector_send_all_equivalent_tokens"] >= report["selector_input_tokens"]
+    assert report["selector_token_saving_vs_send_all"] >= 0
+    assert record["selector_communication_steps"][0]["policy"] == "selector_receiver_aware"
+
+
+def test_phase5_mbpp_missing_public_tests_passed_does_not_trigger_repair():
+    model = QueueModel([
+        "def add_one(x):\n    return x + 1",
+        "def add_one(x):\n    return x + 1",
+    ])
+
+    report = run_select_repair(
+        model,
+        [_code_row()],
+        domain="mbpp",
+        n=2,
+        seed=0,
+        temperature=0.7,
+        top_p=0.95,
+        verifier_baseline=0.0,
+        min_repair_candidates=2,
+        selector_communication_policy="selector_receiver_aware",
+    )
+
+    record = report["records"][0]
+    assert record["action"] == "SELECT"
+    assert record["transition"] == "C->C"
+    assert report["repair_attempt_count"] == 0
 
 
 def test_phase5_transition_labels_include_regression():

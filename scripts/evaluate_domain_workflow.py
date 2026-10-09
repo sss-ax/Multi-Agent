@@ -328,7 +328,24 @@ def hotpot_f1(prediction: Any, gold: Any) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
+def extract_structured_answer(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return value
+        return extract_structured_answer(parsed)
+    if isinstance(value, dict):
+        if "value" in value:
+            return extract_structured_answer(value["value"])
+        for key in ("answer", "final_answer", "choice", "solver_choice"):
+            if key in value:
+                return extract_structured_answer(value[key])
+    return value
+
+
 def extract_choice(value: Any) -> str:
+    value = extract_structured_answer(value)
     text = str(value).strip()
     match = re.search(r"\b([A-J])\b", text.upper())
     return match.group(1) if match else text[:1].upper()
@@ -416,7 +433,8 @@ def is_correct(workflow: Any, row: Dict[str, Any], graph: Any) -> bool:
     final = workflow.latest_node_by_type(graph, "final_answer")
     if final is None:
         return False
-    predicted = normalize_answer(final.content)
+    predicted_value = extract_structured_answer(final.content)
+    predicted = normalize_answer(predicted_value)
     gold = normalize_answer(row.get("gold_answer", ""))
     if task_type == "numeric_solve":
         return extract_numeric_answer(predicted) == numeric_answer(gold)
@@ -434,7 +452,7 @@ def score_record(workflow: Any, row: Dict[str, Any], graph: Any) -> Dict[str, An
     task_type = row["task_type"]
     result = workflow.latest_node_by_type(graph, "result")
     final = workflow.latest_node_by_type(graph, "final_answer")
-    predicted = final.content if final is not None else None
+    predicted = extract_structured_answer(final.content) if final is not None else None
     if task_type == "code_generation":
         passed = False
         if result is not None:
@@ -454,6 +472,7 @@ def score_record(workflow: Any, row: Dict[str, Any], graph: Any) -> Dict[str, An
 
 def score_prediction(row: Dict[str, Any], predicted: Any) -> Dict[str, Any]:
     task_type = row["task_type"]
+    predicted = extract_structured_answer(predicted)
     if task_type == "code_generation":
         return run_code_tests(extract_code(predicted), row)
     if task_type == "multihop_qa":
@@ -786,6 +805,15 @@ def action_token_totals(records: List[Dict[str, Any]]) -> Dict[str, int]:
         "unique_prefix_tokens": 0,
         "repeated_prefix_tokens": 0,
         "simulated_context_reuse_input_tokens": 0,
+        "graph_context_content_tokens": 0,
+        "graph_context_wrapper_tokens": 0,
+        "graph_context_edge_tokens": 0,
+        "graph_source_duplicate_in_prompt_tokens": 0,
+        "graph_source_duplicate_in_prompt_original_tokens": 0,
+        "graph_source_deduplicated_prompt_saved_tokens": 0,
+        "graph_source_cross_call_reread_tokens": 0,
+        "graph_role_aware_source_ref_saved_tokens": 0,
+        "graph_role_aware_state_ref_saved_tokens": 0,
     }
     for record in records:
         runtime = record.get("runtime_summary", {})
@@ -844,6 +872,15 @@ def action_token_totals(records: List[Dict[str, Any]]) -> Dict[str, int]:
                 "system_prompt_tokens",
                 "prompt_wrapper_tokens",
                 "reusable_prefix_tokens",
+                "graph_context_content_tokens",
+                "graph_context_wrapper_tokens",
+                "graph_context_edge_tokens",
+                "graph_source_duplicate_in_prompt_tokens",
+                "graph_source_duplicate_in_prompt_original_tokens",
+                "graph_source_deduplicated_prompt_saved_tokens",
+                "graph_source_cross_call_reread_tokens",
+                "graph_role_aware_source_ref_saved_tokens",
+                "graph_role_aware_state_ref_saved_tokens",
             ):
                 totals[key] += int(telemetry.get(key, 0) or 0)
             totals["simulated_context_reuse_input_tokens"] += max(
@@ -1040,6 +1077,11 @@ def main() -> None:
     )
     parser.add_argument("--communication-seed", type=int, default=0)
     parser.add_argument("--communication-budget-tokens", type=int, default=None)
+    parser.add_argument(
+        "--graph-context-mode",
+        choices=("baseline", "deduplicated", "source_state_split", "role_aware"),
+        default="baseline",
+    )
     parser.add_argument("--fragment-utility-table", default="")
     parser.add_argument("--task-family", default="")
     parser.add_argument("--output", default="")
@@ -1118,6 +1160,7 @@ def main() -> None:
                     task_family=args.task_family or args.domain,
                 ),
                 communication_budget_tokens=args.communication_budget_tokens,
+                graph_context_mode=args.graph_context_mode,
             )
         failure = ""
         started = time.time()
@@ -1178,6 +1221,7 @@ def main() -> None:
         "domain": args.domain,
         "data_path": args.data_path,
         "execution_mode": args.execution_mode,
+        "graph_context_mode": args.graph_context_mode,
         "count": len(records),
         "accuracy_or_pass_at_1": correct / len(records),
         **metric_values,

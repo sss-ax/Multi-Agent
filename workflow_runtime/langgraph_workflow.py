@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import hashlib
 from dataclasses import dataclass
 import json
 from typing import Any, Callable, Mapping, Optional, Sequence, TypedDict
@@ -11,7 +12,7 @@ from .action_compiler import ActionCompilationError, ActionCompiler
 from .action_constraints import ActionConstraint, build_action_constraint
 from .agent_graph_view import AgentGraphViewManager, MANDATORY_LOGICAL_IDS
 from .communication import ClosureAwareHeuristicPolicy, GraphCommunicationPolicy
-from .context_slicer import build_context_slice, render_compact_context_slice
+from .context_slicer import build_context_slice, render_compact_context_slice, _node_sort_key
 from .delta_closure import dependency_closure
 from .delta_extractor import extract_delta_candidates
 from .delta_scoring import estimate_edge_tokens, estimate_node_tokens
@@ -26,6 +27,7 @@ from .semantic_fragments import (
     fragment_token_cost,
     fragments_for_node,
     node_id_from_fragment,
+    render_fragmented_content,
 )
 from .semantic_contract import default_semantic_contract
 from .semantic_feedback import (
@@ -123,6 +125,7 @@ class LangGraphWorkflow:
         enable_action_constraints: bool = True,
         communication_policy: Optional[GraphCommunicationPolicy] = None,
         communication_budget_tokens: Optional[int] = None,
+        graph_context_mode: str = "baseline",
     ) -> None:
         self.store = store
         self.model = model
@@ -145,6 +148,10 @@ class LangGraphWorkflow:
         self.enable_action_constraints = bool(enable_action_constraints)
         self.communication_policy = communication_policy or ClosureAwareHeuristicPolicy()
         self.communication_budget_tokens = communication_budget_tokens
+        if graph_context_mode not in {"baseline", "deduplicated", "source_state_split", "role_aware"}:
+            raise ValueError(f"unsupported graph_context_mode: {graph_context_mode}")
+        self.graph_context_mode = graph_context_mode
+        self._graph_source_seen_hashes: set[str] = set()
         self.agent_views = AgentGraphViewManager(
             store,
             task_id=task_id,
@@ -195,6 +202,7 @@ class LangGraphWorkflow:
             enable_action_constraints=self.enable_action_constraints,
             communication_policy=self.communication_policy,
             communication_budget_tokens=self.communication_budget_tokens,
+            graph_context_mode=self.graph_context_mode,
         )
 
     def merge_branch(
@@ -253,7 +261,13 @@ class LangGraphWorkflow:
                     visible_fragment_ids=role_view.visible_fragment_ids,
                 )
                 graph_state = view_store.snapshot()
-                prompt = render_compact_context_slice(context_slice, graph_state)
+                prompt = self._render_graph_context(
+                    context_slice,
+                    graph_state,
+                    role=role,
+                    mode=mode,
+                    action_index=action_index,
+                )
                 session_prompt = self._session_prompt(role, mode, prompt)
                 graph_read_context_tokens = self._token_count(prompt)
                 logical_input_tokens = self._token_count(session_prompt)
@@ -265,6 +279,13 @@ class LangGraphWorkflow:
                     graph_read_context_tokens=graph_read_context_tokens,
                     logical_input_tokens=logical_input_tokens,
                 )
+                context_costs.update(self._rendered_graph_cost_breakdown(
+                    role=role,
+                    mode=mode,
+                    action_index=action_index,
+                    context_slice=context_slice,
+                    graph_state=graph_state,
+                ))
                 action_constraint = (
                     self._action_constraint(role, state.get("branch_id", self.branch_id), mode=mode)
                     if self.enable_action_constraints else None
@@ -700,6 +721,551 @@ class LangGraphWorkflow:
             "reusable_prefix_key": f"{role}:{mode}:{self.task_type}",
         }
 
+    def _render_graph_context(
+        self,
+        context_slice: Any,
+        graph_state: Any,
+        *,
+        role: str = "",
+        mode: str = "",
+        action_index: int = 0,
+    ) -> str:
+        if self.graph_context_mode == "baseline":
+            return render_compact_context_slice(context_slice, graph_state)
+        if self.graph_context_mode in {"source_state_split", "role_aware"}:
+            rendered, _ = self._render_source_state_split_graph_context(
+                role=role,
+                mode=mode,
+                action_index=action_index,
+                context_slice=context_slice,
+                graph_state=graph_state,
+                update_seen=False,
+            )
+            return rendered
+        rendered, _ = self._render_deduplicated_graph_context(
+            role="",
+            mode="",
+            action_index=0,
+            context_slice=context_slice,
+            graph_state=graph_state,
+            update_seen=False,
+        )
+        return rendered
+
+    @staticmethod
+    def _graph_context_category(node_type: str) -> str:
+        if node_type in {
+            "task",
+            "query_spec",
+            "facts",
+            "fact",
+            "requirements",
+            "test",
+            "choice",
+            "entity",
+            "supporting_fact",
+            "evidence_link",
+            "table",
+            "table_cell",
+            "evidence",
+        }:
+            return "source_payload"
+        if node_type in {"error", "tool_request", "tool_result", "execution"}:
+            return "history_or_tool"
+        return "derived_reasoning"
+
+    def _role_aware_source_ref_only(self, *, role: str, mode: str, node_type: str) -> bool:
+        if self.graph_context_mode != "role_aware":
+            return False
+        # Finalization should ground the answer in result/verification state;
+        # source payload is kept addressable but not repeatedly expanded.
+        return role == "final_solver"
+
+    def _role_aware_state_ref_only(self, *, role: str, mode: str, node_type: str) -> bool:
+        if self.graph_context_mode != "role_aware":
+            return False
+        if role == "planner":
+            return True
+        if role == "final_solver":
+            return node_type not in {"result", "verification", "final_answer", "code"}
+        if role == "critic":
+            return node_type in {"plan", "plan_steps"}
+        return False
+
+    def _render_deduplicated_graph_context(
+        self,
+        *,
+        role: str,
+        mode: str,
+        action_index: int,
+        context_slice: Any,
+        graph_state: Any,
+        update_seen: bool,
+    ) -> tuple[str, dict[str, Any]]:
+        token_by_type = {
+            "task": "T",
+            "query_spec": "Q",
+            "facts": "F",
+            "fact": "F",
+            "plan": "P",
+            "plan_steps": "PS",
+            "calculation": "C",
+            "result": "R",
+            "verification": "V",
+            "final_answer": "A",
+        }
+        nodes = [graph_state.nodes[node_id] for node_id in context_slice.visible_node_ids if node_id in graph_state.nodes]
+        nodes.sort(key=_node_sort_key)
+        fragments_by_node: dict[str, set[str]] = {}
+        for fragment_id in context_slice.visible_fragment_ids:
+            node_id = str(fragment_id).split("#", 1)[0]
+            fragments_by_node.setdefault(node_id, set()).add(str(fragment_id))
+        local_ids = {node.node_id: f"n{index}" for index, node in enumerate(nodes, start=1)}
+        lines = ["<G>"]
+        content_tokens = 0
+        wrapper_tokens = self._token_count("<G>\n</G>")
+        edge_tokens = 0
+        content_by_type: dict[str, int] = {}
+        wrapper_by_type: dict[str, int] = {}
+        content_by_category: dict[str, int] = {}
+        wrapper_by_category: dict[str, int] = {}
+        source_duplicate_in_prompt_tokens = 0
+        source_cross_call_reread_tokens = 0
+        source_deduplicated_prompt_saved_tokens = 0
+        prompt_seen_source_hashes: set[str] = set()
+        first_source_local_id_by_hash: dict[str, str] = {}
+        prior_seen_source_hashes = set(self._graph_source_seen_hashes)
+        source_records: list[dict[str, Any]] = []
+        call_id = f"{self.task_id}:{self.branch_id}:{role}:{mode}:{action_index}"
+
+        for node in nodes:
+            tag = token_by_type.get(node.type, "N")
+            category = self._graph_context_category(node.type)
+            rendered_content = render_fragmented_content(node, fragments_by_node.get(node.node_id, set()))
+            content = json.dumps(rendered_content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            original_content_count = self._token_count(content)
+            content_hash = ""
+            duplicate_in_prompt = False
+            cross_call_reread = False
+            deduplicated = False
+            if category == "source_payload":
+                content_hash = str(node.content_digest or "").strip()
+                if not content_hash:
+                    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                duplicate_in_prompt = content_hash in prompt_seen_source_hashes
+                cross_call_reread = content_hash in prior_seen_source_hashes
+                if duplicate_in_prompt:
+                    source_duplicate_in_prompt_tokens += original_content_count
+                prompt_seen_source_hashes.add(content_hash)
+
+            if (
+                self.graph_context_mode == "deduplicated"
+                and category == "source_payload"
+                and duplicate_in_prompt
+            ):
+                deduplicated = True
+                source_deduplicated_prompt_saved_tokens += original_content_count
+                ref = first_source_local_id_by_hash.get(content_hash, "")
+                line = f"<{tag} id={local_ids[node.node_id]} v={node.version} s={node.status} ref={ref}/>"
+                content_count = 0
+                line_count = self._token_count(line)
+                wrapper_count = line_count
+            else:
+                line = f"<{tag} id={local_ids[node.node_id]} v={node.version} s={node.status}>{content}</{tag}>"
+                content_count = original_content_count
+                line_count = self._token_count(line)
+                wrapper_count = max(0, line_count - content_count)
+                if category == "source_payload" and cross_call_reread:
+                    source_cross_call_reread_tokens += content_count
+            if category == "source_payload" and content_hash and content_hash not in first_source_local_id_by_hash:
+                first_source_local_id_by_hash[content_hash] = local_ids[node.node_id]
+
+            lines.append(line)
+            content_tokens += content_count
+            wrapper_tokens += wrapper_count
+            content_by_type[node.type] = content_by_type.get(node.type, 0) + content_count
+            wrapper_by_type[node.type] = wrapper_by_type.get(node.type, 0) + wrapper_count
+            content_by_category[category] = content_by_category.get(category, 0) + content_count
+            wrapper_by_category[category] = wrapper_by_category.get(category, 0) + wrapper_count
+            if category == "source_payload":
+                source_records.append({
+                    "task_id": self.task_id,
+                    "call_id": call_id,
+                    "agent_role": role,
+                    "mode": mode,
+                    "action_index": action_index,
+                    "source_id": node.node_id,
+                    "source_logical_id": node.logical_id,
+                    "source_type": node.type,
+                    "content_hash": content_hash,
+                    "content_tokens": content_count,
+                    "original_content_tokens": original_content_count,
+                    "duplicate_in_prompt": duplicate_in_prompt,
+                    "cross_call_reread": cross_call_reread and not deduplicated,
+                    "deduplicated_in_prompt": deduplicated,
+                    "dedup_ref": first_source_local_id_by_hash.get(content_hash, ""),
+                })
+
+        if update_seen:
+            self._graph_source_seen_hashes.update(prompt_seen_source_hashes)
+        visible_edges = set(context_slice.visible_edge_ids)
+        for edge in graph_state.edges:
+            if edge.edge_id not in visible_edges:
+                continue
+            if edge.source not in local_ids or edge.target not in local_ids:
+                continue
+            line = f"<E a={local_ids[edge.source]} r={edge.relation} b={local_ids[edge.target]}/>"
+            lines.append(line)
+            edge_tokens += self._token_count(line)
+        lines.append("</G>")
+        return "\n".join(lines), {
+            "graph_context_content_tokens": content_tokens,
+            "graph_context_wrapper_tokens": wrapper_tokens,
+            "graph_context_edge_tokens": edge_tokens,
+            "graph_context_content_tokens_by_type": content_by_type,
+            "graph_context_wrapper_tokens_by_type": wrapper_by_type,
+            "graph_context_content_tokens_by_category": content_by_category,
+            "graph_context_wrapper_tokens_by_category": wrapper_by_category,
+            "graph_source_duplicate_in_prompt_tokens": (
+                0 if self.graph_context_mode == "deduplicated" else source_duplicate_in_prompt_tokens
+            ),
+            "graph_source_duplicate_in_prompt_original_tokens": source_duplicate_in_prompt_tokens,
+            "graph_source_deduplicated_prompt_saved_tokens": source_deduplicated_prompt_saved_tokens,
+            "graph_source_cross_call_reread_tokens": source_cross_call_reread_tokens,
+            "graph_role_aware_source_ref_saved_tokens": 0,
+            "graph_role_aware_state_ref_saved_tokens": 0,
+            "graph_source_context_records": source_records,
+        }
+
+    def _render_source_state_split_graph_context(
+        self,
+        *,
+        role: str,
+        mode: str,
+        action_index: int,
+        context_slice: Any,
+        graph_state: Any,
+        update_seen: bool,
+    ) -> tuple[str, dict[str, Any]]:
+        token_by_type = {
+            "task": "T",
+            "query_spec": "Q",
+            "facts": "F",
+            "fact": "F",
+            "plan": "P",
+            "plan_steps": "PS",
+            "calculation": "C",
+            "result": "R",
+            "verification": "V",
+            "final_answer": "A",
+        }
+        nodes = [graph_state.nodes[node_id] for node_id in context_slice.visible_node_ids if node_id in graph_state.nodes]
+        nodes.sort(key=_node_sort_key)
+        fragments_by_node: dict[str, set[str]] = {}
+        for fragment_id in context_slice.visible_fragment_ids:
+            node_id = str(fragment_id).split("#", 1)[0]
+            fragments_by_node.setdefault(node_id, set()).add(str(fragment_id))
+        local_ids = {node.node_id: f"n{index}" for index, node in enumerate(nodes, start=1)}
+        source_nodes = [node for node in nodes if self._graph_context_category(node.type) == "source_payload"]
+        state_nodes = [node for node in nodes if self._graph_context_category(node.type) != "source_payload"]
+        lines = ["<G>", "<SRC>"]
+        content_tokens = 0
+        wrapper_tokens = self._token_count("<G>\n<SRC>\n</SRC>\n<STATE>\n</STATE>\n<REF>\n</REF>\n</G>")
+        edge_tokens = 0
+        content_by_type: dict[str, int] = {}
+        wrapper_by_type: dict[str, int] = {}
+        content_by_category: dict[str, int] = {}
+        wrapper_by_category: dict[str, int] = {}
+        source_duplicate_in_prompt_tokens = 0
+        source_cross_call_reread_tokens = 0
+        source_deduplicated_prompt_saved_tokens = 0
+        role_aware_source_ref_saved_tokens = 0
+        role_aware_state_ref_saved_tokens = 0
+        prompt_seen_source_hashes: set[str] = set()
+        first_source_local_id_by_hash: dict[str, str] = {}
+        prior_seen_source_hashes = set(self._graph_source_seen_hashes)
+        source_records: list[dict[str, Any]] = []
+        call_id = f"{self.task_id}:{self.branch_id}:{role}:{mode}:{action_index}"
+
+        for node in source_nodes:
+            rendered_content = render_fragmented_content(node, fragments_by_node.get(node.node_id, set()))
+            content = json.dumps(rendered_content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            original_content_count = self._token_count(content)
+            content_hash = str(node.content_digest or "").strip()
+            if not content_hash:
+                content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            duplicate_in_prompt = content_hash in prompt_seen_source_hashes
+            cross_call_reread = content_hash in prior_seen_source_hashes
+            if duplicate_in_prompt:
+                source_duplicate_in_prompt_tokens += original_content_count
+            prompt_seen_source_hashes.add(content_hash)
+            source_ref_only = self._role_aware_source_ref_only(role=role, mode=mode, node_type=node.type)
+            if source_ref_only:
+                role_aware_source_ref_saved_tokens += original_content_count
+                ref = first_source_local_id_by_hash.get(content_hash, "")
+                line = f"{local_ids[node.node_id]} {node.type} {node.logical_id} source_ref hash={content_hash[:12]} ref={ref}"
+                content_count = 0
+                line_count = self._token_count(line)
+                wrapper_count = line_count
+                active_reread = False
+                deduplicated = False
+            elif duplicate_in_prompt:
+                source_deduplicated_prompt_saved_tokens += original_content_count
+                ref = first_source_local_id_by_hash.get(content_hash, "")
+                line = f"{local_ids[node.node_id]} {node.type} {node.logical_id} ref={ref}"
+                content_count = 0
+                line_count = self._token_count(line)
+                wrapper_count = line_count
+                active_reread = False
+                deduplicated = True
+            else:
+                line = f"{local_ids[node.node_id]} {node.type} {node.logical_id} {content}"
+                content_count = original_content_count
+                line_count = self._token_count(line)
+                wrapper_count = max(0, line_count - content_count)
+                active_reread = cross_call_reread
+                if active_reread:
+                    source_cross_call_reread_tokens += content_count
+                deduplicated = False
+            if content_hash not in first_source_local_id_by_hash:
+                first_source_local_id_by_hash[content_hash] = local_ids[node.node_id]
+            lines.append(line)
+            content_tokens += content_count
+            wrapper_tokens += wrapper_count
+            content_by_type[node.type] = content_by_type.get(node.type, 0) + content_count
+            wrapper_by_type[node.type] = wrapper_by_type.get(node.type, 0) + wrapper_count
+            content_by_category["source_payload"] = content_by_category.get("source_payload", 0) + content_count
+            wrapper_by_category["source_payload"] = wrapper_by_category.get("source_payload", 0) + wrapper_count
+            source_records.append({
+                "task_id": self.task_id,
+                "call_id": call_id,
+                "agent_role": role,
+                "mode": mode,
+                "action_index": action_index,
+                "source_id": node.node_id,
+                "source_logical_id": node.logical_id,
+                "source_type": node.type,
+                "content_hash": content_hash,
+                "content_tokens": content_count,
+                "original_content_tokens": original_content_count,
+                "duplicate_in_prompt": duplicate_in_prompt,
+                "cross_call_reread": active_reread,
+                "deduplicated_in_prompt": deduplicated,
+                "role_aware_ref": source_ref_only,
+                "dedup_ref": first_source_local_id_by_hash.get(content_hash, ""),
+            })
+
+        lines.extend(["</SRC>", "<STATE>"])
+        for node in state_nodes:
+            tag = token_by_type.get(node.type, "N")
+            category = self._graph_context_category(node.type)
+            rendered_content = render_fragmented_content(node, fragments_by_node.get(node.node_id, set()))
+            content = json.dumps(rendered_content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            content_count = self._token_count(content)
+            if self._role_aware_state_ref_only(role=role, mode=mode, node_type=node.type):
+                role_aware_state_ref_saved_tokens += content_count
+                line = f"<{tag} id={local_ids[node.node_id]} v={node.version} s={node.status} ref=state/>"
+                line_count = self._token_count(line)
+                wrapper_count = line_count
+                content_count = 0
+            else:
+                line = f"<{tag} id={local_ids[node.node_id]} v={node.version} s={node.status}>{content}</{tag}>"
+                line_count = self._token_count(line)
+                wrapper_count = max(0, line_count - content_count)
+            lines.append(line)
+            content_tokens += content_count
+            wrapper_tokens += wrapper_count
+            content_by_type[node.type] = content_by_type.get(node.type, 0) + content_count
+            wrapper_by_type[node.type] = wrapper_by_type.get(node.type, 0) + wrapper_count
+            content_by_category[category] = content_by_category.get(category, 0) + content_count
+            wrapper_by_category[category] = wrapper_by_category.get(category, 0) + wrapper_count
+
+        if update_seen:
+            self._graph_source_seen_hashes.update(prompt_seen_source_hashes)
+        lines.extend(["</STATE>", "<REF>"])
+        visible_edges = set(context_slice.visible_edge_ids)
+        for edge in graph_state.edges:
+            if edge.edge_id not in visible_edges:
+                continue
+            if edge.source not in local_ids or edge.target not in local_ids:
+                continue
+            line = f"{local_ids[edge.source]} {edge.relation} {local_ids[edge.target]}"
+            lines.append(line)
+            edge_tokens += self._token_count(line)
+        lines.extend(["</REF>", "</G>"])
+        return "\n".join(lines), {
+            "graph_context_content_tokens": content_tokens,
+            "graph_context_wrapper_tokens": wrapper_tokens,
+            "graph_context_edge_tokens": edge_tokens,
+            "graph_context_content_tokens_by_type": content_by_type,
+            "graph_context_wrapper_tokens_by_type": wrapper_by_type,
+            "graph_context_content_tokens_by_category": content_by_category,
+            "graph_context_wrapper_tokens_by_category": wrapper_by_category,
+            "graph_source_duplicate_in_prompt_tokens": 0,
+            "graph_source_duplicate_in_prompt_original_tokens": source_duplicate_in_prompt_tokens,
+            "graph_source_deduplicated_prompt_saved_tokens": source_deduplicated_prompt_saved_tokens,
+            "graph_source_cross_call_reread_tokens": source_cross_call_reread_tokens,
+            "graph_role_aware_source_ref_saved_tokens": role_aware_source_ref_saved_tokens,
+            "graph_role_aware_state_ref_saved_tokens": role_aware_state_ref_saved_tokens,
+            "graph_source_context_records": source_records,
+        }
+
+    def _rendered_graph_cost_breakdown(
+        self,
+        *,
+        role: str,
+        mode: str,
+        action_index: int,
+        context_slice: Any,
+        graph_state: Any,
+    ) -> dict[str, Any]:
+        """Tokenize compact graph rendering into content, wrapper, and edge costs."""
+        if self.graph_context_mode == "source_state_split":
+            _, costs = self._render_source_state_split_graph_context(
+                role=role,
+                mode=mode,
+                action_index=action_index,
+                context_slice=context_slice,
+                graph_state=graph_state,
+                update_seen=True,
+            )
+            return costs
+        if self.graph_context_mode == "role_aware":
+            _, costs = self._render_source_state_split_graph_context(
+                role=role,
+                mode=mode,
+                action_index=action_index,
+                context_slice=context_slice,
+                graph_state=graph_state,
+                update_seen=True,
+            )
+            return costs
+        if self.graph_context_mode == "deduplicated":
+            _, costs = self._render_deduplicated_graph_context(
+                role=role,
+                mode=mode,
+                action_index=action_index,
+                context_slice=context_slice,
+                graph_state=graph_state,
+                update_seen=True,
+            )
+            return costs
+        token_by_type = {
+            "task": "T",
+            "query_spec": "Q",
+            "facts": "F",
+            "fact": "F",
+            "plan": "P",
+            "plan_steps": "PS",
+            "calculation": "C",
+            "result": "R",
+            "verification": "V",
+            "final_answer": "A",
+        }
+        nodes = [graph_state.nodes[node_id] for node_id in context_slice.visible_node_ids if node_id in graph_state.nodes]
+        nodes.sort(key=_node_sort_key)
+        fragments_by_node: dict[str, set[str]] = {}
+        for fragment_id in context_slice.visible_fragment_ids:
+            node_id = str(fragment_id).split("#", 1)[0]
+            fragments_by_node.setdefault(node_id, set()).add(str(fragment_id))
+        local_ids = {node.node_id: f"n{index}" for index, node in enumerate(nodes, start=1)}
+        content_tokens = 0
+        wrapper_tokens = self._token_count("<G>\n</G>")
+        edge_tokens = 0
+        content_by_type: dict[str, int] = {}
+        wrapper_by_type: dict[str, int] = {}
+        category_by_type = {
+            "task": "source_payload",
+            "query_spec": "source_payload",
+            "facts": "source_payload",
+            "fact": "source_payload",
+            "requirements": "source_payload",
+            "test": "source_payload",
+            "choice": "source_payload",
+            "entity": "source_payload",
+            "supporting_fact": "source_payload",
+            "evidence_link": "source_payload",
+            "table": "source_payload",
+            "table_cell": "source_payload",
+            "evidence": "source_payload",
+            "error": "history_or_tool",
+            "tool_request": "history_or_tool",
+            "tool_result": "history_or_tool",
+            "execution": "history_or_tool",
+        }
+        content_by_category: dict[str, int] = {}
+        wrapper_by_category: dict[str, int] = {}
+        source_duplicate_in_prompt_tokens = 0
+        source_cross_call_reread_tokens = 0
+        prompt_seen_source_hashes: set[str] = set()
+        prior_seen_source_hashes = set(self._graph_source_seen_hashes)
+        source_records: list[dict[str, Any]] = []
+        call_id = f"{self.task_id}:{self.branch_id}:{role}:{mode}:{action_index}"
+        for node in nodes:
+            tag = token_by_type.get(node.type, "N")
+            rendered_content = render_fragmented_content(node, fragments_by_node.get(node.node_id, set()))
+            content = json.dumps(rendered_content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            content_count = self._token_count(content)
+            line = f"<{tag} id={local_ids[node.node_id]} v={node.version} s={node.status}>{content}</{tag}>"
+            line_count = self._token_count(line)
+            wrapper_count = max(0, line_count - content_count)
+            category = category_by_type.get(node.type, "derived_reasoning")
+            content_tokens += content_count
+            wrapper_tokens += wrapper_count
+            content_by_type[node.type] = content_by_type.get(node.type, 0) + content_count
+            wrapper_by_type[node.type] = wrapper_by_type.get(node.type, 0) + wrapper_count
+            content_by_category[category] = content_by_category.get(category, 0) + content_count
+            wrapper_by_category[category] = wrapper_by_category.get(category, 0) + wrapper_count
+            if category == "source_payload":
+                content_hash = str(node.content_digest or "").strip()
+                if not content_hash:
+                    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                duplicate_in_prompt = content_hash in prompt_seen_source_hashes
+                cross_call_reread = content_hash in prior_seen_source_hashes
+                if duplicate_in_prompt:
+                    source_duplicate_in_prompt_tokens += content_count
+                if cross_call_reread:
+                    source_cross_call_reread_tokens += content_count
+                prompt_seen_source_hashes.add(content_hash)
+                source_records.append({
+                    "task_id": self.task_id,
+                    "call_id": call_id,
+                    "agent_role": role,
+                    "mode": mode,
+                    "action_index": action_index,
+                    "source_id": node.node_id,
+                    "source_logical_id": node.logical_id,
+                    "source_type": node.type,
+                    "content_hash": content_hash,
+                    "content_tokens": content_count,
+                    "duplicate_in_prompt": duplicate_in_prompt,
+                    "cross_call_reread": cross_call_reread,
+                })
+        self._graph_source_seen_hashes.update(prompt_seen_source_hashes)
+        visible_edges = set(context_slice.visible_edge_ids)
+        for edge in graph_state.edges:
+            if edge.edge_id not in visible_edges:
+                continue
+            if edge.source not in local_ids or edge.target not in local_ids:
+                continue
+            edge_tokens += self._token_count(
+                f"<E a={local_ids[edge.source]} r={edge.relation} b={local_ids[edge.target]}/>"
+            )
+        return {
+            "graph_context_content_tokens": content_tokens,
+            "graph_context_wrapper_tokens": wrapper_tokens,
+            "graph_context_edge_tokens": edge_tokens,
+            "graph_context_content_tokens_by_type": content_by_type,
+            "graph_context_wrapper_tokens_by_type": wrapper_by_type,
+            "graph_context_content_tokens_by_category": content_by_category,
+            "graph_context_wrapper_tokens_by_category": wrapper_by_category,
+            "graph_source_duplicate_in_prompt_tokens": source_duplicate_in_prompt_tokens,
+            "graph_source_duplicate_in_prompt_original_tokens": source_duplicate_in_prompt_tokens,
+            "graph_source_deduplicated_prompt_saved_tokens": 0,
+            "graph_source_cross_call_reread_tokens": source_cross_call_reread_tokens,
+            "graph_source_context_records": source_records,
+        }
+
     def _graph_update_tokens(self, node_ids: Sequence[str]) -> int:
         if not node_ids:
             return 0
@@ -790,6 +1356,40 @@ class LangGraphWorkflow:
             "prompt_wrapper_tokens": int(generation.get("prompt_wrapper_tokens", 0) or 0),
             "reusable_prefix_tokens": int(generation.get("reusable_prefix_tokens", 0) or 0),
             "persistent_context_node_ids": list(generation.get("persistent_context_node_ids", ())),
+            "graph_context_content_tokens": int(generation.get("graph_context_content_tokens", 0) or 0),
+            "graph_context_wrapper_tokens": int(generation.get("graph_context_wrapper_tokens", 0) or 0),
+            "graph_context_edge_tokens": int(generation.get("graph_context_edge_tokens", 0) or 0),
+            "graph_context_content_tokens_by_type": dict(
+                generation.get("graph_context_content_tokens_by_type", {}) or {}
+            ),
+            "graph_context_wrapper_tokens_by_type": dict(
+                generation.get("graph_context_wrapper_tokens_by_type", {}) or {}
+            ),
+            "graph_context_content_tokens_by_category": dict(
+                generation.get("graph_context_content_tokens_by_category", {}) or {}
+            ),
+            "graph_context_wrapper_tokens_by_category": dict(
+                generation.get("graph_context_wrapper_tokens_by_category", {}) or {}
+            ),
+            "graph_source_duplicate_in_prompt_tokens": int(
+                generation.get("graph_source_duplicate_in_prompt_tokens", 0) or 0
+            ),
+            "graph_source_duplicate_in_prompt_original_tokens": int(
+                generation.get("graph_source_duplicate_in_prompt_original_tokens", 0) or 0
+            ),
+            "graph_source_deduplicated_prompt_saved_tokens": int(
+                generation.get("graph_source_deduplicated_prompt_saved_tokens", 0) or 0
+            ),
+            "graph_source_cross_call_reread_tokens": int(
+                generation.get("graph_source_cross_call_reread_tokens", 0) or 0
+            ),
+            "graph_role_aware_source_ref_saved_tokens": int(
+                generation.get("graph_role_aware_source_ref_saved_tokens", 0) or 0
+            ),
+            "graph_role_aware_state_ref_saved_tokens": int(
+                generation.get("graph_role_aware_state_ref_saved_tokens", 0) or 0
+            ),
+            "graph_source_context_records": list(generation.get("graph_source_context_records", []) or []),
             "reusable_prefix_key": generation.get("reusable_prefix_key", f"{role}:{mode}:{self.task_type}"),
             "graph_update_tokens": int(generation.get("graph_update_tokens", 0) or 0),
             "task_verification": generation.get("task_verification"),
@@ -1915,16 +2515,22 @@ class LangGraphWorkflow:
         if role == "solver" and "missing result" in missing:
             if self.task_type == "multiple_choice":
                 return (
-                    "The next required boundary is result. Choose one option letter from the "
-                    "CHOICE nodes. Emit exactly one JSON object and nothing else, for example: "
-                    '{"op":"set_result","id":"answer","value":"A"}. '
-                    "The value must be only a single option letter."
+                    "The next required boundary is result. Choose one option from the CHOICE nodes "
+                    "and include semantic option verification. Emit exactly one JSON object and "
+                    "nothing else, for example: "
+                    '{"op":"set_result","id":"answer","value":{"answer":"A","solver_choice":"A",'
+                    '"independent_choice":"A","option_analysis":{"A":{"support":["..."],'
+                    '"contradiction":[]},"B":{"support":[],"contradiction":["..."]}},'
+                    '"confidence":0.8}}. Bare option letters are invalid.'
                 )
             if self.task_type == "multihop_qa":
                 return (
-                    "The next required boundary is result. Answer the question using the "
+                    "The next required boundary is result. Answer the question using cited "
                     "SUPPORTING_FACT evidence. Emit exactly one JSON object and nothing else, "
-                    'for example: {"op":"set_result","id":"answer","value":"short answer"}.'
+                    'for example: {"op":"set_result","id":"answer","value":{"answer":"short answer",'
+                    '"bridge_entity":"bridge","cited_fact_ids":["supporting_fact_1",'
+                    '"supporting_fact_2"],"reasoning_chain":["supporting_fact_1 -> bridge",'
+                    '"bridge + supporting_fact_2 -> answer"]}}. Bare text answers are invalid.'
                 )
         if role == "solver" and mode == "repair":
             diagnosis = self._latest_repair_diagnosis()
@@ -1967,6 +2573,26 @@ class LangGraphWorkflow:
                     '"requested_fragments":[]}. If tests fail, emit need_fix with non-empty '
                     "error_type, error_location, and repair_instruction. The instruction must say "
                     "what to change and what to preserve; do not emit a bare need_fix flag."
+                )
+            if self.task_type == "multihop_qa":
+                return (
+                    "Verify the latest structured HotpotQA result as the semantic entailment "
+                    "critic. Check that cited_fact_ids exist, the reasoning_chain connects hop1 "
+                    "to bridge_entity and bridge_entity to answer, and the cited facts entail the "
+                    "answer. If and only if the cited evidence entails the answer, emit verify "
+                    "with status=verified and empty diagnostic fields. If entailment is missing, "
+                    "contradicted, or not grounded in the citations, emit need_fix with non-empty "
+                    "error_type, error_location, and repair_instruction; do not emit a bare "
+                    "need_fix flag."
+                )
+            if self.task_type == "multiple_choice":
+                return (
+                    "Verify the latest structured multiple-choice result. Check option_analysis, "
+                    "support and contradiction per option, and independent_choice agreement. If "
+                    "correct, emit verify with status=verified and empty diagnostic fields. If the "
+                    "semantic option analysis is wrong or insufficient, emit need_fix with "
+                    "non-empty error_type, error_location, and repair_instruction; do not emit a "
+                    "bare need_fix flag."
                 )
             return (
                 "Verify the latest result. If correct, emit verify with status=verified and empty "

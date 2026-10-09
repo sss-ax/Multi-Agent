@@ -147,6 +147,35 @@ def validate_action(role: str, payload: Any, *, task_type: str) -> List[str]:
             errors.append("add_plan_step.inputs must be an array of non-empty strings")
     if op == "set_execution" and not isinstance(payload.get("success"), bool):
         errors.append("set_execution.success must be boolean")
+    if op == "set_result" and role == "solver" and task_type == "multiple_choice":
+        value = payload.get("value")
+        if not isinstance(value, dict):
+            errors.append(
+                "multiple_choice set_result.value must be an object with answer, "
+                "solver_choice, independent_choice, option_analysis, and confidence"
+            )
+        else:
+            required = {"answer", "solver_choice", "independent_choice", "option_analysis", "confidence"}
+            missing = sorted(key for key in required if key not in value)
+            if missing:
+                errors.append(f"multiple_choice set_result.value missing keys: {', '.join(missing)}")
+            if "option_analysis" in value and not isinstance(value.get("option_analysis"), dict):
+                errors.append("multiple_choice set_result.value.option_analysis must be an object")
+    if op == "set_result" and role == "solver" and task_type == "multihop_qa":
+        value = payload.get("value")
+        if not isinstance(value, dict):
+            errors.append(
+                "multihop_qa set_result.value must be an object with answer, "
+                "bridge_entity, cited_fact_ids, and reasoning_chain"
+            )
+        else:
+            required = {"answer", "bridge_entity", "cited_fact_ids", "reasoning_chain"}
+            missing = sorted(key for key in required if key not in value)
+            if missing:
+                errors.append(f"multihop_qa set_result.value missing keys: {', '.join(missing)}")
+            for key in ("cited_fact_ids", "reasoning_chain"):
+                if key in value and not isinstance(value.get(key), list):
+                    errors.append(f"multihop_qa set_result.value.{key} must be an array")
     if op == "call_tool":
         if not isinstance(payload.get("name"), str) or not payload["name"].strip():
             errors.append("call_tool.name must be a non-empty string")
@@ -191,13 +220,43 @@ def action_contract(role: str, task_type: str) -> str:
         "Solver must use calculate and set_result for numeric work; it may call an allowlisted tool with call_tool; it must not emit planner Actions."
     )
     if task_type == "multiple_choice":
-        solver_rule = "Solver must choose one option and emit set_result with a single letter value such as A; it must not emit planner Actions."
+        solver_rule = (
+            "Solver must choose one option and emit set_result whose value is an object containing "
+            "answer, solver_choice, independent_choice, option_analysis, and confidence. Bare option "
+            "letters are invalid. It must not emit planner Actions."
+        )
     elif task_type == "multihop_qa":
-        solver_rule = "Solver must answer from the provided evidence and emit set_result with a concise answer; it must not emit planner Actions."
+        solver_rule = (
+            "Solver must answer from the provided evidence and emit set_result whose value is an "
+            "object containing answer, bridge_entity, cited_fact_ids, and reasoning_chain. Bare text "
+            "answers are invalid. cited_fact_ids must refer to visible supporting_fact ids, titles, "
+            "or title:sent_id references. It must not emit planner Actions."
+        )
     elif task_type == "code_generation":
         solver_rule = "Solver must emit executable Python code with emit_code; it must not emit planner Actions."
     elif task_type in {"marble_research", "marble_bargaining", "marble_database"}:
         solver_rule = "Solver must emit the domain artifact with set_result; it must not emit planner Actions."
+    critic_rule = (
+        "Critic must verify an existing result or report an error; it must not create a result. "
+        "For status=need_fix, include actionable diagnostic fields: error_type, "
+        "error_location, repair_instruction, preserve, and requested_fragments."
+    )
+    if task_type == "multihop_qa":
+        critic_rule = (
+            "Critic is the semantic entailment judge for HotpotQA. Verify only when the cited "
+            "supporting facts and reasoning_chain entail the answer through the bridge_entity. "
+            "If a citation is irrelevant, a hop is missing, the bridge is wrong, the cited facts "
+            "contradict the answer, or entailment is insufficient, emit need_fix with actionable "
+            "error_type, error_location, repair_instruction, preserve, and requested_fragments. "
+            "Do not mark verified merely because cited facts exist."
+        )
+    elif task_type == "multiple_choice":
+        critic_rule = (
+            "Critic must verify the semantic option analysis, not just label validity. Verify only "
+            "when option_analysis supports the solver_choice, contradicts plausible alternatives, "
+            "and independent_choice agrees with the final answer. Otherwise emit need_fix with "
+            "actionable diagnostics."
+        )
     stage_rules = {
         "planner": (
             "Planner may use add_fact only for facts explicitly present in the task. "
@@ -205,11 +264,7 @@ def action_contract(role: str, task_type: str) -> str:
             "for the operation and operands before finishing."
         ),
         "solver": solver_rule,
-        "critic": (
-            "Critic must verify an existing result or report an error; it must not create a result. "
-            "For status=need_fix, include actionable diagnostic fields: error_type, "
-            "error_location, repair_instruction, preserve, and requested_fragments."
-        ),
+        "critic": critic_rule,
         "final_solver": "Finalizer must copy an existing verified result using answer; it must not recalculate.",
     }[role]
     return (

@@ -124,3 +124,40 @@ def test_oracle_minimal_sends_only_target_core_and_verifier_summary():
     )
 
     assert set(ids) == {"c1#final_value", "c1#status", "c1#verifier_summary"}
+
+
+def test_receiver_aware_tie_break_prefers_earlier_generation():
+    candidates = [
+        {
+            "candidate_id": "c0",
+            "artifact": "def f(): return 1",
+            "final_value": "def f(): return 1",
+            "score": {
+                "syntax_valid": True,
+                "compile_success": True,
+                "runtime_ok": True,
+                "no_exception": True,
+                "test_pass_rate": 0.0,
+                "failed_test_count": 0,
+                "confidence": 0.25,
+            },
+        },
+        {
+            "candidate_id": "c3",
+            "artifact": "def f(): return 1",
+            "final_value": "def f(): return 1",
+            "score": {
+                "syntax_valid": True,
+                "compile_success": True,
+                "runtime_ok": True,
+                "no_exception": True,
+                "test_pass_rate": 0.0,
+                "failed_test_count": 0,
+                "confidence": 0.25,
+            },
+        },
+    ]
+
+    result = run_selector_with_fragments(candidates, policy="selector_receiver_aware")
+
+    assert result.selected_candidate_id == "c0"

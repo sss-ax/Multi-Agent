@@ -108,6 +108,15 @@ class WorkflowTelemetry:
             "repeated_prefix_tokens": 0,
             "simulated_context_reuse_input_tokens": 0,
             "graph_update_tokens": 0,
+            "graph_context_content_tokens": 0,
+            "graph_context_wrapper_tokens": 0,
+            "graph_context_edge_tokens": 0,
+            "graph_source_duplicate_in_prompt_tokens": 0,
+            "graph_source_duplicate_in_prompt_original_tokens": 0,
+            "graph_source_deduplicated_prompt_saved_tokens": 0,
+            "graph_source_cross_call_reread_tokens": 0,
+            "graph_role_aware_source_ref_saved_tokens": 0,
+            "graph_role_aware_state_ref_saved_tokens": 0,
             "peak_context_tokens": 0,
             "quality": {
                 "protocol_valid_actions": 0,
@@ -166,6 +175,13 @@ class WorkflowTelemetry:
             "persistent_context_tokens", "incremental_context_tokens",
             "logical_communication_tokens", "system_prompt_tokens",
             "prompt_wrapper_tokens", "reusable_prefix_tokens",
+            "graph_context_content_tokens", "graph_context_wrapper_tokens",
+            "graph_context_edge_tokens", "graph_source_duplicate_in_prompt_tokens",
+            "graph_source_duplicate_in_prompt_original_tokens",
+            "graph_source_deduplicated_prompt_saved_tokens",
+            "graph_source_cross_call_reread_tokens",
+            "graph_role_aware_source_ref_saved_tokens",
+            "graph_role_aware_state_ref_saved_tokens",
         ):
             self._summary[key] += int(event.get(key, 0) or 0)
         physical_input = int(event.get("physical_input_tokens", 0) or 0)
@@ -221,6 +237,27 @@ class WorkflowTelemetry:
         self._summary["prompt_wrapper_tokens"] += int(event.get("prompt_wrapper_tokens", 0) or 0)
         self._summary["reusable_prefix_tokens"] += int(event.get("reusable_prefix_tokens", 0) or 0)
         self._summary["graph_update_tokens"] += int(event.get("graph_update_tokens", 0) or 0)
+        self._summary["graph_context_content_tokens"] += int(event.get("graph_context_content_tokens", 0) or 0)
+        self._summary["graph_context_wrapper_tokens"] += int(event.get("graph_context_wrapper_tokens", 0) or 0)
+        self._summary["graph_context_edge_tokens"] += int(event.get("graph_context_edge_tokens", 0) or 0)
+        self._summary["graph_source_duplicate_in_prompt_tokens"] += int(
+            event.get("graph_source_duplicate_in_prompt_tokens", 0) or 0
+        )
+        self._summary["graph_source_duplicate_in_prompt_original_tokens"] += int(
+            event.get("graph_source_duplicate_in_prompt_original_tokens", 0) or 0
+        )
+        self._summary["graph_source_deduplicated_prompt_saved_tokens"] += int(
+            event.get("graph_source_deduplicated_prompt_saved_tokens", 0) or 0
+        )
+        self._summary["graph_source_cross_call_reread_tokens"] += int(
+            event.get("graph_source_cross_call_reread_tokens", 0) or 0
+        )
+        self._summary["graph_role_aware_source_ref_saved_tokens"] += int(
+            event.get("graph_role_aware_source_ref_saved_tokens", 0) or 0
+        )
+        self._summary["graph_role_aware_state_ref_saved_tokens"] += int(
+            event.get("graph_role_aware_state_ref_saved_tokens", 0) or 0
+        )
         self._summary["peak_context_tokens"] = max(
             int(self._summary.get("peak_context_tokens", 0) or 0),
             int(event.get("graph_read_context_tokens", 0) or 0),
