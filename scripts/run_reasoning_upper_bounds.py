@@ -6,8 +6,10 @@ This script intentionally bypasses the graph communication workflow.  It asks:
 * can a deterministic/oracle selector pick a correct candidate?
 * can structured verifier feedback repair an initially wrong candidate?
 * how far can repeated full-context repair go before communication compression?
+* can MMLU-Pro/HotpotQA join the same deployable selector-communication
+  schema without gold answers in the selector path?
 
-Supported domains are the current repairable set: gsm8k, humaneval, mbpp.
+Supported domains are gsm8k, humaneval, mbpp, mmlu_pro, and hotpotqa.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -29,7 +32,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.evaluate_domain_workflow import (  # noqa: E402
     extract_code,
+    extract_choice,
     extract_numeric_answer,
+    hotpot_normalize,
     read,
     render_native_task,
     score_prediction,
@@ -49,10 +54,14 @@ from workflow_runtime.candidate_selector_communication import (  # noqa: E402
     select_fragment_ids,
 )
 from workflow_runtime.graph_store import GraphStore  # noqa: E402
+from workflow_runtime.mmlu_representation import build_mmlu_option_hypothesis_graph_view  # noqa: E402
 from scripts.evaluate_deployable_candidate_selector import code_features, numeric_features  # noqa: E402
 
 
-DOMAINS = ("gsm8k", "humaneval", "mbpp")
+DOMAINS = ("gsm8k", "humaneval", "mbpp", "mmlu_pro", "hotpotqa")
+CODE_DOMAINS = {"humaneval", "mbpp"}
+SELECTION_ONLY_DOMAINS = {"mmlu_pro", "hotpotqa"}
+MMLU_OPTION_PAIRWISE_MARGIN_THRESHOLD = 0.15
 SELECTOR_COMMUNICATION_POLICIES = (
     "deployable_full",
     "selector_send_all",
@@ -73,6 +82,10 @@ class Candidate:
     seed: int
     repair_round: int = 0
     feedback: dict[str, Any] | None = None
+    generation_role: str = ""
+    redundant_candidate: bool = False
+    redundancy_reason: str = ""
+    rationale_similarity_to_previous: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -151,21 +164,297 @@ def task_prompt(row: dict[str, Any], domain: str) -> str:
             "as 'Final answer: <number>'.\n\n"
             f"Problem:\n{row['question']}"
         )
+    if domain == "mmlu_pro":
+        return (
+            f"{render_native_task(row)}\n\n"
+            "Think briefly if needed, then end with exactly 'Final answer: <option letter>'."
+        )
+    if domain == "hotpotqa":
+        return (
+            f"{render_native_task(row)}\n\n"
+            "Answer concisely. End with exactly 'Final answer: <short answer>'."
+        )
     return render_native_task(row)
 
 
+def generation_prompt(
+    row: dict[str, Any],
+    domain: str,
+    *,
+    attempt: int,
+    previous_candidates: list[Candidate] | None = None,
+) -> tuple[str, str]:
+    if domain != "mmlu_pro":
+        return task_prompt(row, domain), ""
+    base = render_native_task(row)
+    previous_candidates = previous_candidates or []
+    previous_answers = [
+        str(candidate_artifact(domain, candidate.text)[2] or "").strip().upper()
+        for candidate in previous_candidates
+    ]
+    previous_answers = [answer for answer in previous_answers if answer]
+    previous_block = (
+        "\nPrevious candidate answers: " + ", ".join(previous_answers)
+        if previous_answers else
+        "\nPrevious candidate answers: none"
+    )
+    labels = [
+        str(choice.get("label", "")).strip().upper()
+        for choice in row.get("choices", [])
+        if isinstance(choice, dict) and str(choice.get("label", "")).strip()
+    ]
+    labels_text = ", ".join(labels) if labels else "the visible option labels"
+    prompt = (
+        f"{base}\n"
+        f"{previous_block}\n\n"
+        "Task: evaluate every option independently as a hypothesis. Do not start by choosing "
+        "an answer label. For each option, list concise support and contradiction evidence, "
+        "then assign support_strength, contradiction_strength, and uncertainty from 0.0 to 1.0.\n\n"
+        "Return only JSON with this schema:\n"
+        "{\n"
+        '  "option_hypotheses": [\n'
+        "    {\n"
+        '      "option_id": "A",\n'
+        '      "support": ["..."],\n'
+        '      "contradictions": ["..."],\n'
+        '      "support_strength": 0.0,\n'
+        '      "contradiction_strength": 0.0,\n'
+        '      "uncertainty": 0.0\n'
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        f"Include exactly these option ids if present: {labels_text}.\n"
+        "Do not include a final answer field; the runtime will select argmax."
+    )
+    return prompt, "option_hypothesis_builder"
+
+
 def score_candidate(row: dict[str, Any], domain: str, text: str) -> dict[str, Any]:
-    if domain in {"humaneval", "mbpp"}:
+    if domain in CODE_DOMAINS:
         return score_prediction(row, extract_code(text))
+    if domain in {"mmlu_pro", "hotpotqa"}:
+        _artifact_type, artifact, _final_value = candidate_artifact(domain, text)
+        return score_prediction(row, artifact)
     return score_prediction(row, text)
 
 
 def candidate_artifact(domain: str, text: str) -> tuple[str, Any, Any]:
-    if domain in {"humaneval", "mbpp"}:
+    if domain in CODE_DOMAINS:
         code = extract_code(text)
         return "code", code, None
+    if domain == "mmlu_pro":
+        choice = select_mmlu_option_from_hypotheses(text) or extract_mmlu_final_choice(text)
+        return "choice", choice, choice
+    if domain == "hotpotqa":
+        answer = extract_hotpot_short_answer(text)
+        return "answer", answer, answer
     final_value = extract_numeric_answer(text)
     return "result", final_value, final_value
+
+
+def select_mmlu_option_from_hypotheses(value: Any) -> str:
+    selected = _mmlu_runtime_selected_option(value)
+    if selected:
+        return selected
+    hypotheses = extract_mmlu_option_hypotheses(value)
+    if not hypotheses:
+        return ""
+    scored = []
+    for index, hypothesis in enumerate(hypotheses):
+        option_id = str(hypothesis.get("option_id") or hypothesis.get("label") or hypothesis.get("option") or "").strip().upper()
+        if not re.fullmatch(r"[A-J]", option_id):
+            continue
+        support = _option_strength(hypothesis, "support_strength", "support")
+        contradiction = _option_strength(hypothesis, "contradiction_strength", "contradictions", "contradiction")
+        uncertainty = _float_value(hypothesis.get("uncertainty"), default=0.0)
+        score = support - contradiction - uncertainty
+        scored.append((score, -index, option_id))
+    if not scored:
+        return ""
+    ranked = sorted(scored, reverse=True)
+    if len(ranked) > 1 and abs(ranked[0][0] - ranked[1][0]) <= 1e-9:
+        return ""
+    return ranked[0][2]
+
+
+def _mmlu_runtime_selected_option(value: Any) -> str:
+    parsed = _parse_json_payload(value)
+    if not isinstance(parsed, dict):
+        return ""
+    selection = parsed.get("runtime_selection")
+    if isinstance(selection, dict):
+        option_id = str(selection.get("selected_option_id") or "").strip().upper()
+        if re.fullmatch(r"[A-J]", option_id):
+            return option_id
+    pairwise = parsed.get("pairwise_critic")
+    if isinstance(pairwise, dict):
+        option_id = str(pairwise.get("selected_option_id") or pairwise.get("better_option_id") or "").strip().upper()
+        if re.fullmatch(r"[A-J]", option_id):
+            return option_id
+    return ""
+
+
+def extract_mmlu_option_hypotheses(value: Any) -> list[dict[str, Any]]:
+    parsed = _parse_json_payload(value)
+    if parsed is None:
+        return _parse_mmlu_option_blocks(str(value or ""))
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, dict)]
+    if not isinstance(parsed, dict):
+        return []
+    for key in ("option_hypotheses", "hypotheses", "options"):
+        items = parsed.get(key)
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+    analysis = parsed.get("option_analysis")
+    if isinstance(analysis, dict):
+        result = []
+        for option_id, payload in analysis.items():
+            if isinstance(payload, dict):
+                result.append({"option_id": option_id, **payload})
+        return result
+    return []
+
+
+def extract_mmlu_final_choice(value: Any) -> str:
+    text = str(value or "").strip()
+    parsed = _parse_json_payload(text)
+    if isinstance(parsed, dict):
+        for key in ("answer", "final_answer", "choice", "selected_option", "solver_choice", "independent_choice"):
+            if key in parsed:
+                choice = extract_mmlu_final_choice(parsed[key])
+                if choice:
+                    return choice
+    labelled = re.findall(
+        r"(?:final\s+answer|answer|selected\s+option|choice)\s*[:：]\s*([A-J])\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if labelled:
+        return labelled[-1].upper()
+    last_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in reversed(last_lines[-3:]):
+        match = re.fullmatch(r"(?:\(?([A-Ja-j])\)?\.?)", line)
+        if match:
+            return match.group(1).upper()
+    return ""
+
+
+def _parse_json_payload(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    candidates = [fenced.group(1).strip()] if fenced else []
+    candidates.append(text)
+    brace = re.search(r"(\{.*\})", text, flags=re.DOTALL)
+    if brace:
+        candidates.append(brace.group(1))
+    bracket = re.search(r"(\[.*\])", text, flags=re.DOTALL)
+    if bracket:
+        candidates.append(bracket.group(1))
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _parse_mmlu_option_blocks(text: str) -> list[dict[str, Any]]:
+    result = []
+    pattern = re.compile(
+        r"(?:^|\n)\s*(?:Option\s+)?([A-J])\s*[:.)-]\s*(.*?)(?=(?:\n\s*(?:Option\s+)?[A-J]\s*[:.)-])|\Z)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for match in pattern.finditer(text):
+        option_id = match.group(1).upper()
+        body = match.group(2)
+        result.append({
+            "option_id": option_id,
+            "support": _extract_lines_after_label(body, "support"),
+            "contradictions": _extract_lines_after_label(body, "contradiction"),
+            "support_strength": _extract_float_after_label(body, "support_strength"),
+            "contradiction_strength": _extract_float_after_label(body, "contradiction_strength"),
+            "uncertainty": _extract_float_after_label(body, "uncertainty"),
+        })
+    return result
+
+
+def _extract_lines_after_label(text: str, label: str) -> list[str]:
+    match = re.search(rf"{label}s?\s*[:：]\s*(.*)", text, flags=re.IGNORECASE)
+    if not match:
+        return []
+    value = match.group(1).strip()
+    return [value] if value else []
+
+
+def _extract_float_after_label(text: str, label: str) -> float:
+    match = re.search(rf"{label}\s*[:：]\s*([01](?:\.\d+)?)", text, flags=re.IGNORECASE)
+    return _float_value(match.group(1), default=0.0) if match else 0.0
+
+
+def _option_strength(hypothesis: dict[str, Any], strength_key: str, *evidence_keys: str) -> float:
+    if strength_key in hypothesis:
+        return _float_value(hypothesis.get(strength_key), default=0.0)
+    evidence_count = 0
+    for key in evidence_keys:
+        value = hypothesis.get(key)
+        if isinstance(value, list):
+            evidence_count += sum(1 for item in value if str(item).strip())
+        elif str(value or "").strip():
+            evidence_count += 1
+    return min(1.0, 0.35 * evidence_count)
+
+
+def _float_value(value: Any, *, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number < 0:
+        return 0.0
+    if number > 1:
+        return 1.0
+    return number
+
+
+def extract_hotpot_short_answer(value: Any) -> str:
+    """Extract a deployable short answer from model text without gold labels."""
+
+    if isinstance(value, dict):
+        for key in ("answer", "final_answer", "derived_answer", "value"):
+            if key in value:
+                return extract_hotpot_short_answer(value[key])
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        extracted = extract_hotpot_short_answer(parsed)
+        if extracted:
+            return extracted
+    labelled = re.findall(
+        r"(?:final\s+answer|answer|short\s+answer)\s*[:：]\s*(.+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if labelled:
+        text = labelled[-1].strip()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines:
+        text = lines[-1]
+    text = re.sub(r"^(?:final\s+answer|answer|short\s+answer)\s*[:：]\s*", "", text, flags=re.IGNORECASE)
+    text = text.strip().strip("\"'`")
+    text = re.split(r"\s+(?:because|since|as)\s+", text, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    if len(text.split()) > 12 and "." in text:
+        text = text.split(".", 1)[0].strip()
+    return text
 
 
 def tests_for_row(row: dict[str, Any]) -> tuple[list[str], str]:
@@ -183,7 +472,7 @@ def code_failure_detail(row: dict[str, Any], text: str) -> dict[str, Any]:
 
 
 def build_repair_feedback(row: dict[str, Any], domain: str, candidate: Candidate) -> dict[str, Any]:
-    if domain in {"humaneval", "mbpp"}:
+    if domain in CODE_DOMAINS:
         detail = code_failure_detail(row, candidate.text)
         kind = str(detail.get("kind") or "execution_failure")
         failed_test = str(detail.get("failed_test") or "")
@@ -214,6 +503,30 @@ def build_repair_feedback(row: dict[str, Any], domain: str, candidate: Candidate
             "exception": detail.get("exception"),
             "repair_instruction": instruction,
         }
+    if domain == "mmlu_pro":
+        _artifact_type, choice, _final_value = candidate_artifact(domain, candidate.text)
+        labels = [str(choice_row.get("label")) for choice_row in row.get("choices", []) if isinstance(choice_row, dict)]
+        return {
+            "feedback_type": "deployable_repair_signal",
+            "kind": "multiple_choice_uncertain",
+            "predicted_choice": choice,
+            "allowed_choices": labels,
+            "repair_instruction": (
+                "Re-evaluate the question and every option. Return exactly one option letter "
+                "using the schema 'Final answer: <option letter>'."
+            ),
+        }
+    if domain == "hotpotqa":
+        _artifact_type, answer, _final_value = candidate_artifact(domain, candidate.text)
+        return {
+            "feedback_type": "deployable_repair_signal",
+            "kind": "multihop_answer_uncertain",
+            "predicted_answer": answer,
+            "repair_instruction": (
+                "Re-check the evidence chain and return only the concise short answer using "
+                "the schema 'Final answer: <short answer>'."
+            ),
+        }
     predicted = extract_numeric_answer(candidate.text)
     return {
         "feedback_type": "oracle_repair_signal",
@@ -228,7 +541,7 @@ def build_repair_feedback(row: dict[str, Any], domain: str, candidate: Candidate
 
 
 def repair_prompt(row: dict[str, Any], domain: str, previous: Candidate, feedback: dict[str, Any], *, round_id: int) -> str:
-    if domain in {"humaneval", "mbpp"}:
+    if domain in CODE_DOMAINS:
         tests = "\n".join(tests_for_row(row)[0])
         return (
             "You are repairing a Python solution. Return only executable Python code, no Markdown.\n\n"
@@ -237,6 +550,22 @@ def repair_prompt(row: dict[str, Any], domain: str, previous: Candidate, feedbac
             f"Previous candidate:\n{extract_code(previous.text)}\n\n"
             f"Verifier feedback:\n{json.dumps(feedback, ensure_ascii=False, indent=2)}\n\n"
             "Repair only the faulty behavior and preserve correct behavior."
+        )
+    if domain == "mmlu_pro":
+        return (
+            "You are repairing a multiple-choice answer. Use only the visible question and options. "
+            "End with exactly 'Final answer: <option letter>'.\n\n"
+            f"Task:\n{render_native_task(row)}\n\n"
+            f"Previous answer:\n{previous.text}\n\n"
+            f"Verifier feedback:\n{json.dumps(feedback, ensure_ascii=False, indent=2)}\n"
+        )
+    if domain == "hotpotqa":
+        return (
+            "You are repairing a multihop QA answer. Use the evidence below and return only a concise "
+            "short answer at the end as 'Final answer: <short answer>'.\n\n"
+            f"Task:\n{render_native_task(row)}\n\n"
+            f"Previous answer:\n{previous.text}\n\n"
+            f"Verifier feedback:\n{json.dumps(feedback, ensure_ascii=False, indent=2)}\n"
         )
     return (
         "You are repairing a math solution. Give concise corrected reasoning and end with "
@@ -259,6 +588,7 @@ def generate_candidate(
     do_sample: bool,
     repair_round: int = 0,
     feedback: dict[str, Any] | None = None,
+    generation_role: str = "",
 ) -> Candidate:
     text, metrics = model.generate(
         prompt,
@@ -276,7 +606,314 @@ def generate_candidate(
         seed=seed,
         repair_round=repair_round,
         feedback=feedback,
+        generation_role=generation_role,
     )
+
+
+def generate_attempt_candidate(
+    model: SamplingModel,
+    row: dict[str, Any],
+    domain: str,
+    *,
+    attempt: int,
+    previous_candidates: list[Candidate],
+    seed: int,
+    temperature: float,
+    top_p: float,
+    do_sample: bool,
+) -> Candidate:
+    if domain == "mmlu_pro":
+        candidate = generate_mmlu_option_independent_candidate(
+            model,
+            row,
+            attempt=attempt,
+            previous_candidates=previous_candidates,
+            seed=seed,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=do_sample,
+        )
+        return mark_candidate_redundancy(candidate, previous_candidates, domain=domain)
+    prompt, role = generation_prompt(
+        row,
+        domain,
+        attempt=attempt,
+        previous_candidates=previous_candidates,
+    )
+    candidate = generate_candidate(
+        model,
+        row,
+        domain,
+        prompt,
+        seed=seed,
+        temperature=temperature,
+        top_p=top_p,
+        do_sample=do_sample,
+        generation_role=role,
+    )
+    return mark_candidate_redundancy(candidate, previous_candidates, domain=domain)
+
+
+def generate_mmlu_option_independent_candidate(
+    model: SamplingModel,
+    row: dict[str, Any],
+    *,
+    attempt: int,
+    previous_candidates: list[Candidate],
+    seed: int,
+    temperature: float,
+    top_p: float,
+    do_sample: bool,
+) -> Candidate:
+    hypotheses: list[dict[str, Any]] = []
+    raw_outputs: list[dict[str, Any]] = []
+    input_tokens = 0
+    output_tokens = 0
+    latency_sec = 0.0
+    choices = [
+        choice for choice in row.get("choices", [])
+        if isinstance(choice, dict) and str(choice.get("text", "")).strip()
+    ]
+    for option_index, choice in enumerate(choices):
+        option_text = str(choice.get("text", "")).strip()
+        prompt = mmlu_option_independent_prompt(row, option_text, previous_candidates=previous_candidates)
+        text, metrics = model.generate(
+            prompt,
+            seed=seed + option_index * 7919,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=do_sample,
+        )
+        input_tokens += int(metrics["input_tokens"])
+        output_tokens += int(metrics["output_tokens"])
+        latency_sec += float(metrics["latency_sec"])
+        hypothesis = parse_single_option_hypothesis(text)
+        hypothesis["option_id"] = str(choice.get("label", "")).strip().upper()
+        hypothesis["option_text"] = option_text
+        hypotheses.append(hypothesis)
+        raw_outputs.append({
+            "option_index": option_index,
+            "option_text": option_text,
+            "raw_output": text,
+        })
+    cheap_scores = mmlu_option_hypothesis_scores(hypotheses)
+    top2 = _top2_mmlu_options(cheap_scores)
+    cheap_margin = _top_option_margin(cheap_scores)
+    pairwise_critic: dict[str, Any] = {}
+    selected_option_id = top2[0][0] if top2 else ""
+    selection_source = "cheap_argmax"
+    if len(top2) >= 2 and cheap_margin < MMLU_OPTION_PAIRWISE_MARGIN_THRESHOLD:
+        pairwise_prompt = mmlu_pairwise_option_critic_prompt(row, hypotheses, top2)
+        pairwise_text, pairwise_metrics = model.generate(
+            pairwise_prompt,
+            seed=seed + 104729,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=do_sample,
+        )
+        input_tokens += int(pairwise_metrics["input_tokens"])
+        output_tokens += int(pairwise_metrics["output_tokens"])
+        latency_sec += float(pairwise_metrics["latency_sec"])
+        pairwise_critic = parse_mmlu_pairwise_critic(pairwise_text, allowed_option_ids=[top2[0][0], top2[1][0]])
+        pairwise_critic["raw_output"] = pairwise_text
+        if pairwise_critic.get("selected_option_id"):
+            selected_option_id = str(pairwise_critic["selected_option_id"])
+            selection_source = "pairwise_top2_critic"
+    payload = {
+        "generation_mode": "option_independent",
+        "attempt": attempt,
+        "option_hypotheses": hypotheses,
+        "cheap_option_scores": cheap_scores,
+        "cheap_top_options": [
+            {"option_id": option_id, "score": score}
+            for option_id, score in top2
+        ],
+        "cheap_score_margin": cheap_margin,
+        "pairwise_margin_threshold": MMLU_OPTION_PAIRWISE_MARGIN_THRESHOLD,
+        "pairwise_critic": pairwise_critic,
+        "runtime_selection": {
+            "selected_option_id": selected_option_id,
+            "selection_source": selection_source,
+            "score_margin": cheap_margin,
+        },
+        "raw_option_outputs": raw_outputs,
+    }
+    text = json.dumps(payload, ensure_ascii=False)
+    return Candidate(
+        text=text,
+        score=score_candidate(row, "mmlu_pro", text),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        latency_sec=latency_sec,
+        seed=seed,
+        generation_role="option_independent_hypothesis_builder",
+    )
+
+
+def mmlu_option_independent_prompt(
+    row: dict[str, Any],
+    option_text: str,
+    *,
+    previous_candidates: list[Candidate],
+) -> str:
+    question = str(row.get("question", "")).strip()
+    # Hide the original option label from the model; runtime reattaches it.
+    question_without_options = question.split("\n\n", 1)[0].strip()
+    return (
+        "Evaluate one answer hypothesis for a multiple-choice question. "
+        "You are not given the option label. Do not infer or mention labels like A, B, C.\n\n"
+        f"Question:\n{question_without_options}\n\n"
+        "Evaluate this hypothesis only:\n"
+        f"{option_text}\n\n"
+        "Return only JSON with this schema:\n"
+        "{\n"
+        '  "support": ["..."],\n'
+        '  "contradictions": ["..."],\n'
+        '  "support_strength": 0.0,\n'
+        '  "contradiction_strength": 0.0,\n'
+        '  "uncertainty": 0.0\n'
+        "}"
+    )
+
+
+def mmlu_pairwise_option_critic_prompt(
+    row: dict[str, Any],
+    hypotheses: list[dict[str, Any]],
+    top2: list[tuple[str, float]],
+) -> str:
+    by_id = {
+        str(hypothesis.get("option_id") or "").strip().upper(): hypothesis
+        for hypothesis in hypotheses
+    }
+    first = by_id.get(top2[0][0], {})
+    second = by_id.get(top2[1][0], {})
+    question = str(row.get("question", "")).split("\n\n", 1)[0].strip()
+    return (
+        "The cheap option-wise scorer is uncertain. Compare only the two listed options.\n\n"
+        f"Question:\n{question}\n\n"
+        f"Option {top2[0][0]}:\n"
+        f"text: {first.get('option_text', '')}\n"
+        f"strongest support: {_first_text(first.get('support'))}\n"
+        f"strongest contradiction: {_first_text(first.get('contradictions'))}\n"
+        f"cheap_score: {top2[0][1]:.3f}\n\n"
+        f"Option {top2[1][0]}:\n"
+        f"text: {second.get('option_text', '')}\n"
+        f"strongest support: {_first_text(second.get('support'))}\n"
+        f"strongest contradiction: {_first_text(second.get('contradictions'))}\n"
+        f"cheap_score: {top2[1][1]:.3f}\n\n"
+        "For each option, identify the strongest support, strongest contradiction, and any condition violated. "
+        "Then choose which option better satisfies the question.\n\n"
+        "Return only JSON:\n"
+        "{\n"
+        f'  "selected_option_id": "{top2[0][0]} or {top2[1][0]}",\n'
+        '  "reason": "...",\n'
+        '  "confidence": 0.0\n'
+        "}"
+    )
+
+
+def parse_mmlu_pairwise_critic(text: str, *, allowed_option_ids: list[str]) -> dict[str, Any]:
+    allowed = {str(option_id).strip().upper() for option_id in allowed_option_ids}
+    parsed = _parse_json_payload(text)
+    selected = ""
+    reason = ""
+    confidence = 0.0
+    if isinstance(parsed, dict):
+        selected = str(
+            parsed.get("selected_option_id")
+            or parsed.get("better_option_id")
+            or parsed.get("choice")
+            or ""
+        ).strip().upper()
+        reason = str(parsed.get("reason") or parsed.get("rationale") or "")
+        confidence = _float_value(parsed.get("confidence"), default=0.0)
+    if selected not in allowed:
+        labelled = re.findall(
+            r"(?:selected_option_id|better_option|choice|answer)\s*[:：]\s*([A-J])\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        selected = labelled[-1].upper() if labelled and labelled[-1].upper() in allowed else ""
+    return {
+        "selected_option_id": selected,
+        "reason": reason,
+        "confidence": confidence,
+        "allowed_option_ids": sorted(allowed),
+    }
+
+
+def _top2_mmlu_options(scores: dict[str, float]) -> list[tuple[str, float]]:
+    return sorted(scores.items(), key=lambda item: (item[1], item[0]), reverse=True)[:2]
+
+
+def _first_text(value: Any) -> str:
+    items = _string_list(value)
+    return items[0] if items else "none"
+
+
+def parse_single_option_hypothesis(text: str) -> dict[str, Any]:
+    parsed = _parse_json_payload(text)
+    if isinstance(parsed, dict):
+        return {
+            "support": _string_list(parsed.get("support")),
+            "contradictions": _string_list(parsed.get("contradictions", parsed.get("contradiction"))),
+            "support_strength": _float_value(parsed.get("support_strength"), default=_option_strength(parsed, "support_strength", "support")),
+            "contradiction_strength": _float_value(
+                parsed.get("contradiction_strength"),
+                default=_option_strength(parsed, "contradiction_strength", "contradictions", "contradiction"),
+            ),
+            "uncertainty": _float_value(parsed.get("uncertainty"), default=0.0),
+        }
+    return {
+        "support": _extract_lines_after_label(text, "support"),
+        "contradictions": _extract_lines_after_label(text, "contradiction"),
+        "support_strength": _extract_float_after_label(text, "support_strength"),
+        "contradiction_strength": _extract_float_after_label(text, "contradiction_strength"),
+        "uncertainty": _extract_float_after_label(text, "uncertainty"),
+    }
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    return [text] if text else []
+
+
+def mark_candidate_redundancy(candidate: Candidate, previous: list[Candidate], *, domain: str) -> Candidate:
+    if domain != "mmlu_pro" or not previous:
+        return candidate
+    current_answer = str(candidate_artifact(domain, candidate.text)[2] or "").strip().upper()
+    best_similarity = 0.0
+    same_answer_high_similarity = False
+    for earlier in previous:
+        earlier_answer = str(candidate_artifact(domain, earlier.text)[2] or "").strip().upper()
+        similarity = _text_jaccard_similarity(candidate.text, earlier.text)
+        best_similarity = max(best_similarity, similarity)
+        if current_answer and current_answer == earlier_answer and similarity > 0.75:
+            same_answer_high_similarity = True
+    candidate.rationale_similarity_to_previous = best_similarity
+    if same_answer_high_similarity:
+        candidate.redundant_candidate = True
+        candidate.redundancy_reason = "same_answer_and_high_rationale_similarity"
+    return candidate
+
+
+def _text_jaccard_similarity(left: Any, right: Any) -> float:
+    left_tokens = set(_rationale_tokens(left))
+    right_tokens = set(_rationale_tokens(right))
+    if not left_tokens and not right_tokens:
+        return 1.0
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def _rationale_tokens(value: Any) -> list[str]:
+    text = str(value or "").lower()
+    text = re.sub(r"final\s+answer\s*[:：]?\s*[a-j]\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"[^a-z0-9\s]+", " ", text)
+    return [token for token in text.split() if len(token) > 2]
 
 
 def run_best_of_n(
@@ -291,20 +928,21 @@ def run_best_of_n(
 ) -> dict[str, Any]:
     records = []
     for index, row in enumerate(rows, start=1):
-        prompt = task_prompt(row, domain)
-        candidates = [
-            generate_candidate(
+        candidates: list[Candidate] = []
+        for attempt in range(n):
+            candidates.append(
+                generate_attempt_candidate(
                 model,
                 row,
                 domain,
-                prompt,
+                attempt=attempt,
+                previous_candidates=candidates,
                 seed=seed + index * 1009 + attempt,
                 temperature=temperature,
                 top_p=top_p,
                 do_sample=attempt > 0,
             )
-            for attempt in range(n)
-        ]
+            )
         correct_any = any(c.score.get("correct") for c in candidates)
         correct_count = sum(int(bool(c.score.get("correct"))) for c in candidates)
         candidate_records = [candidate_record(c, domain=domain, candidate_id=f"c{attempt}") for attempt, c in enumerate(candidates)]
@@ -351,8 +989,8 @@ def run_oracle_select(
         top_p=top_p,
     )
     report["experiment"] = "oracle_select"
-    report["selector"] = "unit_tests" if domain in {"humaneval", "mbpp"} else "gold_numeric_oracle"
-    report["uses_gold_selector"] = domain == "gsm8k"
+    report["selector"] = "unit_tests" if domain in CODE_DOMAINS else f"gold_{domain}_oracle"
+    report["uses_gold_selector"] = domain not in CODE_DOMAINS
     return report
 
 
@@ -369,20 +1007,21 @@ def run_verifier_select(
 ) -> dict[str, Any]:
     records = []
     for index, row in enumerate(rows, start=1):
-        prompt = task_prompt(row, domain)
-        candidates = [
-            generate_candidate(
+        candidates: list[Candidate] = []
+        for attempt in range(n):
+            candidates.append(
+                generate_attempt_candidate(
                 model,
                 row,
                 domain,
-                prompt,
+                attempt=attempt,
+                previous_candidates=candidates,
                 seed=seed + index * 1009 + attempt,
                 temperature=temperature,
                 top_p=top_p,
                 do_sample=attempt > 0,
             )
-            for attempt in range(n)
-        ]
+            )
         candidate_records = [
             candidate_record(candidate, domain=domain, candidate_id=f"c{attempt}")
             for attempt, candidate in enumerate(candidates)
@@ -484,11 +1123,12 @@ def run_select_repair(
 
         while len(candidates) < max(1, n):
             attempt = len(candidates)
-            generated = generate_candidate(
+            generated = generate_attempt_candidate(
                 model,
                 row,
                 domain,
-                prompt,
+                attempt=attempt,
+                previous_candidates=candidates,
                 seed=seed + index * 1009 + attempt,
                 temperature=temperature,
                 top_p=top_p,
@@ -591,6 +1231,7 @@ def run_select_repair(
             "selected": selected.as_dict(),
             "candidate_graph": candidate_graph,
             "candidates": candidate_records,
+            "deployable_candidates": deployable_records,
             "feedback": repair_feedback,
             "selector_communication_steps": selector_communication_steps,
         }
@@ -702,11 +1343,12 @@ def run_oracle_repair(
             model,
             row,
             domain,
-            task_prompt(row, domain),
+            generation_prompt(row, domain, attempt=0, previous_candidates=[])[0],
             seed=seed + index * 1009,
             temperature=temperature,
             top_p=top_p,
             do_sample=False,
+            generation_role=generation_prompt(row, domain, attempt=0, previous_candidates=[])[1],
         )
         if initial.score.get("correct"):
             records.append({
@@ -782,11 +1424,12 @@ def run_iterative_repair(
             model,
             row,
             domain,
-            task_prompt(row, domain),
+            generation_prompt(row, domain, attempt=0, previous_candidates=[])[0],
             seed=seed + index * 1009,
             temperature=temperature,
             top_p=top_p,
             do_sample=False,
+            generation_role=generation_prompt(row, domain, attempt=0, previous_candidates=[])[1],
         )
         attempts.append(current)
         first_success_round = 0 if current.score.get("correct") else None
@@ -842,6 +1485,22 @@ def candidate_record(candidate: Candidate, *, domain: str | None = None, candida
     final_value = None
     if domain is not None:
         artifact_type, artifact, final_value = candidate_artifact(domain, candidate.text)
+    extra: dict[str, Any] = {}
+    if domain == "mmlu_pro":
+        parsed = _parse_json_payload(candidate.text)
+        hypotheses = extract_mmlu_option_hypotheses(candidate.text)
+        if hypotheses:
+            extra["option_hypotheses"] = hypotheses
+            extra["option_hypothesis_scores"] = mmlu_option_hypothesis_scores(hypotheses)
+            if isinstance(parsed, dict):
+                extra["runtime_selection"] = parsed.get("runtime_selection", {})
+                extra["pairwise_critic"] = parsed.get("pairwise_critic", {})
+            view = build_mmlu_option_hypothesis_graph_view(
+                candidate_id=str(candidate_id or ""),
+                hypotheses=hypotheses,
+                selected_option_id=str(final_value or ""),
+            )
+            extra["option_hypothesis_view"] = view.as_dict()
     return {
         "candidate_id": candidate_id,
         "correct": bool(candidate.score.get("correct")),
@@ -855,8 +1514,13 @@ def candidate_record(candidate: Candidate, *, domain: str | None = None, candida
         "latency_sec": candidate.latency_sec,
         "seed": candidate.seed,
         "repair_round": candidate.repair_round,
+        "generation_role": candidate.generation_role,
+        "redundant_candidate": candidate.redundant_candidate,
+        "redundancy_reason": candidate.redundancy_reason,
+        "rationale_similarity_to_previous": candidate.rationale_similarity_to_previous,
         "raw_tail": candidate.text[-1000:],
         "feedback": candidate.feedback,
+        **extra,
     }
 
 
@@ -874,30 +1538,157 @@ def deployable_candidate_records(
     row: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     answer_counts: dict[str, int] = {}
-    if domain == "gsm8k":
+    if domain in {"gsm8k", "mmlu_pro", "hotpotqa"}:
         for candidate in candidates:
-            value = str(candidate.get("final_value") or extract_numeric_answer(candidate.get("raw_tail", ""))).strip()
+            if domain == "gsm8k":
+                value = str(candidate.get("final_value") or extract_numeric_answer(candidate.get("raw_tail", ""))).strip()
+            elif domain == "mmlu_pro":
+                value = str(
+                    candidate.get("final_value")
+                    or select_mmlu_option_from_hypotheses(candidate.get("raw_tail", ""))
+                    or extract_mmlu_final_choice(candidate.get("raw_tail", ""))
+                ).strip()
+            else:
+                value = str(candidate.get("final_value") or extract_hotpot_short_answer(candidate.get("raw_tail", ""))).strip()
             if value:
                 answer_counts[value] = answer_counts.get(value, 0) + 1
     records = []
     for candidate in candidates:
         if domain == "gsm8k":
             signals = numeric_features(candidate, answer_counts, len(candidates))
+            source = "deployable_numeric_check"
+        elif domain == "mmlu_pro":
+            signals = mmlu_choice_features(candidate, row=row, answer_counts=answer_counts, total=len(candidates))
+            source = "deployable_mmlu_option_check"
+        elif domain == "hotpotqa":
+            signals = hotpot_answer_features(candidate, row=row, answer_counts=answer_counts, total=len(candidates))
+            source = "deployable_hotpot_answer_evidence_check"
         else:
             signals = code_features(candidate)
             if domain == "mbpp" and row is not None:
                 signals = {**signals, **mbpp_allowed_test_features(row, candidate)}
+            source = "deployable_static_generated_tests"
         records.append({
             **candidate,
             "score": signals,
             "verification_signals": signals,
-            "verification_source": (
-                "deployable_numeric_check"
-                if domain == "gsm8k"
-                else "deployable_static_generated_tests"
-            ),
+            "verification_source": source,
         })
     return records
+
+
+def mmlu_choice_features(
+    candidate: dict[str, Any],
+    *,
+    row: dict[str, Any] | None,
+    answer_counts: dict[str, int],
+    total: int,
+) -> dict[str, Any]:
+    raw = str(candidate.get("raw_tail") or "")
+    hypotheses = candidate.get("option_hypotheses") if isinstance(candidate.get("option_hypotheses"), list) else extract_mmlu_option_hypotheses(raw)
+    hypothesis_scores = mmlu_option_hypothesis_scores(hypotheses)
+    choice = str(
+        candidate.get("final_value")
+        or select_mmlu_option_from_hypotheses(raw)
+        or extract_mmlu_final_choice(raw)
+    ).strip().upper()
+    labels = []
+    if row is not None:
+        labels = [
+            str(item.get("label", "")).strip().upper()
+            for item in row.get("choices", [])
+            if isinstance(item, dict) and str(item.get("label", "")).strip()
+        ]
+    if not labels:
+        labels = list("ABCDEFGHIJ")
+    option_valid = bool(choice and choice in set(labels))
+    consensus = answer_counts.get(choice, 0) / max(1, total) if choice else 0.0
+    features: dict[str, Any] = {
+        "option_valid": option_valid,
+        "invalid_option": not option_valid,
+        "final_value_valid": option_valid,
+        "option_hypothesis_parseable": bool(hypotheses),
+        "option_hypothesis_count": len(hypotheses),
+        "option_score_margin": _top_option_margin(hypothesis_scores),
+        "cross_candidate_answer_consensus": consensus,
+        "confidence": min(
+            0.95,
+            (0.30 if option_valid else 0.05)
+            + (0.20 if hypotheses else 0.0)
+            + 0.30 * consensus
+            + min(0.20, max(0.0, _top_option_margin(hypothesis_scores))),
+        ),
+    }
+    return features
+
+
+def mmlu_option_hypothesis_scores(hypotheses: list[dict[str, Any]]) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    for hypothesis in hypotheses:
+        option_id = str(hypothesis.get("option_id") or hypothesis.get("label") or hypothesis.get("option") or "").strip().upper()
+        if not re.fullmatch(r"[A-J]", option_id):
+            continue
+        support = _option_strength(hypothesis, "support_strength", "support")
+        contradiction = _option_strength(hypothesis, "contradiction_strength", "contradictions", "contradiction")
+        uncertainty = _float_value(hypothesis.get("uncertainty"), default=0.0)
+        scores[option_id] = support - contradiction - uncertainty
+    return scores
+
+
+def _top_option_margin(scores: dict[str, float]) -> float:
+    if len(scores) < 2:
+        return 0.0
+    values = sorted(scores.values(), reverse=True)
+    return values[0] - values[1]
+
+
+def hotpot_answer_features(
+    candidate: dict[str, Any],
+    *,
+    row: dict[str, Any] | None,
+    answer_counts: dict[str, int],
+    total: int,
+) -> dict[str, Any]:
+    answer = str(candidate.get("final_value") or extract_hotpot_short_answer(candidate.get("raw_tail", ""))).strip()
+    normalized = hotpot_normalize(answer)
+    answer_valid = bool(normalized)
+    consensus = answer_counts.get(answer, 0) / max(1, total) if answer else 0.0
+    evidence_covered = _hotpot_answer_covered_by_visible_evidence(row, answer) if row is not None else False
+    raw = str(candidate.get("raw_tail") or candidate.get("artifact") or "")
+    mentions_evidence = bool(re.search(r"\b(evidence|fact|bridge|because|support)\b", raw, flags=re.IGNORECASE))
+    features: dict[str, Any] = {
+        "final_value_valid": answer_valid,
+        "evidence_covered": evidence_covered,
+        "missing_evidence": answer_valid and not evidence_covered and not mentions_evidence,
+        "cross_candidate_answer_consensus": consensus,
+        "confidence": min(
+            0.95,
+            (0.20 if answer_valid else 0.0)
+            + (0.35 if evidence_covered else 0.0)
+            + 0.35 * consensus
+            + (0.05 if mentions_evidence else 0.0),
+        ),
+    }
+    return features
+
+
+def _hotpot_answer_covered_by_visible_evidence(row: dict[str, Any] | None, answer: str) -> bool:
+    if row is None:
+        return False
+    normalized = hotpot_normalize(answer)
+    if not normalized:
+        return False
+    if normalized in {"yes", "no"}:
+        return True
+    for fact in row.get("supporting_facts", row.get("evidence", [])):
+        text = ""
+        if isinstance(fact, dict):
+            text = f"{fact.get('title', fact.get('entity', ''))} {fact.get('text', '')}"
+        else:
+            text = str(fact)
+        if normalized and normalized in hotpot_normalize(text):
+            return True
+    return False
 
 
 def mbpp_allowed_test_features(row: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
@@ -981,6 +1772,27 @@ def _is_high_confidence_verifier_pass(domain: str, candidate: dict[str, Any], se
                 )
             )
         )
+    elif domain == "mmlu_pro":
+        consensus = float(score.get("cross_candidate_answer_consensus") or 0.0)
+        passed = bool(
+            candidate_count >= 2
+            and
+            score.get("option_valid")
+            and not score.get("invalid_option")
+            and consensus > 0.5
+        )
+    elif domain == "hotpotqa":
+        consensus = float(score.get("cross_candidate_answer_consensus") or 0.0)
+        passed = bool(
+            candidate_count >= 2
+            and
+            score.get("final_value_valid")
+            and (
+                score.get("evidence_covered")
+                or consensus >= 0.5
+            )
+            and not score.get("missing_evidence")
+        )
     else:
         passed = bool(
             score.get("tests_passed")
@@ -1042,7 +1854,7 @@ def adaptive_controller_decision(
 
 def _candidate_disagreement_high(domain: str, candidate: dict[str, Any], selection: Any) -> bool:
     score = candidate.get("score") if isinstance(candidate.get("score"), dict) else {}
-    if domain == "gsm8k":
+    if domain in {"gsm8k", "mmlu_pro", "hotpotqa"}:
         return float(score.get("cross_candidate_answer_consensus") or 0.0) < 0.75
     if domain in {"humaneval", "mbpp"}:
         return float(getattr(selection, "confidence", 0.0) or 0.0) < 0.35
@@ -1051,6 +1863,8 @@ def _candidate_disagreement_high(domain: str, candidate: dict[str, Any], selecti
 
 def _has_actionable_failure(domain: str, candidate: dict[str, Any]) -> bool:
     score = candidate.get("score") if isinstance(candidate.get("score"), dict) else {}
+    if domain in SELECTION_ONLY_DOMAINS:
+        return False
     if domain == "gsm8k":
         return bool(
             score.get("trace_result_disagreement")
@@ -1288,7 +2102,20 @@ def main() -> None:
     parser.add_argument("--domain", required=True, choices=DOMAINS)
     parser.add_argument("--data-path", required=True)
     parser.add_argument("--model-path", required=True)
-    parser.add_argument("--experiment", required=True, choices=("best_of_n", "oracle_select", "verifier_select", "select_repair", "adaptive_controller", "oracle_repair", "iterative_repair"))
+    parser.add_argument(
+        "--experiment",
+        required=True,
+        choices=(
+            "best_of_n",
+            "oracle_select",
+            "verifier_select",
+            "select_repair",
+            "adaptive_controller",
+            "adaptive_controller_selector_comm",
+            "oracle_repair",
+            "iterative_repair",
+        ),
+    )
     parser.add_argument("--n", type=int, default=8)
     parser.add_argument("--max-rounds", type=int, default=3)
     parser.add_argument("--limit", type=int, default=50)
@@ -1340,7 +2167,7 @@ def main() -> None:
             top_p=args.top_p,
             current_baseline=args.current_baseline,
         )
-    elif args.experiment in {"select_repair", "adaptive_controller"}:
+    elif args.experiment in {"select_repair", "adaptive_controller", "adaptive_controller_selector_comm"}:
         report = run_select_repair(
             model,
             rows,

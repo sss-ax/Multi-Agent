@@ -80,8 +80,46 @@ def normalize_action_payload(payload: Any) -> Any:
             return {"op": "emit_code", "code": payload["code"]}
         if "content" in payload:
             return {"op": "emit_code", "code": payload["content"]}
+    if op == "set_result":
+        normalized = dict(payload)
+        value = normalized.get("value")
+        hotpot_keys = ("answer", "bridge_entity", "cited_fact_ids", "reasoning_chain")
+        option_keys = ("answer", "solver_choice", "independent_choice", "option_analysis", "confidence")
+        value_has_hotpot_shape = isinstance(value, dict) and any(key in value for key in hotpot_keys)
+        value_has_option_shape = isinstance(value, dict) and any(key in value for key in option_keys)
+        if any(key in normalized for key in hotpot_keys) or value_has_hotpot_shape:
+            value_obj = dict(value) if isinstance(value, dict) else {"answer": value}
+            for key in hotpot_keys:
+                if key in normalized and key not in value_obj:
+                    value_obj[key] = normalized[key]
+            value_obj.setdefault("answer", value_obj.get("value", ""))
+            value_obj.setdefault("bridge_entity", "")
+            value_obj.setdefault("cited_fact_ids", [])
+            value_obj.setdefault("reasoning_chain", [])
+            return {"op": "set_result", "id": normalized.get("id", "answer"), "value": value_obj}
+        if any(key in normalized for key in option_keys) or value_has_option_shape:
+            value_obj = dict(value) if isinstance(value, dict) else {"answer": value}
+            for key in option_keys:
+                if key in normalized and key not in value_obj:
+                    value_obj[key] = normalized[key]
+            value_obj.setdefault("answer", value_obj.get("value", ""))
+            value_obj.setdefault("solver_choice", value_obj.get("answer", ""))
+            value_obj.setdefault("independent_choice", "")
+            value_obj.setdefault("option_analysis", {})
+            value_obj.setdefault("confidence", 0.0)
+            return {"op": "set_result", "id": normalized.get("id", "answer"), "value": value_obj}
     if op == "verify":
         normalized = dict(payload)
+        for key in ("reason", "error_type", "error_location", "repair_instruction"):
+            if key not in normalized:
+                continue
+            value = normalized[key]
+            if key == "reason" and isinstance(value, (dict, list)):
+                normalized[key] = json.dumps(value, ensure_ascii=False)
+            elif value is None:
+                normalized[key] = ""
+            elif not isinstance(value, str):
+                normalized[key] = str(value)
         normalized.setdefault("error_type", "")
         normalized.setdefault("error_location", "")
         normalized.setdefault("reason", "")
@@ -245,10 +283,14 @@ def action_contract(role: str, task_type: str) -> str:
         critic_rule = (
             "Critic is the semantic entailment judge for HotpotQA. Verify only when the cited "
             "supporting facts and reasoning_chain entail the answer through the bridge_entity. "
-            "If a citation is irrelevant, a hop is missing, the bridge is wrong, the cited facts "
-            "contradict the answer, or entailment is insufficient, emit need_fix with actionable "
-            "error_type, error_location, repair_instruction, preserve, and requested_fragments. "
-            "Do not mark verified merely because cited facts exist."
+            "For status=verified, verify.reason must be a JSON string with hop1_conclusion, "
+            "hop2_conclusion, derived_answer, candidate_answer, match, contradiction, and "
+            "answers_question; match and answers_question must be true and contradiction false. "
+            "If a citation is irrelevant, a hop is "
+            "missing, the bridge is wrong, the cited facts contradict the answer, or entailment "
+            "is insufficient, emit need_fix with error_type from invalid_citation, missing_hop, "
+            "incomplete_evidence_chain, wrong_bridge_entity, answer_not_supported, or "
+            "answer_contradicted. Do not mark verified merely because cited facts exist."
         )
     elif task_type == "multiple_choice":
         critic_rule = (

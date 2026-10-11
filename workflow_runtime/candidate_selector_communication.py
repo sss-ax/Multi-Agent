@@ -8,11 +8,13 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from .candidate_selector import score_candidate_features_with_reasons
+from .mmlu_representation import render_mmlu_option_hypothesis_graph_view
 
 
 CORE_FRAGMENTS = {"final_value", "status"}
 VERIFIER_FRAGMENTS = {
     "verifier_summary",
+    "option_hypothesis_graph",
     "answer_cluster",
     "disagreement",
     "unique_claim",
@@ -84,6 +86,7 @@ def build_candidate_fragments(candidates: Sequence[Mapping[str, Any]]) -> list[C
             ("final_value", value),
             ("status", {"artifact_type": candidate.get("artifact_type", ""), "generation_index": index}),
             ("verifier_summary", summary),
+            ("option_hypothesis_graph", _option_hypothesis_fragment(candidate)),
             ("answer_cluster", {"value": value, "cluster_size": cluster_size}),
             ("disagreement", {"disagrees_with_majority": cluster_size < max(answer_counts.values() or [0])}),
             ("unique_claim", {"unique": cluster_size == 1}),
@@ -128,7 +131,7 @@ def select_fragment_ids(
     elif policy == "selector_receiver_aware":
         selected = [
             fragment.fragment_id for fragment in fragments
-            if fragment.fragment_name in CORE_FRAGMENTS | {"verifier_summary", "conflict_signal"}
+            if fragment.fragment_name in CORE_FRAGMENTS | {"verifier_summary", "conflict_signal", "option_hypothesis_graph"}
         ]
         selected_set = set(selected)
         unresolved = {
@@ -277,6 +280,10 @@ def _features_from_visible(fragments: Mapping[str, Any]) -> dict[str, Any]:
         features["expression_parseable"] = True
     if fragments.get("trace"):
         features["trace_result_agreement"] = bool(features.get("trace_result_agreement", False))
+    option_graph = fragments.get("option_hypothesis_graph")
+    if isinstance(option_graph, Mapping) and option_graph.get("options"):
+        features["option_hypothesis_parseable"] = True
+        features["option_score_margin"] = float(option_graph.get("score_margin") or 0.0)
     return features
 
 
@@ -316,12 +323,31 @@ def _visible_to_candidate_records(visible: Mapping[str, Mapping[str, Any]]) -> l
             "final_value": fragments.get("final_value", ""),
             "score": fragments.get("verifier_summary", {}),
             "verification_signals": fragments.get("verifier_summary", {}),
+            "option_hypothesis_view": fragments.get("option_hypothesis_graph"),
             "raw_tail": fragments.get("trace", ""),
         })
     return records
 
 
+def _option_hypothesis_fragment(candidate: Mapping[str, Any]) -> dict[str, Any] | str:
+    view = candidate.get("option_hypothesis_view")
+    if isinstance(view, Mapping):
+        return dict(view)
+    hypotheses = candidate.get("option_hypotheses")
+    if isinstance(hypotheses, list) and hypotheses:
+        return {
+            "candidate_id": candidate.get("candidate_id", ""),
+            "selected_option_id": candidate.get("final_value", ""),
+            "score_margin": 0.0,
+            "options": hypotheses,
+        }
+    return ""
+
+
 def _token_cost(content: Any) -> int:
+    if isinstance(content, Mapping) and content.get("options") and "selected_option_id" in content:
+        text = render_mmlu_option_hypothesis_graph_view(content)
+        return max(1, (len(text) + 3) // 4)
     text = json.dumps(content, ensure_ascii=False, sort_keys=True)
     return max(1, (len(text) + 3) // 4)
 

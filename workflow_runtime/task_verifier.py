@@ -9,6 +9,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from .context_slicer import _node_sort_key
+from .hotpot_bridge import bridge_candidates_from_values, bridge_matches_any, normalize_bridge
+
 
 @dataclass(frozen=True)
 class VerificationResult:
@@ -74,15 +77,154 @@ def apply_verification_signal(action: dict[str, Any], result: VerificationResult
         merged = dict(action)
         merged["status"] = "verified"
         return merged
+    reason = result.reason or "; ".join((*result.error_signals, *result.missing_evidence))
+    if isinstance(result.metadata.get("repair_packet"), dict):
+        reason = json.dumps(
+            {
+                "reason": reason,
+                "repair_packet": result.metadata["repair_packet"],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
     return {
         **dict(action),
         "status": result.status,
         "error_type": result.error_type or "verification_failure",
         "error_location": result.error_location or "candidate",
-        "reason": result.reason or "; ".join((*result.error_signals, *result.missing_evidence)),
+        "reason": reason,
         "repair_instruction": result.repair_instruction or "Revise the candidate to address the verifier signal.",
         "preserve": list(result.preserve),
         "requested_fragments": list(result.requested_fragments),
+    }
+
+
+def enforce_hotpot_entailment_verdict(
+    action: dict[str, Any],
+    graph: Any,
+    *,
+    task_id: str,
+    branch_id: str,
+) -> dict[str, Any]:
+    """Require a verified HotpotQA critic Action to expose a strict entailment chain.
+
+    The Action schema stays small, so the structured entailment verdict is carried
+    in ``verify.reason`` as JSON.  Runtime only accepts verified when the critic
+    derives the same short answer it is approving.
+    """
+    if action.get("op") != "verify" or action.get("status") != "verified":
+        return action
+    payload = _latest_result_payload(graph, task_id=task_id, branch_id=branch_id)
+    candidate_answer = _structured_answer(payload)
+    verdict = _json_object(action.get("reason", ""))
+    if not verdict:
+        return _hotpot_entailment_need_fix(
+            action,
+            error_type="answer_not_supported",
+            reason=(
+                "Verified HotpotQA decisions must include a JSON entailment verdict "
+                "with hop1_conclusion, hop2_conclusion, derived_answer, candidate_answer, "
+                "match, contradiction, and answers_question."
+            ),
+            repair_instruction=(
+                "Re-check the cited facts and emit a typed entailment verdict. "
+                "Do not mark verified without deriving the answer from the citations."
+            ),
+        )
+    required = (
+        "hop1_conclusion",
+        "hop2_conclusion",
+        "derived_answer",
+        "candidate_answer",
+        "match",
+        "contradiction",
+        "answers_question",
+    )
+    missing = [key for key in required if key not in verdict]
+    if missing:
+        return _hotpot_entailment_need_fix(
+            action,
+            error_type="answer_not_supported",
+            reason=f"Entailment verdict is missing required fields: {', '.join(missing)}.",
+            repair_instruction="Emit a complete entailment verdict before verification.",
+        )
+    hop_missing = [
+        key for key in ("hop1_conclusion", "hop2_conclusion")
+        if not str(verdict.get(key, "")).strip()
+    ]
+    if hop_missing:
+        return _hotpot_entailment_need_fix(
+            action,
+            error_type="incomplete_evidence_chain",
+            reason=f"Entailment verdict has empty hop conclusions: {', '.join(hop_missing)}.",
+            repair_instruction="Derive both hop conclusions explicitly from cited facts.",
+        )
+    derived = str(verdict.get("derived_answer", "")).strip()
+    critic_candidate = str(verdict.get("candidate_answer", "")).strip()
+    candidate = candidate_answer or critic_candidate
+    match = verdict.get("match") is True
+    contradiction = verdict.get("contradiction") is True
+    if contradiction:
+        return _hotpot_entailment_need_fix(
+            action,
+            error_type="answer_contradicted",
+            reason="The critic entailment verdict reports a contradiction.",
+            repair_instruction="Revise the answer or citations so the cited facts do not contradict the answer.",
+        )
+    if not match or not _same_normalized_answer(derived, candidate) or not _same_normalized_answer(critic_candidate, candidate):
+        return _hotpot_entailment_need_fix(
+            action,
+            error_type="answer_not_supported",
+            reason=(
+                "The derived answer, critic candidate_answer, and solver candidate answer "
+                "do not all match."
+            ),
+            repair_instruction=(
+                "Repair only the unsupported answer edge: preserve valid citations where possible, "
+                "derive the answer from the cited facts, and set answer to that derived value."
+            ),
+        )
+    if verdict.get("answers_question") is not True:
+        return _hotpot_entailment_need_fix(
+            action,
+            error_type="answer_not_supported",
+            reason="The entailment verdict does not show that derived_answer directly answers the question.",
+            repair_instruction=(
+                "Repair the answer so the derived short answer directly satisfies the question, "
+                "not merely a related fact supported by the evidence."
+            ),
+        )
+    question = _task_question(graph, task_id=task_id, branch_id=branch_id)
+    answer_form_error = _hotpot_answer_form_error(question, candidate)
+    if answer_form_error:
+        return _hotpot_entailment_need_fix(
+            action,
+            error_type="answer_type_mismatch",
+            reason=answer_form_error,
+            repair_instruction=(
+                "Keep the evidence chain if valid, but replace answer with the canonical short "
+                "answer span required by the question. Put explanations only in reasoning_chain."
+            ),
+        )
+    return action
+
+
+def _hotpot_entailment_need_fix(
+    action: dict[str, Any],
+    *,
+    error_type: str,
+    reason: str,
+    repair_instruction: str,
+) -> dict[str, Any]:
+    return {
+        **dict(action),
+        "status": "need_fix",
+        "error_type": error_type,
+        "error_location": "answer_entailment",
+        "reason": reason,
+        "repair_instruction": repair_instruction,
+        "preserve": list(action.get("preserve") or ["valid citations", "bridge_entity"]),
+        "requested_fragments": list(action.get("requested_fragments") or ["result#final_value", "supporting_fact#content"]),
     }
 
 
@@ -101,6 +243,60 @@ def _json_value(value: Any) -> Any:
         except json.JSONDecodeError:
             return value
     return value
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    value = _json_value(value)
+    return value if isinstance(value, dict) else {}
+
+
+def _latest_result_payload(graph: Any, *, task_id: str, branch_id: str) -> Any:
+    result = _latest(graph, task_id, branch_id, "result")
+    payload = _json_value(_node_content(result)) if result is not None else None
+    if isinstance(payload, dict) and "value" in payload:
+        payload = _json_value(payload.get("value"))
+    return payload
+
+
+def _task_question(graph: Any, *, task_id: str, branch_id: str) -> str:
+    task = _latest(graph, task_id, branch_id, "task")
+    content = _node_content(task) if task is not None else ""
+    if isinstance(content, dict):
+        for key in ("question", "task", "prompt"):
+            if content.get(key):
+                return str(content[key])
+    text = str(content or "")
+    return re.sub(r"^\[domain=[^\]]+\]\s*", "", text).strip()
+
+
+def _hotpot_answer_form_error(question: str, answer: str) -> str:
+    q = _normalize_for_match(question)
+    raw = str(answer or "").strip()
+    a = _normalize_for_match(raw)
+    if not a:
+        return "Answer is empty; HotpotQA requires a canonical short answer."
+    yes_no_starts = (
+        "is ", "are ", "was ", "were ", "do ", "does ", "did ", "can ", "could ",
+        "has ", "have ", "had ", "will ", "would ",
+    )
+    if q.startswith(yes_no_starts):
+        if a not in {"yes", "no"}:
+            return "Question is yes/no, but answer is not the canonical short answer yes or no."
+        return ""
+    token_count = len(a.split())
+    if token_count > 10:
+        return "Answer is an explanatory sentence; HotpotQA answer must be a short entity/span."
+    if re.search(r"\b(who|where|when|which|what)\b", q[:48]) and re.search(
+        r"\b(was|were|is|are|because|which|that|located|known|helped)\b", a
+    ) and token_count > 5:
+        return "Answer form looks explanatory rather than a canonical short answer span."
+    if ("which country" in q or "what country" in q) and token_count > 5:
+        return "Question asks for a country, but answer is not a short country/entity span."
+    if ("which city" in q or "what city" in q) and token_count > 5:
+        return "Question asks for a city, but answer is not a short city/entity span."
+    if q.startswith("how many ") and not re.search(r"\d|one|two|three|four|five|six|seven|eight|nine|ten", a):
+        return "Question asks for a number, but answer is not numeric."
+    return ""
 
 
 def _verify_code(graph: Any, *, task_id: str, branch_id: str) -> VerificationResult:
@@ -399,9 +595,13 @@ def _verify_choice(graph: Any, *, task_id: str, branch_id: str) -> VerificationR
 
 
 def _verify_evidence(graph: Any, *, task_id: str, branch_id: str) -> VerificationResult:
-    facts = [
+    state_nodes = [
         node for node in graph.snapshot().nodes.values()
-        if node.task_id == task_id and node.branch_id == branch_id and node.type in {"supporting_fact", "evidence", "evidence_link"} and node.is_operationally_valid()
+        if node.task_id == task_id and node.branch_id == branch_id and node.is_operationally_valid()
+    ]
+    facts = [
+        node for node in state_nodes
+        if node.type in {"supporting_fact", "evidence", "evidence_link"}
     ]
     if not facts:
         return VerificationResult(
@@ -424,7 +624,9 @@ def _verify_evidence(graph: Any, *, task_id: str, branch_id: str) -> Verificatio
     cited_ids = _string_list(payload.get("cited_fact_ids") if isinstance(payload, dict) else None)
     bridge = str(payload.get("bridge_entity", "")).strip() if isinstance(payload, dict) else ""
     chain = _string_list(payload.get("reasoning_chain") if isinstance(payload, dict) else None)
-    fact_index = _fact_index(facts)
+    resolver = CitationResolver(facts, visible_nodes=state_nodes)
+    fact_index = resolver.fact_index
+    bridge_candidates = _bridge_candidates(state_nodes)
     required_missing = []
     if not isinstance(payload, dict):
         required_missing = ["answer", "bridge_entity", "cited_fact_ids", "reasoning_chain"]
@@ -452,13 +654,24 @@ def _verify_evidence(graph: Any, *, task_id: str, branch_id: str) -> Verificatio
             error_location="result",
             reason="Evidence exists, but the candidate is missing the required structured evidence chain.",
             repair_instruction=(
-                "Return a structured answer with answer, bridge_entity, cited_fact_ids, "
-                "and reasoning_chain grounded in visible supporting facts."
+                "Typed repair request: status=need_fix error_type=missing_evidence_chain. "
+                "Return only a structured set_result.value with answer, bridge_entity, "
+                "cited_fact_ids, and reasoning_chain grounded in visible supporting facts."
             ),
             preserve=("question", "visible evidence"),
             requested_fragments=("result#final_value", "supporting_fact#content", "evidence_link#entity"),
+            metadata={
+                "repair_packet": {
+                    "status": "need_fix",
+                    "error_type": "missing_evidence_chain",
+                    "known": {"answer": answer},
+                    "required": ["answer", "bridge_entity", "cited_fact_ids", "reasoning_chain"],
+                    "preserve": ["question", "visible evidence"],
+                },
+            },
         )
-    missing = [fact_id for fact_id in cited_ids if fact_id not in fact_index]
+    resolved_cited_ids = resolver.resolve_all(cited_ids)
+    missing = [fact_id for fact_id, resolved in zip(cited_ids, resolved_cited_ids) if resolved is None]
     if missing:
         return VerificationResult(
             status="need_fix",
@@ -469,11 +682,25 @@ def _verify_evidence(graph: Any, *, task_id: str, branch_id: str) -> Verificatio
             error_type="invalid_citation",
             error_location="cited_fact_ids",
             reason=f"Candidate cites unknown supporting facts: {', '.join(missing)}.",
-            repair_instruction="Cite only visible supporting_fact ids, titles, or title:sent_id references.",
+            repair_instruction=(
+                "Typed repair request: status=need_fix error_type=invalid_citation. "
+                "Keep the answer only if supported, replace invalid citations with visible "
+                "supporting_fact ids, titles, or title:sent_id references, and do not invent ids."
+            ),
             preserve=("answer", "visible evidence"),
             requested_fragments=("result#final_value", "supporting_fact#content"),
+            metadata={
+                "repair_packet": {
+                    "status": "need_fix",
+                    "error_type": "invalid_citation",
+                    "known": {"answer": answer, "bridge_entity": bridge, "invalid_citations": missing},
+                    "required": ["visible cited_fact_ids"],
+                    "preserve": ["answer if still entailed", "visible evidence"],
+                },
+            },
         )
-    if len(cited_ids) < 2:
+    canonical_cited_ids = [item for item in resolved_cited_ids if item is not None]
+    if len(canonical_cited_ids) < 2:
         return VerificationResult(
             status="need_fix",
             consistency_checks=("citation_valid", "missing_second_hop"),
@@ -483,25 +710,66 @@ def _verify_evidence(graph: Any, *, task_id: str, branch_id: str) -> Verificatio
             error_type="missing_hop",
             error_location="reasoning_chain",
             reason="A multihop answer should cite at least two connected facts.",
-            repair_instruction="Add the missing hop and cite the fact that connects the bridge entity to the answer.",
+            repair_instruction=(
+                "Typed repair request: status=need_fix error_type=missing_hop. "
+                "Preserve the valid cited fact if useful, then add one visible supporting_fact "
+                "that connects the bridge entity to the answer."
+            ),
             preserve=("valid citations",),
             requested_fragments=("supporting_fact#content", "evidence_link#entity"),
+            metadata={
+                "repair_packet": {
+                    "status": "need_fix",
+                    "error_type": "missing_hop",
+                    "known": {
+                        "answer": answer,
+                        "bridge_entity": bridge,
+                        "valid_cited_fact_ids": canonical_cited_ids,
+                    },
+                    "required": [f"find one fact that connects {bridge or 'the bridge entity'} to {answer or 'the answer'}"],
+                    "repair_target": "cited_fact_ids",
+                    "must_change": {"cited_fact_ids": True},
+                    "bridge_candidates": bridge_candidates,
+                    "preserve": ["valid citations"],
+                },
+            },
         )
-    cited_text = " ".join(_fact_text(fact_index[fact_id]) for fact_id in cited_ids)
+    cited_text = " ".join(_fact_text(fact_index[fact_id]) for fact_id in canonical_cited_ids)
     bridge_present = _contains_normalized(cited_text, bridge)
     if not bridge_present:
         return VerificationResult(
             status="need_fix",
             consistency_checks=("citation_valid", "incomplete_chain"),
             confidence=1.0,
-            missing_evidence=("reasoning_chain",),
+            missing_evidence=("bridge_entity",),
             verifier_source=("EvidenceVerifier", "chain_completeness"),
-            error_type="incomplete_evidence_chain",
-            error_location="reasoning_chain",
-            reason="The cited facts do not clearly expose a bridge chain.",
-            repair_instruction="Show hop1 -> bridge and bridge -> answer using the cited facts.",
+            error_type="wrong_bridge_entity",
+            error_location="bridge_entity",
+            reason="The cited facts do not ground the claimed bridge entity.",
+            repair_instruction=(
+                "Typed repair request: status=need_fix error_type=wrong_bridge_entity. "
+                "Choose the bridge entity explicitly supported by the cited facts, or replace "
+                "the citations with facts that support the claimed bridge."
+            ),
             preserve=("valid citations",),
             requested_fragments=("result#final_value", "supporting_fact#content"),
+            metadata={
+                "repair_packet": {
+                    "status": "need_fix",
+                    "error_type": "wrong_bridge_entity",
+                    "known": {
+                        "answer": answer,
+                        "claimed_bridge_entity": bridge,
+                        "valid_cited_fact_ids": canonical_cited_ids,
+                    },
+                    "required": ["select one bridge entity from bridge_candidates that is grounded in cited facts"],
+                    "repair_target": "bridge_entity",
+                    "must_change": {"bridge_entity": True},
+                    "forbidden_values": {"bridge_entity": [bridge]},
+                    "bridge_candidates": bridge_candidates,
+                    "preserve": ["valid citations only if they support the corrected bridge"],
+                },
+            },
         )
     return VerificationResult(
         status="verified",
@@ -511,7 +779,8 @@ def _verify_evidence(graph: Any, *, task_id: str, branch_id: str) -> Verificatio
         metadata={
             "answer": answer,
             "bridge_entity": bridge,
-            "cited_fact_ids": cited_ids,
+            "cited_fact_ids": canonical_cited_ids,
+            "raw_cited_fact_ids": cited_ids,
             "semantic_entailment_required_from": "critic",
         },
     )
@@ -566,11 +835,65 @@ def _string_list(value: Any) -> list[str]:
     return []
 
 
-def _fact_index(facts: list[Any]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for node in facts:
+class CitationResolver:
+    """Resolve model citation aliases to canonical supporting_fact logical ids."""
+
+    def __init__(self, facts: list[Any], *, visible_nodes: list[Any] | None = None):
+        self.facts = sorted(facts, key=_node_sort_key)
+        self.fact_index: dict[str, Any] = {}
+        self.alias_to_canonical: dict[str, str] = {}
+        local_index_by_node = {
+            node.node_id: f"n{index}"
+            for index, node in enumerate(sorted(visible_nodes or self.facts, key=_node_sort_key), start=1)
+        }
+        for index, node in enumerate(self.facts, start=1):
+            canonical = str(getattr(node, "logical_id", "")).strip()
+            if not canonical:
+                continue
+            self.fact_index[canonical] = node
+            aliases = self._aliases(node, index, local_index_by_node.get(node.node_id, f"n{index}"))
+            for alias in aliases:
+                cleaned = self._clean(alias)
+                if cleaned:
+                    self.alias_to_canonical.setdefault(cleaned, canonical)
+            self.alias_to_canonical.setdefault(self._clean(canonical), canonical)
+
+    def resolve_all(self, citations: list[str]) -> list[str | None]:
+        return [self.resolve(citation) for citation in citations]
+
+    def resolve(self, citation: Any) -> str | None:
+        text = str(citation or "").strip()
+        for candidate in self._candidate_forms(text):
+            resolved = self.alias_to_canonical.get(self._clean(candidate))
+            if resolved is not None:
+                return resolved
+        return None
+
+    def _candidate_forms(self, text: str) -> list[str]:
+        forms = [text]
+        if text.startswith("title:"):
+            forms.append(text.removeprefix("title:"))
+        forms.append(re.sub(r":sent_id:", ":", text))
+        forms.append(re.sub(r":sent(?:ence)?_?", ":", text))
+        forms.append(re.sub(r"^fact(\d+)", r"supporting_fact_\1", text))
+        forms.append(re.sub(r"^f(\d+)$", r"supporting_fact_\1", text))
+        forms.append(re.sub(r"^n(\d+)(?::.*)?$", r"n\1", text))
+        forms.append(re.sub(r"^title:(.*):sent_id:(\d+)$", r"\1:\2", text))
+        forms.append(re.sub(r"^title:(.*):sent(\d+)$", r"\1:\2", text))
+        return list(dict.fromkeys(forms))
+
+    def _aliases(self, node: Any, index: int, local_node_id: str) -> set[str]:
         content = _json_value(_node_content(node))
-        keys = {str(getattr(node, "logical_id", "")).strip(), str(getattr(node, "node_id", "")).strip()}
+        keys = {
+            str(getattr(node, "logical_id", "")).strip(),
+            str(getattr(node, "node_id", "")).strip(),
+            local_node_id,
+        }
+        logical_id = str(getattr(node, "logical_id", "")).strip()
+        match = re.fullmatch(r"supporting_fact_(\d+)", logical_id)
+        if match:
+            keys.add(f"f{match.group(1)}")
+            keys.add(f"fact{match.group(1)}")
         if isinstance(content, dict):
             for key in ("id", "fact_id", "logical_id"):
                 if content.get(key):
@@ -579,13 +902,24 @@ def _fact_index(facts: list[Any]) -> dict[str, Any]:
             sent_id = content.get("sent_id")
             if title:
                 keys.add(title)
+                keys.add(f"title:{title}")
                 if sent_id is not None:
                     keys.add(f"{title}:{sent_id}")
                     keys.add(f"{title}#{sent_id}")
-        for key in keys:
-            if key:
-                result[key] = node
-    return result
+                    keys.add(f"title:{title}:{sent_id}")
+                    keys.add(f"title:{title}:sent_id:{sent_id}")
+                    keys.add(f"{title}:sent_id:{sent_id}")
+                    keys.add(f"{title}:sent{sent_id}")
+                    keys.add(f"{local_node_id}:{sent_id}")
+                    keys.add(f"{local_node_id}:sent_id:{sent_id}")
+                    keys.add(f"{local_node_id}:sent{sent_id}")
+        return keys
+
+    @staticmethod
+    def _clean(value: Any) -> str:
+        text = str(value or "").strip().lower()
+        text = re.sub(r"\s+", " ", text)
+        return text
 
 
 def _fact_text(node: Any) -> str:
@@ -597,11 +931,35 @@ def _fact_text(node: Any) -> str:
     return str(content or "")
 
 
+def _bridge_candidates(nodes: Iterable[Any], *, limit: int = 24) -> list[str]:
+    values: list[Any] = []
+    sorted_nodes = sorted(nodes, key=_node_sort_key)
+    for node in sorted_nodes:
+        content = _json_value(_node_content(node))
+        if node.type == "entity":
+            if isinstance(content, dict):
+                for key in ("name", "entity", "title", "value"):
+                    values.append(content.get(key))
+            else:
+                values.append(content)
+        elif node.type in {"supporting_fact", "evidence", "evidence_link"}:
+            if isinstance(content, dict):
+                for key in ("title", "entity"):
+                    values.append(content.get(key))
+        if len(values) >= limit * 2:
+            break
+    return bridge_candidates_from_values(values, limit=limit)
+
+
 def _normalize_for_match(value: Any) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", str(value).lower())).strip()
+    return normalize_bridge(value)
 
 
 def _contains_normalized(text: str, needle: str) -> bool:
     normalized_text = _normalize_for_match(text)
     normalized_needle = _normalize_for_match(needle)
     return bool(normalized_needle and normalized_needle in normalized_text)
+
+
+def _same_normalized_answer(left: Any, right: Any) -> bool:
+    return bool(_normalize_for_match(left) and _normalize_for_match(left) == _normalize_for_match(right))

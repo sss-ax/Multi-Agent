@@ -481,6 +481,8 @@ class ActionCompiler:
             raise ActionCompilationError(f"verify target does not exist: {action['target']}")
         target_logical_id = target.logical_id
         content = {"target": target_logical_id, "status": action["status"]}
+        if verified and action.get("reason"):
+            content["reason"] = action.get("reason", "")
         if not verified:
             content.update({
                 "error_type": action["error_type"],

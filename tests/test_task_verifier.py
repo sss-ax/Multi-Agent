@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -372,3 +373,329 @@ def test_hotpot_verifier_does_not_use_lexical_answer_proxy() -> None:
     assert signal.status == "verified"
     assert "semantic_entailment_delegated_to_critic" in signal.consistency_checks
     assert signal.confidence == 0.0
+
+
+def test_hotpot_wrong_bridge_repair_packet_includes_bridge_candidates() -> None:
+    store = GraphStore()
+    store.add_node(task_id="t", branch_id="main", logical_id="task", node_type="task", content="qa", owner="user")
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="entity_1",
+        node_type="entity",
+        content={"name": "Charles Babbage"},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="supporting_fact_1",
+        node_type="supporting_fact",
+        content={"title": "Ada", "sent_id": 0, "text": "Ada collaborated with Charles Babbage."},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="supporting_fact_2",
+        node_type="supporting_fact",
+        content={"title": "Charles Babbage", "sent_id": 0, "text": "Charles Babbage was born in London."},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="result",
+        node_type="result",
+        content={
+            "id": "answer",
+            "value": {
+                "answer": "London",
+                "bridge_entity": "Wrong Bridge",
+                "cited_fact_ids": ["supporting_fact_1", "supporting_fact_2"],
+                "reasoning_chain": ["supporting_fact_1 -> Wrong Bridge", "Wrong Bridge -> London"],
+            },
+        },
+        owner="solver",
+    )
+
+    signal = verify_task_candidate("multihop_qa", store, task_id="t", branch_id="main")
+
+    assert signal.status == "need_fix"
+    assert signal.error_type == "wrong_bridge_entity"
+    assert "Charles Babbage" in signal.metadata["repair_packet"]["bridge_candidates"]
+
+
+def test_hotpot_verifier_resolves_citation_aliases_to_canonical_ids() -> None:
+    store = GraphStore()
+    store.add_node(task_id="t", branch_id="main", logical_id="task", node_type="task", content="qa", owner="user")
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="supporting_fact_1",
+        node_type="supporting_fact",
+        content={"title": "Ada", "sent_id": 0, "text": "Ada collaborated with Charles Babbage."},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="supporting_fact_2",
+        node_type="supporting_fact",
+        content={"title": "Charles Babbage", "sent_id": 0, "text": "Charles Babbage designed the Analytical Engine."},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="result",
+        node_type="result",
+        content={
+            "id": "answer",
+            "value": {
+                "answer": "Analytical Engine",
+                "bridge_entity": "Charles Babbage",
+                "cited_fact_ids": ["n2", "title:Charles Babbage:sent_id:0"],
+                "reasoning_chain": [
+                    "n2 -> Charles Babbage",
+                    "title:Charles Babbage:sent_id:0 -> Analytical Engine",
+                ],
+            },
+        },
+        owner="solver",
+    )
+
+    signal = verify_task_candidate("multihop_qa", store, task_id="t", branch_id="main")
+
+    assert signal.status == "verified"
+    assert signal.metadata["cited_fact_ids"] == ["supporting_fact_1", "supporting_fact_2"]
+    assert signal.metadata["raw_cited_fact_ids"] == ["n2", "title:Charles Babbage:sent_id:0"]
+
+
+def test_hotpot_entailment_gate_rejects_verified_without_chain_verdict() -> None:
+    from workflow_runtime.task_verifier import enforce_hotpot_entailment_verdict
+
+    store = GraphStore()
+    store.add_node(task_id="t", branch_id="main", logical_id="result", node_type="result", content={
+        "id": "answer",
+        "value": {
+            "answer": "London",
+            "bridge_entity": "Charles Babbage",
+            "cited_fact_ids": ["supporting_fact_1", "supporting_fact_2"],
+            "reasoning_chain": ["supporting_fact_1 -> Charles Babbage", "Charles Babbage -> London"],
+        },
+    }, owner="solver")
+
+    action = enforce_hotpot_entailment_verdict(
+        {"op": "verify", "target": "result", "status": "verified", "reason": ""},
+        store,
+        task_id="t",
+        branch_id="main",
+    )
+
+    assert action["status"] == "need_fix"
+    assert action["error_type"] == "answer_not_supported"
+
+
+def test_hotpot_entailment_gate_accepts_explicit_matching_chain_verdict() -> None:
+    from workflow_runtime.task_verifier import enforce_hotpot_entailment_verdict
+
+    store = GraphStore()
+    store.add_node(task_id="t", branch_id="main", logical_id="result", node_type="result", content={
+        "id": "answer",
+        "value": {
+            "answer": "London",
+            "bridge_entity": "Charles Babbage",
+            "cited_fact_ids": ["supporting_fact_1", "supporting_fact_2"],
+            "reasoning_chain": ["supporting_fact_1 -> Charles Babbage", "Charles Babbage -> London"],
+        },
+    }, owner="solver")
+    verdict = {
+        "hop1_conclusion": "Ada collaborated with Charles Babbage.",
+        "hop2_conclusion": "Charles Babbage was born in London.",
+        "derived_answer": "London",
+        "candidate_answer": "London",
+        "match": True,
+        "contradiction": False,
+        "answers_question": True,
+    }
+
+    action = enforce_hotpot_entailment_verdict(
+        {
+            "op": "verify",
+            "target": "result",
+            "status": "verified",
+            "reason": json.dumps(verdict),
+            "error_type": "",
+            "error_location": "",
+            "repair_instruction": "",
+            "preserve": [],
+            "requested_fragments": [],
+        },
+        store,
+        task_id="t",
+        branch_id="main",
+    )
+
+    assert action["status"] == "verified"
+
+
+def test_hotpot_entailment_gate_requires_answer_to_question() -> None:
+    from workflow_runtime.task_verifier import enforce_hotpot_entailment_verdict
+
+    store = GraphStore()
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="task",
+        node_type="task",
+        content="[domain=multihop_qa] Where was Charles Babbage born?",
+        owner="user",
+    )
+    store.add_node(task_id="t", branch_id="main", logical_id="result", node_type="result", content={
+        "id": "answer",
+        "value": {
+            "answer": "Analytical Engine",
+            "bridge_entity": "Charles Babbage",
+            "cited_fact_ids": ["supporting_fact_1", "supporting_fact_2"],
+            "reasoning_chain": ["supporting_fact_1 -> Charles Babbage", "Charles Babbage -> Analytical Engine"],
+        },
+    }, owner="solver")
+    verdict = {
+        "hop1_conclusion": "Charles Babbage designed the Analytical Engine.",
+        "hop2_conclusion": "The Analytical Engine is associated with Charles Babbage.",
+        "derived_answer": "Analytical Engine",
+        "candidate_answer": "Analytical Engine",
+        "match": True,
+        "contradiction": False,
+        "answers_question": False,
+    }
+
+    action = enforce_hotpot_entailment_verdict(
+        {
+            "op": "verify",
+            "target": "result",
+            "status": "verified",
+            "reason": json.dumps(verdict),
+            "error_type": "",
+            "error_location": "",
+            "repair_instruction": "",
+            "preserve": [],
+            "requested_fragments": [],
+        },
+        store,
+        task_id="t",
+        branch_id="main",
+    )
+
+    assert action["status"] == "need_fix"
+    assert action["error_type"] == "answer_not_supported"
+
+
+def test_hotpot_entailment_gate_rejects_explanatory_answer_form() -> None:
+    from workflow_runtime.task_verifier import enforce_hotpot_entailment_verdict
+
+    store = GraphStore()
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="task",
+        node_type="task",
+        content="[domain=multihop_qa] What was Eenasul Fateh known for?",
+        owner="user",
+    )
+    long_answer = (
+        "Eenasul Fateh was known by his stage name Aladin and helped organizations "
+        "improve their performance as a consultant."
+    )
+    store.add_node(task_id="t", branch_id="main", logical_id="result", node_type="result", content={
+        "id": "answer",
+        "value": {
+            "answer": long_answer,
+            "bridge_entity": "Management consulting",
+            "cited_fact_ids": ["supporting_fact_1", "supporting_fact_2"],
+            "reasoning_chain": ["supporting_fact_1 -> Aladin", "supporting_fact_2 -> management consulting"],
+        },
+    }, owner="solver")
+    verdict = {
+        "hop1_conclusion": "Eenasul Fateh was known by his stage name Aladin.",
+        "hop2_conclusion": "Management consulting helps organizations improve performance.",
+        "derived_answer": long_answer,
+        "candidate_answer": long_answer,
+        "match": True,
+        "contradiction": False,
+        "answers_question": True,
+    }
+
+    action = enforce_hotpot_entailment_verdict(
+        {
+            "op": "verify",
+            "target": "result",
+            "status": "verified",
+            "reason": json.dumps(verdict),
+            "error_type": "",
+            "error_location": "",
+            "repair_instruction": "",
+            "preserve": [],
+            "requested_fragments": [],
+        },
+        store,
+        task_id="t",
+        branch_id="main",
+    )
+
+    assert action["status"] == "need_fix"
+    assert action["error_type"] == "answer_type_mismatch"
+
+
+def test_hotpot_entailment_gate_requires_yes_no_short_answer() -> None:
+    from workflow_runtime.task_verifier import enforce_hotpot_entailment_verdict
+
+    store = GraphStore()
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="task",
+        node_type="task",
+        content="[domain=multihop_qa] Were Scott Derrickson and Ed Wood of the same nationality?",
+        owner="user",
+    )
+    answer = "No, Scott Derrickson and Ed Wood were not of the same nationality."
+    store.add_node(task_id="t", branch_id="main", logical_id="result", node_type="result", content={
+        "id": "answer",
+        "value": {
+            "answer": answer,
+            "bridge_entity": "nationality",
+            "cited_fact_ids": ["supporting_fact_1", "supporting_fact_2"],
+            "reasoning_chain": ["supporting_fact_1 -> American", "supporting_fact_2 -> American"],
+        },
+    }, owner="solver")
+    verdict = {
+        "hop1_conclusion": "Scott Derrickson is American.",
+        "hop2_conclusion": "Ed Wood is American.",
+        "derived_answer": answer,
+        "candidate_answer": answer,
+        "match": True,
+        "contradiction": False,
+        "answers_question": True,
+    }
+
+    action = enforce_hotpot_entailment_verdict(
+        {
+            "op": "verify",
+            "target": "result",
+            "status": "verified",
+            "reason": json.dumps(verdict),
+            "error_type": "",
+            "error_location": "",
+            "repair_instruction": "",
+            "preserve": [],
+            "requested_fragments": [],
+        },
+        store,
+        task_id="t",
+        branch_id="main",
+    )
+
+    assert action["status"] == "need_fix"
+    assert action["error_type"] == "answer_type_mismatch"

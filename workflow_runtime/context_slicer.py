@@ -603,6 +603,19 @@ def render_compact_context_slice(context_slice: ContextSlice, state: GraphState)
     for node in nodes:
         tag = token_by_type.get(node.type, "N")
         content_value = render_fragmented_content(node, fragments_by_node.get(node.node_id, set()))
+        if node.type == "supporting_fact":
+            if isinstance(content_value, dict):
+                content_value = {
+                    "citation_id": node.logical_id,
+                    "local_node_id": local_ids[node.node_id],
+                    **content_value,
+                }
+            else:
+                content_value = {
+                    "citation_id": node.logical_id,
+                    "local_node_id": local_ids[node.node_id],
+                    "text": content_value,
+                }
         content = json.dumps(content_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         lines.append(
             f"<{tag} id={local_ids[node.node_id]} v={node.version} s={node.status}>{content}</{tag}>"

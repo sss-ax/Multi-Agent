@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,6 +11,7 @@ import pytest
 from workflow_runtime.protocol import (
     PROTOCOL_VERSION,
     action_contract,
+    normalize_action_payload,
     parse_action,
     render_role_context,
     require_exact_copy,
@@ -71,6 +73,28 @@ def test_domain_qa_solver_results_require_structured_verifier_inputs() -> None:
     ) == []
 
 
+def test_multihop_set_result_normalization_moves_top_level_fields_into_value() -> None:
+    action = normalize_action_payload({
+        "op": "set_result",
+        "id": "answer",
+        "value": {"answer": "London"},
+        "bridge_entity": "Charles Babbage",
+        "reasoning_chain": ["hop1", "hop2"],
+    })
+
+    assert action == {
+        "op": "set_result",
+        "id": "answer",
+        "value": {
+            "answer": "London",
+            "bridge_entity": "Charles Babbage",
+            "cited_fact_ids": [],
+            "reasoning_chain": ["hop1", "hop2"],
+        },
+    }
+    assert validate_action("solver", action, task_type="multihop_qa") == []
+
+
 def test_need_fix_verify_requires_structured_repair_feedback() -> None:
     bare = {"op": "verify", "target": "result", "status": "need_fix"}
     assert validate_action("critic", bare, task_type="code_generation")
@@ -87,6 +111,37 @@ def test_need_fix_verify_requires_structured_repair_feedback() -> None:
         "requested_fragments": ["code#function_body"],
     }
     assert validate_action("critic", detailed, task_type="code_generation") == []
+
+
+def test_verify_reason_normalizes_structured_payload_before_validation() -> None:
+    action = parse_action(
+        json.dumps({
+            "op": "verify",
+            "target": "result",
+            "status": "verified",
+            "reason": {
+                "hop1_conclusion": "A points to B.",
+                "hop2_conclusion": "B points to C.",
+                "derived_answer": "C",
+                "candidate_answer": "C",
+                "match": True,
+                "contradiction": False,
+            },
+            "error_type": None,
+            "error_location": 0,
+            "repair_instruction": None,
+            "preserve": [],
+            "requested_fragments": [],
+        }),
+        role="critic",
+        task_type="multihop_qa",
+    )
+
+    assert isinstance(action["reason"], str)
+    assert json.loads(action["reason"])["derived_answer"] == "C"
+    assert action["error_type"] == ""
+    assert action["error_location"] == "0"
+    assert action["repair_instruction"] == ""
 
 
 def test_action_contract_is_role_scoped() -> None:

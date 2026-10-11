@@ -41,6 +41,48 @@ def test_workflow_contract_requests_one_strict_action():
     assert "GraphStore nodes" in contract
 
 
+def test_hotpot_bridge_candidates_prioritize_source_entities_over_previous_answer():
+    store = GraphStore()
+    for index, name in enumerate(
+        [
+            "Billings Bulls",
+            "Robins Center",
+            "2011-12 QMJHL season",
+            "Loan modification in the United States",
+            "Case Gym",
+            "Androscoggin Bank Colisee",
+            "2007 Memorial Cup",
+            "Lewiston Maineiacs",
+        ],
+        start=1,
+    ):
+        store.add_node(
+            task_id="t",
+            branch_id="main",
+            logical_id=f"entity_{index}",
+            node_type="entity",
+            content=json.dumps({"name": name}),
+            owner="dataset",
+        )
+    workflow = LangGraphWorkflow(
+        store=store,
+        model=lambda request: {},
+        task_id="t",
+        task_type="multihop_qa",
+    )
+    previous = {
+        "bridge_entity": "Paris, France",
+        "answer": "The Eiffel Tower is located in Paris, France.",
+    }
+
+    stages = workflow._hotpot_bridge_candidate_stages(store.snapshot(), previous, [])
+
+    assert "Paris, France" not in stages["ranked_top8"]
+    assert "The Eiffel Tower is located in Paris, France." not in stages["ranked_top8"]
+    assert "Androscoggin Bank Colisee" in stages["ranked_top8"]
+    assert "Lewiston Maineiacs" in stages["ranked_top8"]
+
+
 def test_deduplicated_graph_context_refs_duplicate_source_content():
     store = GraphStore()
     first = store.add_node(
@@ -769,6 +811,276 @@ def test_numeric_solver_exhaustion_auto_sets_result_from_latest_calculation(tmp_
 
     assert store.latest_valid("t", "main", "result").content == {"id": "R1", "value": 5}
     assert store.latest_valid("t", "main", "final_answer").content == 5
+
+
+def test_hotpot_unresolved_need_fix_does_not_finalize(tmp_path):
+    store = GraphStore()
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="task",
+        node_type="task",
+        content="[domain=multihop_qa] Where was Ada's collaborator born?",
+        owner="user",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="supporting_fact_1",
+        node_type="supporting_fact",
+        content={"title": "Ada", "sent_id": 0, "text": "Ada collaborated with Charles Babbage."},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="supporting_fact_2",
+        node_type="supporting_fact",
+        content={"title": "Charles Babbage", "sent_id": 0, "text": "Charles Babbage was born in London."},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="entity_1",
+        node_type="entity",
+        content={"name": "Ada"},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="entity_2",
+        node_type="entity",
+        content={"name": "Charles Babbage"},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="evidence_link_1",
+        node_type="evidence_link",
+        content={"entity": "Ada", "sent_id": 0},
+        owner="dataset",
+    )
+    queues = {
+        ("planner", "normal"): [
+            {"op": "declare_query", "content": {"question": "Where was Ada's collaborator born?", "task_type": "multihop_qa"}},
+            {"op": "add_plan_step", "id": "M1", "operation": "bridge", "inputs": ["task"]},
+            {"op": "done"},
+        ],
+        ("solver", "normal"): [
+            {
+                "op": "set_result",
+                "id": "answer",
+                "value": {
+                    "answer": "Paris",
+                    "bridge_entity": "Wrong Bridge",
+                    "cited_fact_ids": ["supporting_fact_1", "supporting_fact_2"],
+                    "reasoning_chain": ["supporting_fact_1 -> Wrong Bridge", "Wrong Bridge -> Paris"],
+                },
+            },
+            {"op": "done"},
+        ],
+        ("critic", "normal"): [
+            {"op": "verify", "target": "result", "status": "verified"},
+        ],
+        ("final_solver", "finalization"): [
+            {"op": "answer", "source": "result", "value": "should not run"},
+        ],
+    }
+
+    def model(request):
+        return queues[(request.role, request.mode)].pop(0)
+
+    workflow = LangGraphWorkflow(
+        store=store,
+        model=model,
+        task_id="t",
+        task_type="multihop_qa",
+        max_rounds=1,
+        max_actions_per_role=6,
+        telemetry=WorkflowTelemetry(tmp_path / "workflow.jsonl"),
+    )
+    try:
+        from langgraph.checkpoint.memory import MemorySaver
+    except ImportError:  # pragma: no cover
+        pytest.skip("LangGraph is not installed")
+
+    result = workflow.compile(checkpointer=MemorySaver()).invoke(
+        workflow.initial_state(),
+        {"configurable": {"thread_id": "hotpot-unresolved"}},
+    )
+
+    assert result["status"] == "verification_unresolved"
+    assert store.latest_valid("t", "main", "final_answer") is None
+    assert store.latest_valid("t", "main", "verification").status == "need_fix"
+
+
+def test_hotpot_repair_is_one_shot_structured_patch(tmp_path):
+    store = GraphStore()
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="task",
+        node_type="task",
+        content="[domain=multihop_qa] Where was Ada's collaborator born?",
+        owner="user",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="supporting_fact_1",
+        node_type="supporting_fact",
+        content={"title": "Ada", "sent_id": 0, "text": "Ada collaborated with Charles Babbage."},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="supporting_fact_2",
+        node_type="supporting_fact",
+        content={"title": "Charles Babbage", "sent_id": 0, "text": "Charles Babbage was born in London."},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="entity_1",
+        node_type="entity",
+        content={"name": "Ada"},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="evidence_link_1",
+        node_type="evidence_link",
+        content={"entity": "Ada", "sent_id": 0},
+        owner="dataset",
+    )
+    calls = []
+    queues = {
+        ("planner", "normal"): [
+            {"op": "declare_query", "content": {"question": "Where was Ada's collaborator born?", "task_type": "multihop_qa"}},
+            {"op": "add_plan_step", "id": "M1", "operation": "bridge", "inputs": ["task"]},
+            {"op": "done"},
+        ],
+        ("solver", "normal"): [
+            {
+                "op": "set_result",
+                "id": "answer",
+                "value": {
+                    "answer": "Paris",
+                    "bridge_entity": "Wrong Bridge",
+                    "cited_fact_ids": ["supporting_fact_1", "supporting_fact_2"],
+                    "reasoning_chain": ["supporting_fact_1 -> Wrong Bridge", "Wrong Bridge -> Paris"],
+                },
+            },
+            {"op": "done"},
+        ],
+        ("critic", "normal"): [
+            {
+                "op": "verify",
+                "target": "result",
+                "status": "need_fix",
+                "error_type": "wrong_bridge_entity",
+                "error_location": "bridge_entity",
+                "reason": json.dumps({
+                    "reason": "The bridge is not grounded.",
+                    "repair_packet": {
+                        "status": "need_fix",
+                        "error_type": "wrong_bridge_entity",
+                        "known": {"answer": "Paris", "claimed_bridge_entity": "Wrong Bridge"},
+                        "required": ["choose a bridge entity grounded in the facts"],
+                        "preserve": ["answer if still supported"],
+                    },
+                }),
+                "repair_instruction": "Replace the bridge and rebuild the cited chain.",
+                "preserve": ["answer if still supported"],
+                "requested_fragments": ["supporting_fact#content"],
+            },
+            {
+                "op": "verify",
+                "target": "result",
+                "status": "verified",
+                "reason": json.dumps({
+                    "hop1_conclusion": "Ada collaborated with Charles Babbage.",
+                    "hop2_conclusion": "Charles Babbage was born in London.",
+                    "derived_answer": "London",
+                    "candidate_answer": "London",
+                    "match": True,
+                    "contradiction": False,
+                    "answers_question": True,
+                }),
+                "error_type": "",
+                "error_location": "",
+                "repair_instruction": "",
+                "preserve": [],
+                "requested_fragments": [],
+            },
+            {"op": "done"},
+        ],
+        ("solver", "repair"): [
+            {
+                "op": "set_result",
+                "id": "answer",
+                "value": {
+                    "answer": "London",
+                    "bridge_entity": "Charles Babbage",
+                    "cited_fact_ids": ["supporting_fact_1", "supporting_fact_2"],
+                    "reasoning_chain": [
+                        "supporting_fact_1 -> Charles Babbage",
+                        "Charles Babbage + supporting_fact_2 -> London",
+                    ],
+                },
+            },
+        ],
+        ("final_solver", "finalization"): [
+            {"op": "answer", "source": "result", "value": "London"},
+        ],
+    }
+
+    def model(request):
+        calls.append((request.role, request.mode, request.prompt))
+        return queues[(request.role, request.mode)].pop(0)
+
+    workflow = LangGraphWorkflow(
+        store=store,
+        model=model,
+        task_id="t",
+        task_type="multihop_qa",
+        max_rounds=2,
+        max_actions_per_role=8,
+        telemetry=WorkflowTelemetry(tmp_path / "workflow.jsonl"),
+    )
+    try:
+        from langgraph.checkpoint.memory import MemorySaver
+    except ImportError:  # pragma: no cover
+        pytest.skip("LangGraph is not installed")
+
+    result = workflow.compile(checkpointer=MemorySaver()).invoke(
+        workflow.initial_state(),
+        {"configurable": {"thread_id": "hotpot-one-shot-repair"}},
+    )
+
+    repair_calls = [item for item in calls if item[0] == "solver" and item[1] == "repair"]
+    assert len(repair_calls) == 1
+    assert "HOTPOT_REPAIR_PACKET" in repair_calls[0][2]
+    assert "previous_structured_answer" in repair_calls[0][2]
+    assert "bridge_candidates" in repair_calls[0][2]
+    assert "Charles Babbage" in repair_calls[0][2]
+    assert "allowed_evidence" in repair_calls[0][2]
+    assert result["status"] == "running"
+    assert store.latest_valid("t", "main", "final_answer").content == {
+        "answer": "London",
+        "bridge_entity": "Charles Babbage",
+        "cited_fact_ids": ["supporting_fact_1", "supporting_fact_2"],
+        "reasoning_chain": [
+            "supporting_fact_1 -> Charles Babbage",
+            "Charles Babbage + supporting_fact_2 -> London",
+        ],
+    }
 
 
 def test_task_verifier_overrides_false_positive_code_verified(tmp_path):

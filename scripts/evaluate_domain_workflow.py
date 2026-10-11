@@ -913,6 +913,42 @@ def action_token_totals(records: List[Dict[str, Any]]) -> Dict[str, int]:
     return totals
 
 
+def hotpot_verification_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    taxonomy: Dict[str, int] = {}
+    unresolved_taxonomy: Dict[str, int] = {}
+    verified_total = 0
+    verified_correct = 0
+    correct_total = 0
+    verified_but_wrong = 0
+    for record in records:
+        correct = bool(record.get("correct"))
+        correct_total += int(correct)
+        last_verify: dict[str, Any] = {}
+        for action_log in record.get("runtime_summary", {}).get("records", []):
+            action = action_log.get("action", {})
+            if action_log.get("role") == "critic" and isinstance(action, dict) and action.get("op") == "verify":
+                last_verify = action
+        if last_verify.get("status") == "verified":
+            verified_total += 1
+            verified_correct += int(correct)
+            if not correct:
+                verified_but_wrong += 1
+        error_type = str(last_verify.get("error_type") or record.get("failure") or "unknown")
+        if record.get("failure"):
+            taxonomy[error_type] = taxonomy.get(error_type, 0) + 1
+            if record.get("failure") == "verification_unresolved":
+                unresolved_taxonomy[error_type] = unresolved_taxonomy.get(error_type, 0) + 1
+    return {
+        "failure_taxonomy": dict(sorted(taxonomy.items())),
+        "unresolved_failure_taxonomy": dict(sorted(unresolved_taxonomy.items())),
+        "verifier_verified_count": verified_total,
+        "verifier_verified_correct_count": verified_correct,
+        "verified_but_wrong": verified_but_wrong,
+        "verifier_precision": verified_correct / verified_total if verified_total else 0.0,
+        "verifier_recall": verified_correct / correct_total if correct_total else 0.0,
+    }
+
+
 def optional_consumption_totals(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     totals: Dict[str, Any] = {
         "optional_transmitted_roots": 0,
@@ -1002,8 +1038,10 @@ def evaluate_verifier_guided_candidates(
     current_baseline: float,
     data_path: str = "",
 ) -> Dict[str, Any]:
-    if domain not in {"gsm8k", "humaneval", "mbpp"}:
-        raise ValueError("verifier_guided_candidates currently supports gsm8k, humaneval, and mbpp")
+    if domain not in {"gsm8k", "humaneval", "mbpp", "mmlu_pro", "hotpotqa"}:
+        raise ValueError(
+            "verifier_guided_candidates currently supports gsm8k, humaneval, mbpp, mmlu_pro, and hotpotqa"
+        )
     from scripts.run_reasoning_upper_bounds import run_verifier_select
 
     report = run_verifier_select(
@@ -1173,6 +1211,11 @@ def main() -> None:
             )
         except Exception as exc:
             failure = str(exc)
+            partial_state = getattr(exc, "partial_state", None)
+            if isinstance(partial_state, dict):
+                run_result = partial_state
+        if not failure and run_result.get("status") == "verification_unresolved":
+            failure = "verification_unresolved"
         if failure:
             scores = {"correct": False, "predicted_answer": None}
         elif args.execution_mode == "native_langgraph":
@@ -1232,6 +1275,8 @@ def main() -> None:
         **optional_consumption,
         "records": records,
     }
+    if args.domain == "hotpotqa":
+        report.update(hotpot_verification_metrics(records))
     if args.output:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

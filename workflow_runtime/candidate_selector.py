@@ -196,6 +196,7 @@ def score_candidate_features_with_reasons(features: Mapping[str, Any]) -> tuple[
         ("final_value_valid", 0.8),
         ("expression_parseable", 0.6),
         ("option_valid", 5.0),
+        ("option_hypothesis_parseable", 1.5),
         ("evidence_covered", 4.0),
     ):
         if bool(features.get(key)):
@@ -215,6 +216,11 @@ def score_candidate_features_with_reasons(features: Mapping[str, Any]) -> tuple[
     if execution_diversity is not None:
         score += min(2.0, execution_diversity)
         reasons.append(f"execution_diversity={execution_diversity:.3f}")
+
+    option_margin = _optional_float(features.get("option_score_margin"))
+    if option_margin is not None:
+        score += min(2.0, max(0.0, option_margin * 2.0))
+        reasons.append(f"option_score_margin={option_margin:.3f}")
 
     for key, weight in (
         ("tests_failed", 8.0),
@@ -329,6 +335,7 @@ def _sanitized_features(
         "trace_result_agreement",
         "independent_recompute_consistency",
         "option_valid",
+        "option_hypothesis_parseable",
         "evidence_covered",
         "tests_failed",
         "execution_failed",
@@ -354,6 +361,7 @@ def _sanitized_features(
         "exception_severity",
         "execution_diversity",
         "cross_candidate_answer_consensus",
+        "option_score_margin",
     ):
         if key in score:
             features[key] = _float(score[key])

@@ -20,6 +20,7 @@ from .domain_executors import execute_domain
 from .feedback_controller import FeedbackAction, decide_feedback_action
 from .graph_delta import DeltaCandidate, GraphDelta
 from .graph_store import GraphStore
+from .hotpot_bridge import bridge_candidates_from_values, deduplicate_bridge_candidates, extract_bridge_candidate
 from .semantic_fragments import (
     MANDATORY_FRAGMENT,
     OPTIONAL_FRAGMENT,
@@ -55,7 +56,7 @@ from .protocol import (
 )
 from .tools import ToolRegistry
 from .telemetry import WorkflowTelemetry
-from .task_verifier import apply_verification_signal, verify_task_candidate
+from .task_verifier import apply_verification_signal, enforce_hotpot_entailment_verdict, verify_task_candidate
 from .native_agents import AgentConfig, NativeAgent
 from .message_bus import MessageBus, MessageEnvelope
 from .native_tooling import (
@@ -152,6 +153,7 @@ class LangGraphWorkflow:
             raise ValueError(f"unsupported graph_context_mode: {graph_context_mode}")
         self.graph_context_mode = graph_context_mode
         self._graph_source_seen_hashes: set[str] = set()
+        self._last_hotpot_repair_packet_audit: dict[str, Any] = {}
         self.agent_views = AgentGraphViewManager(
             store,
             task_id=task_id,
@@ -172,13 +174,19 @@ class LangGraphWorkflow:
         graph.add_node("critic", self._agent_node("critic"))
         graph.add_node("repair", self._agent_node("solver", mode="repair"))
         graph.add_node("finalizer", self._agent_node("final_solver", mode="finalization"))
+        graph.add_node("unresolved", self._unresolved_verification_node)
         graph.add_edge(START, "planner")
         graph.add_edge("planner", "solver")
         graph.add_edge("solver", "tool")
         graph.add_edge("tool", "critic")
-        graph.add_conditional_edges("critic", self._route_after_critic, {"repair": "repair", "finalizer": "finalizer"})
+        graph.add_conditional_edges(
+            "critic",
+            self._route_after_critic,
+            {"repair": "repair", "finalizer": "finalizer", "unresolved": "unresolved"},
+        )
         graph.add_edge("repair", "tool")
         graph.add_edge("finalizer", END)
+        graph.add_edge("unresolved", END)
         return graph.compile(checkpointer=checkpointer)
 
     def fork(self, branch_id: str) -> "LangGraphWorkflow":
@@ -240,8 +248,9 @@ class LangGraphWorkflow:
             last_action: dict[str, Any] = {}
             completed = False
             session_id = state.get("session_id", self.session_id)
+            action_limit = 1 if self._is_hotpot_repair_mode(role, mode) else self.max_actions_per_role
 
-            for action_index in range(self.max_actions_per_role):
+            for action_index in range(action_limit):
                 if not self._completion_errors(role, mode=mode):
                     completed = True
                     break
@@ -268,6 +277,8 @@ class LangGraphWorkflow:
                     mode=mode,
                     action_index=action_index,
                 )
+                if self._is_hotpot_repair_mode(role, mode):
+                    prompt = self._render_hotpot_repair_context(graph_state)
                 session_prompt = self._session_prompt(role, mode, prompt)
                 graph_read_context_tokens = self._token_count(prompt)
                 logical_input_tokens = self._token_count(session_prompt)
@@ -290,20 +301,44 @@ class LangGraphWorkflow:
                     self._action_constraint(role, state.get("branch_id", self.branch_id), mode=mode)
                     if self.enable_action_constraints else None
                 )
-                action, generation = self._generate_action(
-                    role,
-                    mode,
-                    prompt,
-                    graph_state,
-                    context_slice,
-                    session_id=session_id,
-                    session_prompt=session_prompt,
-                    logical_input_tokens=logical_input_tokens,
-                    graph_read_context_tokens=graph_read_context_tokens,
-                    context_slice_tokens=context_slice.token_count,
-                    context_costs=context_costs,
-                    action_constraint=action_constraint,
-                )
+                if self._is_hotpot_repair_mode(role, mode):
+                    action_constraint = ActionConstraint(
+                        role=role,
+                        task_type=self.task_type,
+                        allowed_ops=("set_result",),
+                        reason="HotpotQA repair is a one-shot structured patch",
+                    )
+                try:
+                    action, generation = self._generate_action(
+                        role,
+                        mode,
+                        prompt,
+                        graph_state,
+                        context_slice,
+                        session_id=session_id,
+                        session_prompt=session_prompt,
+                        logical_input_tokens=logical_input_tokens,
+                        graph_read_context_tokens=graph_read_context_tokens,
+                        context_slice_tokens=context_slice.token_count,
+                        context_costs=context_costs,
+                        action_constraint=action_constraint,
+                    )
+                except ValueError as error:
+                    if self._is_hotpot_repair_mode(role, mode):
+                        self._raise_stage_failure(
+                            f"repair_invalid_action: {error}",
+                            state=state,
+                            logs=logs,
+                            session_id=session_id,
+                            role=role,
+                            last_action=last_action,
+                        )
+                    raise
+                if self._is_hotpot_repair_mode(role, mode):
+                    generation = {
+                        **generation,
+                        "hotpot_repair_packet_audit": dict(self._last_hotpot_repair_packet_audit),
+                    }
                 if role == "critic" and action.get("op") == "verify":
                     verification_signal = verify_task_candidate(
                         self.task_type,
@@ -312,6 +347,13 @@ class LangGraphWorkflow:
                         branch_id=state.get("branch_id", self.branch_id),
                     )
                     action = apply_verification_signal(action, verification_signal)
+                    if self.task_type == "multihop_qa":
+                        action = enforce_hotpot_entailment_verdict(
+                            action,
+                            self.store,
+                            task_id=self.task_id,
+                            branch_id=state.get("branch_id", self.branch_id),
+                        )
                     generation = {
                         **generation,
                         "task_verification": verification_signal.as_dict(),
@@ -320,6 +362,15 @@ class LangGraphWorkflow:
                     self.compiler.set_node_ref_context(self._node_ref_context(context_slice))
                     result = self.compiler.apply(role, action)
                 except ActionCompilationError as error:
+                    if self._is_hotpot_repair_mode(role, mode):
+                        self._raise_stage_failure(
+                            f"repair_compile_failed: {error}",
+                            state=state,
+                            logs=logs,
+                            session_id=session_id,
+                            role=role,
+                            last_action=action,
+                        )
                     if self.telemetry is not None:
                         self.telemetry.record_action(self._telemetry_action(
                             role=role,
@@ -409,6 +460,7 @@ class LangGraphWorkflow:
                     "generation": {
                         "attempts": generation.get("attempts", 1),
                         "validation_errors": list(generation.get("validation_errors", [])),
+                        "hotpot_repair_packet_audit": generation.get("hotpot_repair_packet_audit"),
                     },
                     "telemetry": self._telemetry_action(
                         role=role,
@@ -445,7 +497,7 @@ class LangGraphWorkflow:
                     logs.append({
                         "role": role,
                         "mode": mode,
-                        "action_index": self.max_actions_per_role,
+                        "action_index": action_limit,
                         "action": auto_result.action,
                         "compiled_node_ids": list(auto_result.node_ids),
                         "graph_update_tokens": self._graph_update_tokens(auto_result.node_ids),
@@ -470,8 +522,24 @@ class LangGraphWorkflow:
                     })
                     completed = True
                 else:
+                    if self._is_hotpot_repair_mode(role, mode):
+                        reason = (
+                            "repair_noop: solver produced no operationally new result"
+                            if last_action.get("op") == "set_result"
+                            else "repair_invalid_patch: solver did not produce a revised set_result in one repair action"
+                        )
+                        self._raise_stage_failure(
+                            self._hotpot_repair_noop_reason(last_action)
+                            if reason.startswith("repair_noop:")
+                            else reason,
+                            state=state,
+                            logs=logs,
+                            session_id=session_id,
+                            role=role,
+                            last_action=last_action,
+                        )
                     raise ActionCompilationError(
-                        f"{role} exceeded max_actions_per_role={self.max_actions_per_role} without done"
+                        f"{role} exceeded max_actions_per_role={action_limit} without done"
                     )
             latest = self.store.snapshot()
             branch_id = state.get("branch_id", self.branch_id)
@@ -513,6 +581,36 @@ class LangGraphWorkflow:
         except ActionCompilationError:
             return None
 
+    def _is_hotpot_repair_mode(self, role: str, mode: str) -> bool:
+        return role == "solver" and mode == "repair" and self.task_type == "multihop_qa"
+
+    def _raise_stage_failure(
+        self,
+        message: str,
+        *,
+        state: WorkflowState,
+        logs: list[dict[str, Any]],
+        session_id: str,
+        role: str,
+        last_action: dict[str, Any],
+    ) -> None:
+        branch_id = state.get("branch_id", self.branch_id)
+        latest = self.store.snapshot()
+        error = ActionCompilationError(message)
+        error.partial_state = {
+            "graph_revision": len(latest.nodes),
+            "graph_snapshot_digest": self.store.branch_digest(self.task_id, branch_id),
+            "round_id": state.get("round_id", 0),
+            "action_count": state.get("action_count", 0) + len(logs) - len(state.get("logs", [])),
+            "status": "repair_failed",
+            "error": message,
+            "last_role": role,
+            "last_action": last_action,
+            "session_id": session_id,
+            "logs": logs,
+        }
+        raise error
+
     def _generate_action(
         self,
         role: str,
@@ -551,6 +649,7 @@ class LangGraphWorkflow:
                 if isinstance(raw, dict):
                     action = self._normalize_generated_action(role, raw)
                     errors = self._validate_action_dict(role, action)
+                    errors.extend(self._hotpot_repair_action_errors(role, mode, action))
                     if errors:
                         raise ValueError(f"invalid {role} Action: {'; '.join(errors)}")
                     return action, {
@@ -565,6 +664,9 @@ class LangGraphWorkflow:
                         "action_constraint": action_constraint.as_dict() if action_constraint else None,
                     }
                 action = self._parse_generated_action(str(raw).strip(), role=role)
+                repair_errors = self._hotpot_repair_action_errors(role, mode, action)
+                if repair_errors:
+                    raise ValueError(f"invalid {role} Action: {'; '.join(repair_errors)}")
                 return action, {
                     "attempts": attempts,
                     "raw_output": raw_text,
@@ -623,6 +725,56 @@ class LangGraphWorkflow:
         if errors:
             raise ValueError(f"invalid {role} Action: {'; '.join(errors)}")
         return action
+
+    def _hotpot_repair_action_errors(self, role: str, mode: str, action: Any) -> list[str]:
+        if not self._is_hotpot_repair_mode(role, mode):
+            return []
+        if not isinstance(action, dict):
+            return ["HotpotQA repair must emit exactly one set_result Action"]
+        if action.get("op") != "set_result":
+            return ["HotpotQA repair mode allows only set_result"]
+        value = action.get("value")
+        if not isinstance(value, dict):
+            return ["HotpotQA repair set_result.value must be a structured object"]
+        missing = [
+            key for key in ("answer", "bridge_entity", "cited_fact_ids", "reasoning_chain")
+            if key not in value
+        ]
+        if missing:
+            return [f"HotpotQA repair set_result.value missing keys: {', '.join(missing)}"]
+        errors = self._hotpot_repair_must_change_errors(value)
+        if errors:
+            return errors
+        return []
+
+    def _hotpot_repair_must_change_errors(self, value: dict[str, Any]) -> list[str]:
+        diagnosis = self._latest_repair_diagnosis()
+        packet = diagnosis.get("repair_packet") if isinstance(diagnosis, dict) else {}
+        if not isinstance(packet, dict):
+            return []
+        previous = self._latest_result_value()
+        if not isinstance(previous, dict):
+            return []
+        target = str(packet.get("repair_target", "") or "").strip()
+        must_change = packet.get("must_change") if isinstance(packet.get("must_change"), dict) else {}
+        forbidden = packet.get("forbidden_values") if isinstance(packet.get("forbidden_values"), dict) else {}
+        errors: list[str] = []
+
+        def changed(field: str) -> bool:
+            old_value = previous.get(field)
+            new_value = value.get(field)
+            if isinstance(old_value, list) or isinstance(new_value, list):
+                return [str(item) for item in (old_value or [])] != [str(item) for item in (new_value or [])]
+            return str(old_value or "").strip() != str(new_value or "").strip()
+
+        if (target == "bridge_entity" or must_change.get("bridge_entity")) and not changed("bridge_entity"):
+            errors.append("HotpotQA repair must change bridge_entity")
+        if (target == "cited_fact_ids" or must_change.get("cited_fact_ids")) and not changed("cited_fact_ids"):
+            errors.append("HotpotQA repair must add or replace cited_fact_ids")
+        forbidden_bridge = {str(item).strip().lower() for item in forbidden.get("bridge_entity", [])} if isinstance(forbidden.get("bridge_entity"), list) else set()
+        if forbidden_bridge and str(value.get("bridge_entity", "")).strip().lower() in forbidden_bridge:
+            errors.append("HotpotQA repair bridge_entity repeats a forbidden value")
+        return errors
 
     def _normalize_generated_action(self, role: str, payload: Any) -> Any:
         from .protocol import normalize_action_payload
@@ -792,6 +944,23 @@ class LangGraphWorkflow:
             return node_type in {"plan", "plan_steps"}
         return False
 
+    @staticmethod
+    def _rendered_node_content_with_refs(node: Any, fragments: set[str], local_id: str) -> Any:
+        rendered = render_fragmented_content(node, fragments)
+        if node.type != "supporting_fact":
+            return rendered
+        if isinstance(rendered, dict):
+            return {
+                "citation_id": node.logical_id,
+                "local_node_id": local_id,
+                **rendered,
+            }
+        return {
+            "citation_id": node.logical_id,
+            "local_node_id": local_id,
+            "text": rendered,
+        }
+
     def _render_deduplicated_graph_context(
         self,
         *,
@@ -841,7 +1010,11 @@ class LangGraphWorkflow:
         for node in nodes:
             tag = token_by_type.get(node.type, "N")
             category = self._graph_context_category(node.type)
-            rendered_content = render_fragmented_content(node, fragments_by_node.get(node.node_id, set()))
+            rendered_content = self._rendered_node_content_with_refs(
+                node,
+                fragments_by_node.get(node.node_id, set()),
+                local_ids[node.node_id],
+            )
             content = json.dumps(rendered_content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             original_content_count = self._token_count(content)
             content_hash = ""
@@ -988,7 +1161,11 @@ class LangGraphWorkflow:
         call_id = f"{self.task_id}:{self.branch_id}:{role}:{mode}:{action_index}"
 
         for node in source_nodes:
-            rendered_content = render_fragmented_content(node, fragments_by_node.get(node.node_id, set()))
+            rendered_content = self._rendered_node_content_with_refs(
+                node,
+                fragments_by_node.get(node.node_id, set()),
+                local_ids[node.node_id],
+            )
             content = json.dumps(rendered_content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             original_content_count = self._token_count(content)
             content_hash = str(node.content_digest or "").strip()
@@ -1059,7 +1236,11 @@ class LangGraphWorkflow:
         for node in state_nodes:
             tag = token_by_type.get(node.type, "N")
             category = self._graph_context_category(node.type)
-            rendered_content = render_fragmented_content(node, fragments_by_node.get(node.node_id, set()))
+            rendered_content = self._rendered_node_content_with_refs(
+                node,
+                fragments_by_node.get(node.node_id, set()),
+                local_ids[node.node_id],
+            )
             content = json.dumps(rendered_content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             content_count = self._token_count(content)
             if self._role_aware_state_ref_only(role=role, mode=mode, node_type=node.type):
@@ -1203,7 +1384,11 @@ class LangGraphWorkflow:
         call_id = f"{self.task_id}:{self.branch_id}:{role}:{mode}:{action_index}"
         for node in nodes:
             tag = token_by_type.get(node.type, "N")
-            rendered_content = render_fragmented_content(node, fragments_by_node.get(node.node_id, set()))
+            rendered_content = self._rendered_node_content_with_refs(
+                node,
+                fragments_by_node.get(node.node_id, set()),
+                local_ids[node.node_id],
+            )
             content = json.dumps(rendered_content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             content_count = self._token_count(content)
             line = f"<{tag} id={local_ids[node.node_id]} v={node.version} s={node.status}>{content}</{tag}>"
@@ -1393,6 +1578,7 @@ class LangGraphWorkflow:
             "reusable_prefix_key": generation.get("reusable_prefix_key", f"{role}:{mode}:{self.task_type}"),
             "graph_update_tokens": int(generation.get("graph_update_tokens", 0) or 0),
             "task_verification": generation.get("task_verification"),
+            "hotpot_repair_packet_audit": generation.get("hotpot_repair_packet_audit"),
             "protocol_valid": protocol_valid,
             "compile_success": compile_success,
             "stage_complete": stage_complete,
@@ -2417,6 +2603,16 @@ class LangGraphWorkflow:
         )
 
     def _retry_session_prompt(self, role: str, mode: str, error: Exception) -> str:
+        if self._is_hotpot_repair_mode(role, mode):
+            return (
+                "\n<|im_end|>\n<|im_start|>user\n"
+                "<RETRY role='solver' mode='repair'>\n"
+                "HotpotQA repair is one-shot. Emit ONLY one set_result Action. "
+                "Do not emit done, plan, add_fact, add_plan_step, verify, markdown, or explanation. "
+                f"Previous Action was rejected: {error}\n"
+                + self._hotpot_repair_schema_instruction()
+                + "\n</RETRY>\n<|im_end|>\n<|im_start|>assistant\n"
+            )
         return (
             "\n<|im_end|>\n<|im_start|>user\n"
             f"<RETRY role={role!r} mode={mode!r}>\n"
@@ -2434,6 +2630,13 @@ class LangGraphWorkflow:
         return validate_action(role, normalize_action_payload(payload), task_type=self.task_type)
 
     def _system_contract(self, role: str, mode: str) -> str:
+        if self._is_hotpot_repair_mode(role, mode):
+            return (
+                "You are a HotpotQA local repair operator. Task type=multihop_qa. Mode=repair. "
+                "The only allowed action is set_result. Forbidden actions: plan, add_plan_step, "
+                "add_fact, explain, verify, done, and any other action. "
+                + self._hotpot_repair_schema_instruction()
+            )
         return (
             ROLE_SYSTEM_PROMPTS[role]
             + f" Task type={self.task_type}. Mode={mode}."
@@ -2442,16 +2645,37 @@ class LangGraphWorkflow:
             + action_contract(role, self.task_type)
         )
 
+    @staticmethod
+    def _hotpot_repair_schema_instruction() -> str:
+        return (
+            'Output exactly one JSON object with schema {"op":"set_result","id":"answer",'
+            '"value":{"answer":"...","bridge_entity":"...","cited_fact_ids":'
+            '["supporting_fact_1","supporting_fact_2"],"reasoning_chain":'
+            '["supporting_fact_1 -> bridge","bridge + supporting_fact_2 -> answer"]}}. '
+            "Use only citation_ids visible in allowed_evidence. Prefer bridge_candidates when a "
+            "candidate fits; otherwise propose a new bridge_entity grounded by cited evidence."
+        )
+
     def _latest_repair_diagnosis(self) -> dict[str, Any]:
         verification = self.store.latest_valid(self.task_id, self.branch_id, "verification")
         if verification is None or verification.status not in {"need_fix", "uncertain"}:
             return {}
         content = verification.content if isinstance(verification.content, dict) else {}
+        reason = content.get("reason", "")
+        repair_packet: dict[str, Any] = {}
+        if isinstance(reason, str) and reason.strip().startswith("{"):
+            try:
+                parsed_reason = json.loads(reason)
+            except json.JSONDecodeError:
+                parsed_reason = {}
+            if isinstance(parsed_reason, dict) and isinstance(parsed_reason.get("repair_packet"), dict):
+                repair_packet = parsed_reason["repair_packet"]
+                reason = str(parsed_reason.get("reason") or reason)
         return {
             "target": content.get("target", "result"),
             "error_type": content.get("error_type", ""),
             "error_location": content.get("error_location", ""),
-            "reason": content.get("reason", ""),
+            "reason": reason,
             "repair_instruction": content.get("repair_instruction", ""),
             "preserve": list(content.get("preserve", [])) if isinstance(content.get("preserve", []), list) else [],
             "requested_fragments": (
@@ -2459,7 +2683,202 @@ class LangGraphWorkflow:
                 if isinstance(content.get("requested_fragments", []), list)
                 else []
             ),
+            "repair_packet": repair_packet,
         }
+
+    def _render_hotpot_repair_context(self, graph_state: Any) -> str:
+        previous = self._latest_result_value()
+        diagnosis = self._latest_repair_diagnosis()
+        evidence = self._hotpot_allowed_evidence(graph_state)
+        entities = self._hotpot_available_entities(graph_state)
+        bridge_stage_candidates = self._hotpot_bridge_candidate_stages(graph_state, previous, evidence)
+        bridge_candidates = list(bridge_stage_candidates["repair_target_filtered"])
+        repair_packet = diagnosis.get("repair_packet") or {
+            "status": "need_fix",
+            "error_type": diagnosis.get("error_type", ""),
+            "known": {
+                "reason": diagnosis.get("reason", ""),
+                "error_location": diagnosis.get("error_location", ""),
+            },
+            "required": [diagnosis.get("repair_instruction", "")],
+            "preserve": diagnosis.get("preserve", []),
+        }
+        if isinstance(repair_packet, dict) and not repair_packet.get("bridge_candidates"):
+            repair_packet = {**repair_packet, "bridge_candidates": bridge_candidates}
+        serialized_candidates = (
+            self._hotpot_string_list(repair_packet.get("bridge_candidates"))
+            if isinstance(repair_packet, dict)
+            else bridge_candidates
+        )
+        bridge_stage_candidates = {
+            **bridge_stage_candidates,
+            "serialized_packet": serialized_candidates,
+            "solver_visible": self._hotpot_dedup_strings([*serialized_candidates, *bridge_candidates]),
+        }
+        self._last_hotpot_repair_packet_audit = {
+            "bridge_candidate_stages": bridge_stage_candidates,
+            "notes": {
+                "raw_pool": "candidate strings before case-insensitive deduplication",
+                "ranked_top8": "first eight raw candidates in runtime construction order",
+                "deduplicated_top8": "case-insensitive deduplicated candidates before packet insertion",
+                "visibility_filtered": "same as deduplicated_top8; source graph was already receiver-visible",
+                "budget_filtered": "same as visibility_filtered; no extra bridge candidate budget filter is applied",
+                "repair_target_filtered": "same as budget_filtered; repair target currently constrains validation, not candidate delivery",
+                "serialized_packet": "bridge_candidates field serialized inside repair_packet",
+                "solver_visible": "union of repair_packet.bridge_candidates and top-level bridge_candidates in the prompt",
+            },
+        }
+        packet = {
+            "previous_structured_answer": previous,
+            "repair_packet": repair_packet,
+            "bridge_candidates": bridge_candidates,
+            "allowed_entities": entities,
+            "allowed_evidence": evidence,
+        }
+        return (
+            "<HOTPOT_REPAIR_PACKET>\n"
+            + json.dumps(packet, ensure_ascii=False, indent=2, default=str)
+            + "\n</HOTPOT_REPAIR_PACKET>"
+        )
+
+    def _latest_result_value(self) -> Any:
+        result = self.store.latest_valid(self.task_id, self.branch_id, "result")
+        if result is None:
+            return None
+        content = result.content
+        if isinstance(content, dict) and "value" in content:
+            return content.get("value")
+        return content
+
+    def _hotpot_allowed_evidence(self, graph_state: Any) -> list[dict[str, Any]]:
+        nodes = [
+            node for node in graph_state.nodes.values()
+            if node.task_id == self.task_id
+            and node.branch_id == self.branch_id
+            and node.type == "supporting_fact"
+            and node.is_operationally_valid()
+        ]
+        nodes.sort(key=_node_sort_key)
+        evidence: list[dict[str, Any]] = []
+        for node in nodes:
+            content = node.content if isinstance(node.content, dict) else {"text": node.content}
+            evidence.append({
+                "citation_id": node.logical_id,
+                "title": content.get("title", content.get("entity", "")),
+                "sent_id": content.get("sent_id"),
+                "text": content.get("text", content.get("sentence", content)),
+            })
+        return evidence
+
+    def _hotpot_available_entities(self, graph_state: Any) -> list[Any]:
+        values: list[Any] = []
+        for node in sorted(graph_state.nodes.values(), key=_node_sort_key):
+            if (
+                node.task_id == self.task_id
+                and node.branch_id == self.branch_id
+                and node.type == "entity"
+                and node.is_operationally_valid()
+            ):
+                values.append(node.content)
+        return values
+
+    def _hotpot_bridge_candidates(self, graph_state: Any, previous: Any, evidence: list[dict[str, Any]]) -> list[str]:
+        values: list[Any] = []
+        if isinstance(previous, dict):
+            values.append(previous.get("bridge_entity"))
+            values.append(previous.get("answer"))
+        for entity in self._hotpot_available_entities(graph_state):
+            if isinstance(entity, dict):
+                for key in ("name", "entity", "title", "value"):
+                    values.append(entity.get(key))
+            else:
+                values.append(entity)
+        for fact in evidence:
+            values.append(fact.get("title"))
+            values.append(fact.get("entity"))
+        return bridge_candidates_from_values(values, limit=24)
+
+    def _hotpot_bridge_candidate_stages(self, graph_state: Any, previous: Any, evidence: list[dict[str, Any]]) -> dict[str, list[str]]:
+        records: list[dict[str, Any]] = []
+        order = 0
+
+        def add_candidate(value: Any, source: str, priority: float) -> None:
+            nonlocal order
+            text = extract_bridge_candidate(value)
+            if text:
+                records.append({
+                    "candidate": text,
+                    "source": source,
+                    "priority": priority,
+                    "order": order,
+                })
+                order += 1
+
+        for entity in self._hotpot_available_entities(graph_state):
+            if isinstance(entity, dict):
+                for key in ("name", "entity", "title", "value"):
+                    add_candidate(entity.get(key), "dataset_entity_field", 1.0)
+            else:
+                add_candidate(entity, "dataset_entity", 1.0)
+        for fact in evidence:
+            add_candidate(fact.get("title"), "supporting_fact_title", 0.95)
+            add_candidate(fact.get("entity"), "supporting_fact_entity", 0.95)
+        if isinstance(previous, dict):
+            add_candidate(previous.get("bridge_entity"), "previous_bridge", 0.5)
+            add_candidate(previous.get("answer"), "previous_answer", 0.2)
+
+        raw_pool = [str(record["candidate"]) for record in records]
+        ranked_records = sorted(
+            records,
+            key=lambda record: (-float(record["priority"]), int(record["order"])),
+        )
+        ranked = deduplicate_bridge_candidates(
+            (record["candidate"] for record in ranked_records),
+            limit=24,
+        )
+        ranked_top8 = ranked[:8]
+        deduplicated = deduplicate_bridge_candidates(raw_pool, limit=24)
+        deduplicated_top8 = deduplicated[:8]
+        return {
+            "raw_pool": raw_pool,
+            "ranked_top8": ranked_top8,
+            "deduplicated_top8": deduplicated_top8,
+            "visibility_filtered": list(ranked),
+            "budget_filtered": list(ranked),
+            "repair_target_filtered": list(ranked),
+        }
+
+    @staticmethod
+    def _hotpot_dedup_strings(values: list[Any]) -> list[str]:
+        return deduplicate_bridge_candidates(values, limit=24)
+
+    @staticmethod
+    def _hotpot_string_list(value: Any) -> list[str]:
+        if isinstance(value, str):
+            return [value] if value.strip() else []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return []
+
+    def _hotpot_repair_noop_reason(self, action: dict[str, Any]) -> str:
+        if action.get("op") != "set_result":
+            return "repair_invalid_patch: solver did not produce a revised set_result in one repair action"
+        old = self._latest_result_value()
+        new = action.get("value")
+        if not isinstance(old, dict) or not isinstance(new, dict):
+            return "repair_noop_same_full_result: solver produced no operationally new result"
+        deltas = []
+        if str(old.get("answer", "")).strip() != str(new.get("answer", "")).strip():
+            deltas.append("answer")
+        if str(old.get("bridge_entity", "")).strip() != str(new.get("bridge_entity", "")).strip():
+            deltas.append("bridge")
+        old_citations = [str(item) for item in old.get("cited_fact_ids", [])] if isinstance(old.get("cited_fact_ids"), list) else []
+        new_citations = [str(item) for item in new.get("cited_fact_ids", [])] if isinstance(new.get("cited_fact_ids"), list) else []
+        if old_citations != new_citations:
+            deltas.append("citations")
+        if not deltas:
+            return "repair_noop_same_answer_bridge_citations: solver repeated answer, bridge, and citations"
+        return "repair_semantically_unchanged: solver patch changed " + ",".join(deltas) + " but compiled to no new result"
 
     def _action_role_suffix(self, role: str, mode: str) -> str:
         """Give the small local model an explicit, state-aware next-action target."""
@@ -2550,6 +2969,19 @@ class LangGraphWorkflow:
                     "Do not emit done until revised code exists after the latest need_fix verification."
                 )
             if self.task_type in {"multiple_choice", "multihop_qa"}:
+                if self.task_type == "multihop_qa":
+                    return (
+                        "The critic requested typed HotpotQA repair. "
+                        + repair_directive
+                        + " Use repair_packet.known as fixed context, satisfy repair_packet.required, "
+                        "prefer bridge_candidates for bridge_entity when a candidate fits, "
+                        "and preserve only the listed valid items. Emit a revised result as exactly "
+                        'one JSON object with this schema: {"op":"set_result","id":"answer",'
+                        '"value":{"answer":"...","bridge_entity":"...","cited_fact_ids":'
+                        '["supporting_fact_1","supporting_fact_2"],"reasoning_chain":'
+                        '["supporting_fact_1 -> bridge","bridge + supporting_fact_2 -> answer"]}}. '
+                        "Do not emit done until revised result exists after the latest need_fix verification."
+                    )
                 return (
                     "The critic requested repair. "
                     + repair_directive
@@ -2577,13 +3009,15 @@ class LangGraphWorkflow:
             if self.task_type == "multihop_qa":
                 return (
                     "Verify the latest structured HotpotQA result as the semantic entailment "
-                    "critic. Check that cited_fact_ids exist, the reasoning_chain connects hop1 "
-                    "to bridge_entity and bridge_entity to answer, and the cited facts entail the "
-                    "answer. If and only if the cited evidence entails the answer, emit verify "
-                    "with status=verified and empty diagnostic fields. If entailment is missing, "
-                    "contradicted, or not grounded in the citations, emit need_fix with non-empty "
-                    "error_type, error_location, and repair_instruction; do not emit a bare "
-                    "need_fix flag."
+                    "critic. Make three explicit judgments: citation_valid, chain_complete, and "
+                    "answer_entailed and answers_question. For verified, reason MUST be a JSON string with exactly these "
+                    "semantic fields: hop1_conclusion, hop2_conclusion, derived_answer, "
+                    "candidate_answer, match, contradiction, answers_question. Only verify when the two hop "
+                    "conclusions derive candidate_answer from the cited facts, match is true, and "
+                    "contradiction is false, and derived_answer directly answers the question. For need_fix, use a typed error_type from "
+                    "invalid_citation, missing_hop, incomplete_evidence_chain, wrong_bridge_entity, "
+                    "answer_not_supported, or answer_contradicted, and include actionable "
+                    "error_location, repair_instruction, preserve, and requested_fragments."
                 )
             if self.task_type == "multiple_choice":
                 return (
@@ -2784,11 +3218,54 @@ class LangGraphWorkflow:
         )
         return {"status": "running", "error": None if execution.success else "; ".join(execution.errors)}
 
+    def _unresolved_verification_node(self, state: WorkflowState) -> dict[str, Any]:
+        branch_id = state.get("branch_id", self.branch_id)
+        verification = self.store.latest_valid(self.task_id, branch_id, "verification")
+        content = verification.content if verification is not None and isinstance(verification.content, dict) else {}
+        error = content.get("reason") or content.get("repair_instruction") or "verification unresolved"
+        logs = list(state.get("logs", []))
+        logs.append({
+            "role": "runtime",
+            "mode": "verification_unresolved",
+            "action_index": 0,
+            "action": {
+                "op": "verification_unresolved",
+                "status": getattr(verification, "status", "missing") if verification is not None else "missing",
+                "error_type": content.get("error_type", "verification_unresolved"),
+                "error_location": content.get("error_location", "verification"),
+            },
+            "compiled_node_ids": [],
+            "graph_update_tokens": 0,
+            "communication": [],
+            "context_tokens": 0,
+            "context_slice_tokens": 0,
+            "context_slice_node_ids": [],
+            "context_slice_edge_ids": [],
+            "context_slice_fragment_ids": [],
+            "context_slice_root_node_ids": [],
+            "rendered_context_node_ids": [],
+            "rendered_context_fragment_ids": [],
+            "logical_context_tokens": 0,
+            "generation": {"attempts": 0, "validation_errors": [], "verification_unresolved": True},
+            "telemetry": {},
+            "session": self._session_snapshot(state.get("session_id", self.session_id)),
+            "latency_sec": 0.0,
+        })
+        return {
+            "status": "verification_unresolved",
+            "error": str(error),
+            "last_role": "runtime",
+            "session_id": state.get("session_id", self.session_id),
+            "logs": logs,
+        }
+
     def _route_after_critic(self, state: WorkflowState) -> str:
         verification = self.store.latest_valid(self.task_id, state.get("branch_id", self.branch_id), "verification")
         if verification is not None and verification.status == "verified" and not self._completion_errors("critic"):
             return "finalizer"
         if int(state.get("round_id", 0)) >= self.max_rounds:
+            if self.task_type == "multihop_qa":
+                return "unresolved"
             return "finalizer"
         return "repair"
 
