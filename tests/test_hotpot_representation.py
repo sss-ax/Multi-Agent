@@ -5,9 +5,11 @@ from workflow_runtime.hotpot_representation import (
     build_hotpot_semantic_fragments,
     build_hotpot_chain_view,
     build_hotpot_chain_view_from_facts,
+    build_hotpot_reasoning_candidate_object,
     render_hotpot_chain_view,
     render_hotpot_discriminative_chain_static,
     render_hotpot_semantic_fragments,
+    render_hotpot_structured_candidate_view,
 )
 
 
@@ -56,6 +58,35 @@ def test_hotpot_chain_view_from_graph_is_lossless_structured_view() -> None:
     assert view.hop2_key_sentence == "Ed Wood was an American filmmaker."
     assert view.derived_answer == "yes"
     assert view.answer_type == "yes_no"
+    assert view.contradiction_signal is False
+
+
+def test_hotpot_reasoning_candidate_object_is_graph_ready() -> None:
+    view = build_hotpot_chain_view_from_facts(
+        candidate_id="c1",
+        bridge_entity="Charles Babbage",
+        question="Where was Ada's collaborator born?",
+        facts=[
+            {"fact_id": "supporting_fact_1", "title": "Ada", "text": "Ada collaborated with Charles Babbage."},
+            {"fact_id": "supporting_fact_2", "title": "Charles Babbage", "text": "Charles Babbage was born in London."},
+        ],
+        hop1_fact_ids=["supporting_fact_1"],
+        hop2_fact_ids=["supporting_fact_2"],
+        derived_answer="London",
+    )
+
+    obj = build_hotpot_reasoning_candidate_object(
+        view=view,
+        reasoning_type="bridge_entity",
+        evidence_bindings={"hop1": view.hop1_fact_ids, "hop2": view.hop2_fact_ids},
+        derived_decision={"answer": "London"},
+        provenance={"constructor": "test"},
+    )
+
+    data = obj.as_dict()
+    assert obj.node_type == "hotpot_reasoning_candidate"
+    assert data["chain_view"]["bridge_entity"] == "Charles Babbage"
+    assert data["reasoning_type"] == "bridge_entity"
 
 
 def test_hotpot_chain_view_renderer_uses_structured_v1_format() -> None:
@@ -81,7 +112,27 @@ def test_hotpot_chain_view_renderer_uses_structured_v1_format() -> None:
     assert "evidence: Scott Derrickson is an American film director." in rendered
     assert "Derived answer:\nyes" in rendered
     assert "Answer alignment:" in rendered
+    assert "Contradiction signal:\nfalse" in rendered
     assert "relation:" not in rendered
+
+    structured = json.loads(render_hotpot_structured_candidate_view(view))
+    assert structured == {
+        "candidate_id": "c3",
+        "bridge_entity": "Scott Derrickson",
+        "hop1": {
+            "fact_id": "supporting_fact_1",
+            "fact_ids": ["supporting_fact_1"],
+            "key_evidence": "Scott Derrickson is an American film director.",
+        },
+        "hop2": {
+            "fact_id": "supporting_fact_2",
+            "fact_ids": ["supporting_fact_2"],
+            "key_evidence": "Ed Wood was an American filmmaker.",
+        },
+        "derived_answer": "yes",
+        "answer_alignment": "yes/no answer derived from whether both evidence hops satisfy the question relation",
+        "contradiction_signal": False,
+    }
 
 
 def test_hotpot_semantic_fragments_split_chain_without_graph_nodes() -> None:

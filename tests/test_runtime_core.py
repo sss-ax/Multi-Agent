@@ -74,6 +74,18 @@ def test_dependency_closure_context_slice() -> None:
     assert task.node_id in context_slice.visible_node_ids
 
 
+def test_graph_store_survival_trace_reports_missing_mandatory_roots() -> None:
+    store = GraphStore()
+    root = store.add_node(task_id="t", branch_id="main", logical_id="supporting_fact_1", node_type="supporting_fact", content="f", owner="dataset")
+    delivered = store.add_node(task_id="t", branch_id="main", logical_id="result", node_type="result", content="a", owner="solver")
+
+    trace = store.survival_trace(root_node_ids=[root.node_id, delivered.node_id], delivered_node_ids=[delivered.node_id])
+
+    assert trace["present_node_ids"] == [delivered.node_id]
+    assert trace["missing_node_ids"] == [root.node_id]
+    assert trace["mandatory_dependency_closure_satisfied"] is False
+
+
 def test_minimal_verified_rejects_unverified_result() -> None:
     store = GraphStore()
     store.add_node(task_id="t", branch_id="main", logical_id="query_spec", node_type="query_spec", content="q", owner="planner")

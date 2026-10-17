@@ -6,7 +6,14 @@ from .heuristic import ClosureAwareHeuristicPolicy
 from .minimal import MinimalNoFeedbackPolicy, MinimalSendAllFallbackPolicy, MinimalTargetedFeedbackPolicy
 from .random_keep import RandomKeepPolicy
 from .send_all import SendAllPolicy
-from .utility import RandomSameBudgetPolicy, ReceiverAwareHeuristicPolicy, StaticUtilityPolicy, UtilityTable
+from .utility import (
+    RandomSameBudgetPolicy,
+    ReceiverAwareHeuristicPolicy,
+    ReceiverAwareNoClosurePolicy,
+    ReceiverAwareTargetedFeedbackPolicy,
+    StaticUtilityPolicy,
+    UtilityTable,
+)
 
 __all__ = [
     "GraphCommunicationPolicy",
@@ -21,6 +28,8 @@ __all__ = [
     "FRAGMENT_ABLATION_TARGETS",
     "RandomSameBudgetPolicy",
     "ReceiverAwareHeuristicPolicy",
+    "ReceiverAwareNoClosurePolicy",
+    "ReceiverAwareTargetedFeedbackPolicy",
     "StaticUtilityPolicy",
     "UtilityTable",
     "make_communication_policy",
@@ -36,7 +45,13 @@ def make_communication_policy(
 ) -> GraphCommunicationPolicy:
     key = (name or "closure_aware_heuristic").strip().lower()
     utility_table = None
-    if key in {"static_utility", "receiver_aware_heuristic", "random_same_budget"}:
+    if key in {
+        "static_utility",
+        "receiver_aware_heuristic",
+        "receiver_aware_no_closure",
+        "receiver_aware_targeted_feedback",
+        "random_same_budget",
+    }:
         utility_table = UtilityTable.from_path(utility_table_path, task_family=task_family)
     if key == "send_all":
         return SendAllPolicy()
@@ -58,6 +73,10 @@ def make_communication_policy(
         return StaticUtilityPolicy(utility_table)
     if key == "receiver_aware_heuristic":
         return ReceiverAwareHeuristicPolicy(utility_table, task_family=task_family)
+    if key == "receiver_aware_no_closure":
+        return ReceiverAwareNoClosurePolicy(utility_table, task_family=task_family)
+    if key == "receiver_aware_targeted_feedback":
+        return ReceiverAwareTargetedFeedbackPolicy(utility_table, task_family=task_family)
     if key == "random_same_budget":
         return RandomSameBudgetPolicy(utility_table, task_family=task_family, seed=seed)
     if key.startswith(FRAGMENT_ABLATION_POLICY_PREFIX):

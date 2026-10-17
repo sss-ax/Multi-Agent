@@ -113,6 +113,7 @@ def main() -> None:
     records = list(eval_report.get("records", []))
     rows = read(Path(args.data_path), "hotpotqa", args.limit or len(records))
     rows_by_sample = {f"eval_hotpotqa_{index}": row for index, row in enumerate(rows)}
+    rows_by_sample.update({str(row.get("sample_id")): row for row in rows if str(row.get("sample_id", "")).strip()})
     selected_settings = [item.strip() for item in args.settings.split(",") if item.strip()]
     unknown = sorted(set(selected_settings) - set(SETTINGS))
     if unknown:
@@ -126,10 +127,12 @@ def main() -> None:
 
         model = TransformersModel(args.model_path, max_new_tokens=args.max_new_tokens)
 
-    events = [
-        _event(record, rows_by_sample.get(str(record.get("sample_id", ""))), candidate_limit=args.candidate_limit)
-        for record in records
-    ]
+    events = []
+    for index, record in enumerate(records):
+        row = rows_by_sample.get(str(record.get("sample_id", "")))
+        if row is None and index < len(rows):
+            row = rows[index]
+        events.append(_event(record, row, candidate_limit=args.candidate_limit))
     events = [event for event in events if event]
 
     setting_rows: list[dict[str, Any]] = []

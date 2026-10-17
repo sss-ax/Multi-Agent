@@ -73,6 +73,34 @@ def bridge_matches_any(value: Any, gold: Iterable[Any]) -> bool:
     return bool(normalized and any(normalized == normalize_bridge(item) for item in gold))
 
 
+def bridge_aliases(value: Any) -> set[str]:
+    """Return conservative aliases for evidence-conditioned bridge matching."""
+    candidate = extract_bridge_candidate(value, allow_text=False)
+    normalized = normalize_bridge(candidate)
+    aliases = {candidate, normalized} if candidate else set()
+    if candidate:
+        aliases.add(re.sub(r"\s*\([^)]*\)", "", candidate).strip())
+        aliases.add(re.sub(r"^(the|a|an)\s+", "", candidate, flags=re.IGNORECASE).strip())
+    return {alias for alias in aliases if normalize_bridge(alias)}
+
+
+def canonical_bridge(value: Any, *, evidence_values: Iterable[Any] = ()) -> str:
+    """Canonicalize a bridge using exact/alias evidence matches when present."""
+    candidate = extract_bridge_candidate(value, allow_text=False)
+    candidate_key = normalize_bridge(candidate)
+    if not candidate_key:
+        return ""
+    candidate_aliases = {normalize_bridge(alias) for alias in bridge_aliases(candidate)}
+    for evidence in evidence_values:
+        evidence_candidate = extract_bridge_candidate(evidence, allow_text=False)
+        evidence_key = normalize_bridge(evidence_candidate)
+        if evidence_key and evidence_key in candidate_aliases:
+            return evidence_candidate
+        if evidence_key and candidate_key in {normalize_bridge(alias) for alias in bridge_aliases(evidence_candidate)}:
+            return evidence_candidate
+    return candidate
+
+
 def _clean_candidate(value: Any) -> str:
     text = str(value or "").strip()
     text = re.sub(r"\s+", " ", text)

@@ -1,6 +1,8 @@
 from workflow_runtime.hotpot_bridge import (
+    bridge_aliases,
     bridge_candidates_from_values,
     bridge_matches_any,
+    canonical_bridge,
     extract_bridge_candidate,
     normalize_bridge,
 )
@@ -30,3 +32,8 @@ def test_hotpot_bridge_candidates_deduplicate_after_canonical_extraction() -> No
 def test_hotpot_bridge_match_handles_json_string_candidate() -> None:
     assert normalize_bridge('{"name":"Scott Derrickson"}') == "scott derrickson"
     assert bridge_matches_any('{"name":"Scott Derrickson"}', {"Scott Derrickson"})
+
+
+def test_hotpot_bridge_canonicalizes_against_evidence_aliases() -> None:
+    assert "winner" in bridge_aliases("WINNER")
+    assert canonical_bridge("Winner", evidence_values=["WINNER"]) == "WINNER"

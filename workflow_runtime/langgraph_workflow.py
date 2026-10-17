@@ -1650,6 +1650,7 @@ class LangGraphWorkflow:
                 "minimal_no_feedback",
                 "minimal_sendall_fallback",
                 "minimal_targeted_feedback",
+                "receiver_aware_targeted_feedback",
             }
             if semantic_minimal_policy:
                 contract = default_semantic_contract(sender, receiver, task_type=self.task_type)
@@ -1818,7 +1819,7 @@ class LangGraphWorkflow:
                 feedback_decisions.append(feedback_decision.as_dict())
                 while (
                     feedback_decision.action == FeedbackAction.TARGETED_REFINEMENT
-                    and self.communication_policy.name == "minimal_targeted_feedback"
+                    and self.communication_policy.name in {"minimal_targeted_feedback", "receiver_aware_targeted_feedback"}
                 ):
                     targeted_plan = plan_refinement(
                         state,
@@ -2607,7 +2608,7 @@ class LangGraphWorkflow:
             return (
                 "\n<|im_end|>\n<|im_start|>user\n"
                 "<RETRY role='solver' mode='repair'>\n"
-                "HotpotQA repair is one-shot. Emit ONLY one set_result Action. "
+                "HotpotQA repair is a bounded local patch step. Emit ONLY one set_result Action for this attempt. "
                 "Do not emit done, plan, add_fact, add_plan_step, verify, markdown, or explanation. "
                 f"Previous Action was rejected: {error}\n"
                 + self._hotpot_repair_schema_instruction()
@@ -2633,7 +2634,8 @@ class LangGraphWorkflow:
         if self._is_hotpot_repair_mode(role, mode):
             return (
                 "You are a HotpotQA local repair operator. Task type=multihop_qa. Mode=repair. "
-                "The only allowed action is set_result. Forbidden actions: plan, add_plan_step, "
+                "This is one bounded local patch inside an iterative repair loop. "
+                "The only allowed action for this attempt is set_result. Forbidden actions: plan, add_plan_step, "
                 "add_fact, explain, verify, done, and any other action. "
                 + self._hotpot_repair_schema_instruction()
             )

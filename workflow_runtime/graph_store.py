@@ -413,6 +413,26 @@ class GraphStore:
                 result[node.logical_id] = current.node_id
         return result
 
+    def survival_trace(
+        self,
+        *,
+        root_node_ids: Iterable[str],
+        delivered_node_ids: Iterable[str],
+    ) -> Dict[str, Any]:
+        """Trace whether mandatory roots survived packet/visibility filtering."""
+        roots = list(dict.fromkeys(str(item) for item in root_node_ids if str(item)))
+        delivered = set(str(item) for item in delivered_node_ids if str(item))
+        missing = [node_id for node_id in roots if node_id not in delivered]
+        present = [node_id for node_id in roots if node_id in delivered]
+        return {
+            "root_node_ids": roots,
+            "delivered_node_ids": sorted(delivered),
+            "present_node_ids": present,
+            "missing_node_ids": missing,
+            "survival_rate": (len(present) / len(roots)) if roots else 1.0,
+            "mandatory_dependency_closure_satisfied": not missing,
+        }
+
     def begin_transaction(self, read_versions: Mapping[str, str]) -> "GraphTransaction":
         return GraphTransaction(self, dict(read_versions))
 

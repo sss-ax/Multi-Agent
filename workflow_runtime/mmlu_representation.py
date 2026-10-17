@@ -17,6 +17,9 @@ class MMLUOptionHypothesisView:
     option_text: str
     support_fragments: list[str]
     contradiction_fragments: list[str]
+    support_score: float
+    contradiction_score: float
+    aggregate_score: float
     score: float
     uncertainty: float
     provenance: dict[str, Any]
@@ -67,6 +70,9 @@ def build_mmlu_option_hypothesis_graph_view(
                 option_text=str(hypothesis.get("option_text") or "").strip(),
                 support_fragments=support,
                 contradiction_fragments=contradictions,
+                support_score=support_strength,
+                contradiction_score=contradiction_strength,
+                aggregate_score=score,
                 score=score,
                 uncertainty=uncertainty,
                 provenance={
@@ -99,8 +105,10 @@ def render_mmlu_option_hypothesis_graph_view(view: MMLUOptionHypothesisGraphView
             "",
             f"Option {option.get('option_id', '')}",
             f"text: {option.get('option_text', '')}",
-            f"score: {_float(option.get('score'), default=0.0):.3f}",
+            f"support_score: {_float(option.get('support_score'), default=0.0):.3f}",
+            f"contradiction_score: {_float(option.get('contradiction_score'), default=0.0):.3f}",
             f"uncertainty: {_float(option.get('uncertainty'), default=0.0):.3f}",
+            f"aggregate_score: {_float(option.get('aggregate_score', option.get('score')), default=0.0):.3f}",
             "support: " + _summary(option.get("support_fragments")),
             "contradiction: " + _summary(option.get("contradiction_fragments")),
         ])

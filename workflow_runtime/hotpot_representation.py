@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
 
 from .context_slicer import _node_sort_key
@@ -28,9 +28,102 @@ class HotpotChainView:
     answer_type: str
     answer_alignment: str | None
     cited_fact_ids: list[str]
+    contradiction_signal: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class HotpotReasoningCandidateObject:
+    """Canonical graph-ready object for a topology-specific Hotpot candidate."""
+
+    candidate_id: str
+    reasoning_type: str
+    chain_view: HotpotChainView
+    evidence_bindings: dict[str, Any]
+    derived_decision: dict[str, Any]
+    provenance: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def node_type(self) -> str:
+        return "hotpot_reasoning_candidate"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_id": self.candidate_id,
+            "reasoning_type": self.reasoning_type,
+            "chain_view": self.chain_view.as_dict(),
+            "evidence_bindings": dict(self.evidence_bindings),
+            "derived_decision": dict(self.derived_decision),
+            "provenance": dict(self.provenance),
+            "node_type": self.node_type,
+        }
+
+
+@dataclass(frozen=True)
+class HotpotFactEndpoint:
+    """A model-bound semantic endpoint view over one evidence sentence."""
+
+    subject: str = ""
+    relation: str = ""
+    object: str = ""
+    subject_role: str = ""
+    object_role: str = ""
+    confidence: float = 0.0
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class HotpotEndpointBinding:
+    """Fact-level and pair-level endpoint binding for a Hotpot evidence pair."""
+
+    fact1: HotpotFactEndpoint = field(default_factory=HotpotFactEndpoint)
+    fact2: HotpotFactEndpoint = field(default_factory=HotpotFactEndpoint)
+    inferred_bridge: str = ""
+    bridge_alignment: str = ""
+    derived_answer: str = ""
+    answer_source: str = ""
+    reasoning_type: str = ""
+    confidence: float = 0.0
+    source: str = "model"
+    raw_output: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "fact1": self.fact1.as_dict(),
+            "fact2": self.fact2.as_dict(),
+            "cross_fact": {
+                "inferred_bridge": self.inferred_bridge,
+                "bridge_alignment": self.bridge_alignment,
+                "derived_answer": self.derived_answer,
+                "answer_source": self.answer_source,
+            },
+            "reasoning_type": self.reasoning_type,
+            "confidence": self.confidence,
+            "source": self.source,
+            "raw_output": self.raw_output,
+        }
+
+
+def build_hotpot_reasoning_candidate_object(
+    *,
+    view: HotpotChainView,
+    reasoning_type: str,
+    evidence_bindings: dict[str, Any] | None = None,
+    derived_decision: dict[str, Any] | None = None,
+    provenance: dict[str, Any] | None = None,
+) -> HotpotReasoningCandidateObject:
+    return HotpotReasoningCandidateObject(
+        candidate_id=view.candidate_id,
+        reasoning_type=reasoning_type,
+        chain_view=view,
+        evidence_bindings=dict(evidence_bindings or {}),
+        derived_decision=dict(derived_decision or {"answer": view.derived_answer}),
+        provenance=dict(provenance or {}),
+    )
 
 
 @dataclass(frozen=True)
@@ -68,6 +161,8 @@ def build_hotpot_chain_view(candidate: Any, graph_store: Any, question: str) -> 
     hop1 = selected[:1] or _facts_for_bridge(bridge, facts)[:1]
     hop2 = selected[1:2] or _rank_facts(" ".join([question, bridge, *_fact_texts(hop1)]), facts, limit=1, exclude=hop1)
     derived = str(value.get("answer") or value.get("derived_answer") or "").strip()
+    alignment = deterministic_answer_alignment(question, derived, [*hop1, *hop2])
+    contradiction = _has_contradiction_text(alignment, _join_fact_sentences(hop1), _join_fact_sentences(hop2))
     return HotpotChainView(
         candidate_id=str(candidate.get("candidate_id", candidate.get("id", "candidate")) if isinstance(candidate, dict) else "candidate"),
         bridge_entity=bridge,
@@ -77,7 +172,8 @@ def build_hotpot_chain_view(candidate: Any, graph_store: Any, question: str) -> 
         hop2_key_sentence=_join_fact_sentences(hop2),
         derived_answer=derived,
         answer_type=infer_hotpot_answer_type(question, derived),
-        answer_alignment=deterministic_answer_alignment(question, derived, [*hop1, *hop2]),
+        answer_alignment=alignment,
+        contradiction_signal=contradiction,
         cited_fact_ids=cited,
     )
 
@@ -99,6 +195,9 @@ def build_hotpot_chain_view_from_facts(
         or _rank_facts(" ".join([question, bridge_entity, *_fact_texts(hop1)]), indexed, limit=1, exclude=hop1)
     )
     cited = [fact["fact_id"] for fact in [*hop1, *hop2]]
+    derived = str(derived_answer or _derived_answer_hint(question, [*hop1, *hop2])).strip()
+    alignment = deterministic_answer_alignment(question, derived, [*hop1, *hop2])
+    contradiction = _has_contradiction_text(alignment, _join_fact_sentences(hop1), _join_fact_sentences(hop2))
     return HotpotChainView(
         candidate_id=candidate_id,
         bridge_entity=bridge_entity,
@@ -106,9 +205,10 @@ def build_hotpot_chain_view_from_facts(
         hop1_key_sentence=_join_fact_sentences(hop1),
         hop2_fact_ids=[fact["fact_id"] for fact in hop2],
         hop2_key_sentence=_join_fact_sentences(hop2),
-        derived_answer=str(derived_answer or _derived_answer_hint(question, [*hop1, *hop2])).strip(),
+        derived_answer=derived,
         answer_type=infer_hotpot_answer_type(question, derived_answer),
-        answer_alignment=deterministic_answer_alignment(question, derived_answer, [*hop1, *hop2]),
+        answer_alignment=alignment,
+        contradiction_signal=contradiction,
         cited_fact_ids=cited,
     )
 
@@ -145,14 +245,39 @@ def render_hotpot_chain_view(view: HotpotChainView, *, include_hop1: bool, inclu
             "",
             "Answer alignment:",
             view.answer_alignment or "",
+            "",
+            "Contradiction signal:",
+            str(bool(view.contradiction_signal)).lower(),
         ])
     return "\n".join(lines).strip()
+
+
+def render_hotpot_structured_candidate_view(view: HotpotChainView) -> str:
+    """Render the Phase-1 Hotpot structured candidate schema."""
+
+    payload = {
+        "candidate_id": view.candidate_id,
+        "bridge_entity": view.bridge_entity,
+        "hop1": {
+            "fact_id": _first_or_empty(view.hop1_fact_ids),
+            "fact_ids": list(view.hop1_fact_ids),
+            "key_evidence": view.hop1_key_sentence,
+        },
+        "hop2": {
+            "fact_id": _first_or_empty(view.hop2_fact_ids),
+            "fact_ids": list(view.hop2_fact_ids),
+            "key_evidence": view.hop2_key_sentence,
+        },
+        "derived_answer": view.derived_answer,
+        "answer_alignment": view.answer_alignment,
+        "contradiction_signal": view.contradiction_signal,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def build_hotpot_semantic_fragments(view: HotpotChainView, question: str) -> list[HotpotSemanticFragment]:
     """Split a structured chain view into deterministic semantic fragments."""
     question_target = infer_hotpot_question_target(question)
-    contradiction = _has_contradiction_signal(view)
     return [
         HotpotSemanticFragment(
             "bridge_identity",
@@ -194,7 +319,7 @@ def build_hotpot_semantic_fragments(view: HotpotChainView, question: str) -> lis
         HotpotSemanticFragment(
             "contradiction_signal",
             view.candidate_id,
-            {"value": contradiction},
+            {"value": view.contradiction_signal},
         ),
     ]
 
@@ -298,11 +423,11 @@ def _alignment_label(view: HotpotChainView) -> str:
 
 
 def _has_contradiction_signal(view: HotpotChainView) -> bool:
-    text = " ".join([
-        str(view.answer_alignment or ""),
-        str(view.hop1_key_sentence or ""),
-        str(view.hop2_key_sentence or ""),
-    ]).lower()
+    return _has_contradiction_text(view.answer_alignment, view.hop1_key_sentence, view.hop2_key_sentence)
+
+
+def _has_contradiction_text(*values: Any) -> bool:
+    text = " ".join(str(value or "") for value in values).lower()
     return bool(re.search(r"\bcontradict|whereas|however|not supported\b", text))
 
 

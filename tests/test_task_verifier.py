@@ -8,6 +8,7 @@ if str(ROOT) not in sys.path:
 
 from workflow_runtime import GraphStore
 from workflow_runtime.domain_executors import execute_python_tests_detailed
+from workflow_runtime.hotpot_verifier import HotpotSemanticVerifier
 from workflow_runtime.task_verifier import apply_verification_signal, verify_task_candidate
 
 
@@ -327,6 +328,39 @@ def test_hotpot_verifier_accepts_structured_bridge_chain() -> None:
     assert signal.confidence == 0.0
     assert signal.metadata["answer"] == "London"
     assert signal.metadata["semantic_entailment_required_from"] == "critic"
+
+
+def test_hotpot_semantic_verifier_is_unified_programmatic_entrypoint() -> None:
+    store = GraphStore()
+    store.add_node(task_id="t", branch_id="main", logical_id="task", node_type="task", content="qa", owner="user")
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="supporting_fact_1",
+        node_type="supporting_fact",
+        content={"title": "Ada", "sent_id": 0, "text": "Ada collaborated with Charles Babbage."},
+        owner="dataset",
+    )
+    store.add_node(
+        task_id="t",
+        branch_id="main",
+        logical_id="supporting_fact_2",
+        node_type="supporting_fact",
+        content={"title": "Charles Babbage", "sent_id": 0, "text": "Charles Babbage was born in London."},
+        owner="dataset",
+    )
+    payload = {
+        "answer": "London",
+        "bridge_entity": "Charles Babbage",
+        "cited_fact_ids": ["supporting_fact_1", "supporting_fact_2"],
+        "reasoning_chain": ["supporting_fact_1 -> Charles Babbage", "Charles Babbage -> London"],
+    }
+
+    signal = HotpotSemanticVerifier(list(store.snapshot().nodes.values())).verify(payload)
+
+    assert signal.status == "verified"
+    assert "chain_complete" in signal.checks
+    assert signal.metadata["programmatic_verifier"] == "HotpotSemanticVerifier"
 
 
 def test_hotpot_verifier_does_not_use_lexical_answer_proxy() -> None:

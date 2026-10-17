@@ -11,6 +11,7 @@ from typing import Any, Iterable
 
 from .context_slicer import _node_sort_key
 from .hotpot_bridge import bridge_candidates_from_values, bridge_matches_any, normalize_bridge
+from .hotpot_verifier import HotpotSemanticVerifier
 
 
 @dataclass(frozen=True)
@@ -599,190 +600,30 @@ def _verify_evidence(graph: Any, *, task_id: str, branch_id: str) -> Verificatio
         node for node in graph.snapshot().nodes.values()
         if node.task_id == task_id and node.branch_id == branch_id and node.is_operationally_valid()
     ]
-    facts = [
-        node for node in state_nodes
-        if node.type in {"supporting_fact", "evidence", "evidence_link"}
-    ]
-    if not facts:
-        return VerificationResult(
-            status="need_fix",
-            consistency_checks=("missing_evidence",),
-            confidence=1.0,
-            missing_evidence=("supporting_fact",),
-            verifier_source=("EvidenceVerifier", "coverage"),
-            error_type="evidence_insufficiency",
-            error_location="supporting evidence",
-            reason="No supporting evidence is visible for the answer.",
-            repair_instruction="Request or use supporting evidence before finalizing the answer.",
-            requested_fragments=("supporting_fact#content", "evidence_link#entity"),
-        )
     result = _latest(graph, task_id, branch_id, "result")
     payload = _json_value(_node_content(result)) if result is not None else None
-    if isinstance(payload, dict) and "value" in payload:
-        payload = _json_value(payload.get("value"))
-    answer = _structured_answer(payload)
-    cited_ids = _string_list(payload.get("cited_fact_ids") if isinstance(payload, dict) else None)
-    bridge = str(payload.get("bridge_entity", "")).strip() if isinstance(payload, dict) else ""
-    chain = _string_list(payload.get("reasoning_chain") if isinstance(payload, dict) else None)
-    resolver = CitationResolver(facts, visible_nodes=state_nodes)
-    fact_index = resolver.fact_index
-    bridge_candidates = _bridge_candidates(state_nodes)
-    required_missing = []
-    if not isinstance(payload, dict):
-        required_missing = ["answer", "bridge_entity", "cited_fact_ids", "reasoning_chain"]
-    else:
-        required_missing = [
-            key for key in ("answer", "bridge_entity", "cited_fact_ids", "reasoning_chain")
-            if key not in payload
-        ]
-        if not answer:
-            required_missing.append("answer_value")
-        if not cited_ids:
-            required_missing.append("cited_fact_ids_value")
-        if not bridge:
-            required_missing.append("bridge_entity_value")
-        if not chain:
-            required_missing.append("reasoning_chain_value")
-    if required_missing:
+    signal = HotpotSemanticVerifier(state_nodes).verify(payload)
+    if signal.status != "verified":
         return VerificationResult(
-            status="need_fix",
-            consistency_checks=("evidence_present", "missing_structured_citations"),
-            confidence=1.0,
-            missing_evidence=tuple(dict.fromkeys(required_missing)),
-            verifier_source=("EvidenceVerifier", "coverage"),
-            error_type="missing_evidence_chain",
-            error_location="result",
-            reason="Evidence exists, but the candidate is missing the required structured evidence chain.",
-            repair_instruction=(
-                "Typed repair request: status=need_fix error_type=missing_evidence_chain. "
-                "Return only a structured set_result.value with answer, bridge_entity, "
-                "cited_fact_ids, and reasoning_chain grounded in visible supporting facts."
-            ),
+            status=signal.status,
+            consistency_checks=signal.checks,
+            confidence=signal.confidence,
+            missing_evidence=signal.missing_evidence,
+            verifier_source=("HotpotSemanticVerifier", "programmatic_structure"),
+            error_type=signal.error_type,
+            error_location=signal.error_location,
+            reason=signal.reason,
+            repair_instruction=signal.repair_instruction,
             preserve=("question", "visible evidence"),
             requested_fragments=("result#final_value", "supporting_fact#content", "evidence_link#entity"),
-            metadata={
-                "repair_packet": {
-                    "status": "need_fix",
-                    "error_type": "missing_evidence_chain",
-                    "known": {"answer": answer},
-                    "required": ["answer", "bridge_entity", "cited_fact_ids", "reasoning_chain"],
-                    "preserve": ["question", "visible evidence"],
-                },
-            },
-        )
-    resolved_cited_ids = resolver.resolve_all(cited_ids)
-    missing = [fact_id for fact_id, resolved in zip(cited_ids, resolved_cited_ids) if resolved is None]
-    if missing:
-        return VerificationResult(
-            status="need_fix",
-            consistency_checks=("invalid_citation",),
-            confidence=1.0,
-            missing_evidence=tuple(missing),
-            verifier_source=("EvidenceVerifier", "citation_validity"),
-            error_type="invalid_citation",
-            error_location="cited_fact_ids",
-            reason=f"Candidate cites unknown supporting facts: {', '.join(missing)}.",
-            repair_instruction=(
-                "Typed repair request: status=need_fix error_type=invalid_citation. "
-                "Keep the answer only if supported, replace invalid citations with visible "
-                "supporting_fact ids, titles, or title:sent_id references, and do not invent ids."
-            ),
-            preserve=("answer", "visible evidence"),
-            requested_fragments=("result#final_value", "supporting_fact#content"),
-            metadata={
-                "repair_packet": {
-                    "status": "need_fix",
-                    "error_type": "invalid_citation",
-                    "known": {"answer": answer, "bridge_entity": bridge, "invalid_citations": missing},
-                    "required": ["visible cited_fact_ids"],
-                    "preserve": ["answer if still entailed", "visible evidence"],
-                },
-            },
-        )
-    canonical_cited_ids = [item for item in resolved_cited_ids if item is not None]
-    if len(canonical_cited_ids) < 2:
-        return VerificationResult(
-            status="need_fix",
-            consistency_checks=("citation_valid", "missing_second_hop"),
-            confidence=1.0,
-            missing_evidence=("second_hop",),
-            verifier_source=("EvidenceVerifier", "chain_completeness"),
-            error_type="missing_hop",
-            error_location="reasoning_chain",
-            reason="A multihop answer should cite at least two connected facts.",
-            repair_instruction=(
-                "Typed repair request: status=need_fix error_type=missing_hop. "
-                "Preserve the valid cited fact if useful, then add one visible supporting_fact "
-                "that connects the bridge entity to the answer."
-            ),
-            preserve=("valid citations",),
-            requested_fragments=("supporting_fact#content", "evidence_link#entity"),
-            metadata={
-                "repair_packet": {
-                    "status": "need_fix",
-                    "error_type": "missing_hop",
-                    "known": {
-                        "answer": answer,
-                        "bridge_entity": bridge,
-                        "valid_cited_fact_ids": canonical_cited_ids,
-                    },
-                    "required": [f"find one fact that connects {bridge or 'the bridge entity'} to {answer or 'the answer'}"],
-                    "repair_target": "cited_fact_ids",
-                    "must_change": {"cited_fact_ids": True},
-                    "bridge_candidates": bridge_candidates,
-                    "preserve": ["valid citations"],
-                },
-            },
-        )
-    cited_text = " ".join(_fact_text(fact_index[fact_id]) for fact_id in canonical_cited_ids)
-    bridge_present = _contains_normalized(cited_text, bridge)
-    if not bridge_present:
-        return VerificationResult(
-            status="need_fix",
-            consistency_checks=("citation_valid", "incomplete_chain"),
-            confidence=1.0,
-            missing_evidence=("bridge_entity",),
-            verifier_source=("EvidenceVerifier", "chain_completeness"),
-            error_type="wrong_bridge_entity",
-            error_location="bridge_entity",
-            reason="The cited facts do not ground the claimed bridge entity.",
-            repair_instruction=(
-                "Typed repair request: status=need_fix error_type=wrong_bridge_entity. "
-                "Choose the bridge entity explicitly supported by the cited facts, or replace "
-                "the citations with facts that support the claimed bridge."
-            ),
-            preserve=("valid citations",),
-            requested_fragments=("result#final_value", "supporting_fact#content"),
-            metadata={
-                "repair_packet": {
-                    "status": "need_fix",
-                    "error_type": "wrong_bridge_entity",
-                    "known": {
-                        "answer": answer,
-                        "claimed_bridge_entity": bridge,
-                        "valid_cited_fact_ids": canonical_cited_ids,
-                    },
-                    "required": ["select one bridge entity from bridge_candidates that is grounded in cited facts"],
-                    "repair_target": "bridge_entity",
-                    "must_change": {"bridge_entity": True},
-                    "forbidden_values": {"bridge_entity": [bridge]},
-                    "bridge_candidates": bridge_candidates,
-                    "preserve": ["valid citations only if they support the corrected bridge"],
-                },
-            },
+            metadata=signal.metadata,
         )
     return VerificationResult(
         status="verified",
-        consistency_checks=("citation_valid", "chain_complete", "semantic_entailment_delegated_to_critic"),
-        confidence=0.0,
-        verifier_source=("EvidenceVerifier", "programmatic_structure_only"),
-        metadata={
-            "answer": answer,
-            "bridge_entity": bridge,
-            "cited_fact_ids": canonical_cited_ids,
-            "raw_cited_fact_ids": cited_ids,
-            "semantic_entailment_required_from": "critic",
-        },
+        consistency_checks=signal.checks,
+        confidence=signal.confidence,
+        verifier_source=("HotpotSemanticVerifier", "programmatic_structure", "semantic_entailment_contract"),
+        metadata=signal.metadata,
     )
 
 

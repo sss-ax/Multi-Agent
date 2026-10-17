@@ -34,7 +34,9 @@ POLICY_BASELINE_ARMS = (
     "core_only",
     "random_same_budget",
     "static_utility",
+    "receiver_aware_no_closure",
     "receiver_aware_heuristic",
+    "receiver_aware_targeted_feedback",
     "send_all",
 )
 POLICY_BY_ARM = {
@@ -47,7 +49,9 @@ POLICY_BY_ARM = {
     "send_all": "send_all",
     "random_same_budget": "random_same_budget",
     "static_utility": "static_utility",
+    "receiver_aware_no_closure": "receiver_aware_no_closure",
     "receiver_aware_heuristic": "receiver_aware_heuristic",
+    "receiver_aware_targeted_feedback": "receiver_aware_targeted_feedback",
 }
 
 

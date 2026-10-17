@@ -104,6 +104,15 @@ class ReceiverAwareHeuristicPolicy(GraphCommunicationPolicy):
         )
 
 
+class ReceiverAwareNoClosurePolicy(ReceiverAwareHeuristicPolicy):
+    name = "receiver_aware_no_closure"
+    include_dependency_closure = False
+
+
+class ReceiverAwareTargetedFeedbackPolicy(ReceiverAwareHeuristicPolicy):
+    name = "receiver_aware_targeted_feedback"
+
+
 class RandomSameBudgetPolicy(GraphCommunicationPolicy):
     name = "random_same_budget"
 

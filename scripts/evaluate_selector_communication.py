@@ -35,6 +35,7 @@ POLICIES = (
 
 def evaluate_selector_communication(path: Path, *, domain: str, seed: int = 0) -> dict[str, Any]:
     source = json.loads(path.read_text(encoding="utf-8"))
+    skipped_empty_candidate_records = 0
     summaries: dict[str, dict[str, Any]] = {
         policy: {
             "correct_count": 0,
@@ -44,7 +45,14 @@ def evaluate_selector_communication(path: Path, *, domain: str, seed: int = 0) -
         for policy in POLICIES
     }
     for record in source.get("records", []):
-        deployable = deployable_candidate_records(list(record.get("candidates", [])), domain=domain)
+        deployable = deployable_candidate_records(
+            list(record.get("candidates", [])),
+            domain=domain,
+            row=record.get("row") if isinstance(record.get("row"), dict) else None,
+        )
+        if not deployable:
+            skipped_empty_candidate_records += 1
+            continue
         oracle_candidate_id = _first_correct_candidate_id(deployable)
         fragments = build_candidate_fragments(deployable)
         receiver_aware_ids = select_fragment_ids(fragments, policy="selector_receiver_aware", seed=seed)
@@ -68,11 +76,12 @@ def evaluate_selector_communication(path: Path, *, domain: str, seed: int = 0) -
                 "visible_fragment_ids": list(result.visible_fragment_ids),
                 "selection_reason": list(result.selection_reason),
             })
-    count = len(source.get("records", []))
+    count = sum(len(payload["records"]) for payload in summaries.values()) // max(1, len(POLICIES))
     compact: dict[str, Any] = {
         "domain": domain,
         "source_path": str(path),
         "count": count,
+        "skipped_empty_candidate_records": skipped_empty_candidate_records,
         "policies": {},
     }
     send_all_tokens = max(1, int(summaries["selector_send_all"]["selector_input_tokens"]))
@@ -117,7 +126,7 @@ def _first_correct_candidate_id(candidates: list[dict[str, Any]]) -> str | None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
-    parser.add_argument("--domain", required=True, choices=("gsm8k", "humaneval", "mbpp"))
+    parser.add_argument("--domain", required=True, choices=("gsm8k", "humaneval", "mbpp", "mmlu_pro", "hotpotqa"))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
