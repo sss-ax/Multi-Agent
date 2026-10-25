@@ -469,11 +469,11 @@ def _oracle_hotpot_facts(row: dict[str, Any], *, limit: int) -> list[Any]:
 
 def _guess_bridge_entity(row: dict[str, Any], candidate: Candidate) -> str:
     text = f"{candidate.answer} {candidate.text}".lower()
-    for entity in row.get("entities", []):
+    for entity in row.get("question_entities", []):
         entity_text = str(entity)
         if entity_text and entity_text.lower() in text:
             return entity_text
-    return str(row.get("entities", [""])[0] if row.get("entities") else "")
+    return str(row.get("question_entities", [""])[0] if row.get("question_entities") else "")
 
 
 def _fact_label(fact: Any) -> str:

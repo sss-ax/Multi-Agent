@@ -28,6 +28,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from workflow_runtime.protocol import PROTOCOL_VERSION
+from workflow_runtime.run_metadata import build_run_metadata
+from workflow_runtime.code_verifier import CodeVerifier
+
 
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
@@ -96,9 +100,75 @@ def _options(row: Dict[str, Any]) -> List[str]:
     return result
 
 
-def _hotpot_context(row: Dict[str, Any]) -> tuple[List[str], List[Dict[str, Any]], List[Dict[str, Any]]]:
+_HOT_POT_QUESTION_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "by", "can", "did", "does", "for",
+    "from", "has", "have", "held", "how", "in", "is", "it", "of", "on", "or",
+    "the", "that", "this", "to", "was", "were", "what", "when", "where", "which",
+    "who", "why", "with",
+}
+
+
+def extract_question_entities(question: str) -> List[str]:
+    """Extract question-side entities without consulting distractor context."""
+    text = str(question or "")
+    candidates: List[str] = []
+
+    # Quoted titles are high-confidence entities.
+    for match in re.finditer(r"[\"']([^\"']{2,120})[\"']", text):
+        value = re.sub(r"\s+", " ", match.group(1)).strip(" .,;:()[]{}")
+        if value:
+            candidates.append(value)
+
+    # Preserve identifiers such as "2014 S/S".
+    candidates.extend(re.findall(r"\b\d{4}\s+[A-Z][A-Za-z0-9-]*(?:\s*/\s*[A-Z][A-Za-z0-9-]*)?\b", text))
+
+    token = r"[A-Z][A-Za-z0-9'’./&-]*"
+    connector = r"(?:and|of|the|for|&|in)"
+    for match in re.finditer(rf"\b{token}(?:(?:\s+{connector})?\s+{token}){{0,5}}", text):
+        value = re.sub(r"\s+", " ", match.group(0)).strip(" .,;:()[]{}\"'")
+        words = value.split()
+        while words and words[0].lower() in _HOT_POT_QUESTION_STOPWORDS:
+            words.pop(0)
+        while words and words[-1].lower() in _HOT_POT_QUESTION_STOPWORDS:
+            words.pop()
+        value = " ".join(words)
+        if not value:
+            continue
+        if value.lower() in {
+            "american", "british", "canadian", "french", "german", "italian",
+            "dutch", "greek", "korean", "south korean", "new", "old",
+        }:
+            continue
+        if len(value) >= 2:
+            candidates.append(value)
+
+    expanded_candidates: List[str] = []
+    for value in candidates:
+        parts = re.split(r"\s+and\s+", value)
+        # In questions, multi-token spans joined by "and" are usually two
+        # separate entities ("Annie Morton and Terry Richardson").  Keep
+        # one-token title phrases such as "Kiss and Tell" intact.
+        if len(parts) == 2 and all(len(part.split()) >= 2 for part in parts):
+            expanded_candidates.extend(parts)
+        else:
+            expanded_candidates.append(value)
+
+    result: List[str] = []
+    for value in expanded_candidates:
+        normalized = re.sub(r"\s+", " ", value).strip()
+        if not normalized or normalized.lower() in _HOT_POT_QUESTION_STOPWORDS:
+            continue
+        if "/" in normalized and any(normalized.lower() in existing.lower() for existing in result):
+            continue
+        if all(normalized.lower() != existing.lower() for existing in result):
+            result.append(normalized)
+    return result
+
+
+def _hotpot_context(row: Dict[str, Any]) -> Dict[str, Any]:
     context = row.get("context", [])
-    entities: List[str] = []
+    context_titles: List[str] = []
+    context_entities: List[str] = []
     facts: List[Dict[str, Any]] = []
     if isinstance(context, dict):
         titles = context.get("title", [])
@@ -113,11 +183,19 @@ def _hotpot_context(row: Dict[str, Any]) -> tuple[List[str], List[Dict[str, Any]
             title, sentences = str(item.get("title", "")), item.get("sentences", item.get("text", []))
         else:
             continue
-        entities.append(title)
+        if title and title not in context_titles:
+            context_titles.append(title)
+        if title and title not in context_entities:
+            context_entities.append(title)
         if isinstance(sentences, str):
             sentences = [sentences]
         for sent_id, sentence in enumerate(sentences or []):
-            facts.append({"title": title, "sent_id": sent_id, "text": str(sentence)})
+            text = str(sentence)
+            facts.append({"title": title, "sent_id": sent_id, "text": text})
+            for entity in re.findall(r"\b[A-Z][A-Za-z0-9'’./&-]*(?:\s+[A-Z][A-Za-z0-9'’./&-]*){0,5}", text):
+                value = re.sub(r"\s+", " ", entity).strip(" .,;:()[]{}\"'")
+                if len(value) >= 2 and value not in context_entities:
+                    context_entities.append(value)
     supporting = []
     raw_supporting = row.get("supporting_facts", [])
     if isinstance(raw_supporting, dict):
@@ -129,7 +207,12 @@ def _hotpot_context(row: Dict[str, Any]) -> tuple[List[str], List[Dict[str, Any]
             supporting.append({"entity": str(item[0]), "sent_id": item[1]})
         elif isinstance(item, dict):
             supporting.append(item)
-    return entities, facts, supporting
+    return {
+        "context_titles": context_titles,
+        "context_entities": context_entities,
+        "supporting_facts": facts,
+        "evidence_links": supporting,
+    }
 
 
 def render_native_task(row: Dict[str, Any]) -> str:
@@ -138,7 +221,9 @@ def render_native_task(row: Dict[str, Any]) -> str:
         requirements = row.get("requirements", {})
         text = requirements.get("text", row.get("question", "")) if isinstance(requirements, dict) else str(requirements)
         entry_point = requirements.get("entry_point", "") if isinstance(requirements, dict) else ""
-        tests = row.get("tests", [])
+        # Official/private tests stay in EvaluationContext; only explicitly
+        # marked public tests may enter a model prompt.
+        tests = row.get("public_tests", [])
         test_lines = [str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in tests]
         lines = [
             "Write Python code that passes the tests.",
@@ -225,6 +310,7 @@ def read(path: Path, domain: str, limit: int) -> List[Dict[str, Any]]:
                 "sample_id": row.get("question_id", row.get("id", f"mmlu_pro_{len(result)}")),
                 "domain": "mmlu_pro",
                 "task_type": "multiple_choice",
+                "question_text": str(row.get("question", row.get("input", ""))),
                 "question": (
                     f"{row.get('question', row.get('input', ''))}\n\n"
                     + "\n".join(choice_lines)
@@ -235,15 +321,18 @@ def read(path: Path, domain: str, limit: int) -> List[Dict[str, Any]]:
                 "category": row.get("category", row.get("subject", "")),
             }
         elif domain == "hotpotqa":
-            entities, facts, links = _hotpot_context(row)
+            context = _hotpot_context(row)
+            question = str(row.get("question", "")).strip()
             row = {
                 "sample_id": row.get("_id", row.get("id", f"hotpotqa_{len(result)}")),
                 "domain": "hotpotqa",
                 "task_type": "multihop_qa",
-                "question": str(row.get("question", "")).strip(),
-                "entities": entities,
-                "supporting_facts": facts,
-                "evidence_links": links,
+                "question": question,
+                "question_entities": extract_question_entities(question),
+                "context_titles": context["context_titles"],
+                "context_entities": context["context_entities"],
+                "supporting_facts": context["supporting_facts"],
+                "evidence_links": context["evidence_links"],
                 "gold_answer": row.get("answer", ""),
             }
         result.append(row)
@@ -252,21 +341,45 @@ def read(path: Path, domain: str, limit: int) -> List[Dict[str, Any]]:
     return result
 
 
-def add_source_nodes(workflow: Any, graph: Any, row: Dict[str, Any], sample_id: str) -> None:
+def add_source_nodes(
+    workflow: Any,
+    graph: Any,
+    row: Dict[str, Any],
+    sample_id: str,
+    *,
+    action_protocol: str = "semantic_delta_v2",
+) -> None:
+    if action_protocol != "semantic_delta_v2":
+        raise ValueError(f"unsupported action protocol: {action_protocol}")
     task_type = row["task_type"]
     refs: Dict[str, Any] = {}
 
-    def add(logical_id: str, node_type: str, content: Any) -> None:
+    def add(
+        logical_id: str,
+        node_type: str,
+        content: Any,
+        *,
+        visibility_class: str = "public",
+        owner: str = "dataset",
+        created_by_role: str = "dataset",
+    ) -> None:
         refs[logical_id] = graph.add_node(
             task_id=sample_id,
             branch_id="main",
             logical_id=logical_id,
             node_type=node_type,
             content=content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, separators=(",", ":")),
-            owner="dataset",
+            owner=owner,
             status="ready",
             validation={"schema_valid": True},
-            created_by_role="dataset",
+            created_by_role=created_by_role,
+            provenance={
+                "origin": "source",
+                "trust": "trusted_input",
+                "visibility_class": visibility_class,
+                "source_dataset": row.get("domain", ""),
+                "sample_id": sample_id,
+            },
         )
 
     if task_type == "table_qa":
@@ -276,27 +389,60 @@ def add_source_nodes(workflow: Any, graph: Any, row: Dict[str, Any], sample_id: 
         for index, evidence in enumerate(row.get("evidence", []), start=1):
             add(f"evidence_{index}", "evidence", evidence)
     elif task_type == "multihop_qa":
-        for index, entity in enumerate(row.get("entities", []), start=1):
-            add(f"entity_{index}", "entity", {"name": entity})
-        for index, fact in enumerate(row.get("supporting_facts", row.get("evidence", [])), start=1):
-            add(f"supporting_fact_{index}", "supporting_fact", fact)
-        for index, link in enumerate(row.get("evidence_links", []), start=1):
-            add(f"evidence_link_{index}", "evidence_link", link)
+        facts = list(row.get("supporting_facts", row.get("evidence", [])))
+        for index, title in enumerate(row.get("context_titles", []), start=1):
+            add(f"document_source_{index}", "document_source", {"title": title})
+        for index, entity in enumerate(row.get("context_entities", []), start=1):
+            add(f"entity_source_{index}", "entity_source", {"name": entity})
+        for index, fact in enumerate(facts, start=1):
+            add(f"sentence_source_{index}", "sentence_source", fact)
     elif task_type == "multiple_choice":
         choices = row.get("choices", [])
+        slot_values = {}
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            label = str(choice.get("label", "")).strip().upper()
+            text = str(choice.get("text", "")).strip()
+            values = [part.strip() for part in re.split(r"\s*,\s*", text) if part.strip()]
+            slot_values[label] = values or [text]
         add("choice_schema", "choice_schema", {
             "allowed_labels": [str(choice.get("label", "")).strip().upper() for choice in choices if isinstance(choice, dict)],
+            "slot_values": slot_values,
         })
+        add("question_source", "question_source", {"task_ref": "task"})
         for index, choice in enumerate(choices, start=1):
-            add(f"choice_{index}", "choice", choice)
+            add(f"choice_source_{index}", "choice_source", choice)
     elif task_type == "code_generation":
-        add("requirements", "requirements", row.get("requirements", {"text": row["question"]}))
-        for index, test in enumerate(row.get("tests", []), start=1):
-            add(f"test_{index}", "test", test)
+        requirements = row.get("requirements", {"text": row["question"]})
+        add("requirements_source", "requirements_source", {"task_ref": "task"})
+        if isinstance(requirements, dict) and requirements.get("entry_point"):
+            add("entry_point_source", "entry_point_source", {"entry_point": requirements["entry_point"]})
+        for index, _test in enumerate(row.get("tests", []), start=1):
+            add(f"public_test_source_{index}", "public_test_source", {"test_id": index})
 
     task = graph.latest_valid(sample_id, "main", "task")
     for node in refs.values():
         graph.add_edge(source=task.node_id, target=node.node_id, relation="depends_on", created_by_role="dataset")
+
+
+def hotpot_hidden_source_row(row: Dict[str, Any], environment: Any) -> Dict[str, Any]:
+    """Build graph-visible Hotpot inputs without copying gold support labels."""
+    source_row = dict(row)
+    visible_titles = sorted({fact["title"] for fact in environment.visible_facts})
+    source_row["context_titles"] = visible_titles
+    source_row["context_entities"] = visible_titles
+    source_row["question_entities"] = extract_question_entities(source_row.get("question", ""))
+    source_row["supporting_facts"] = list(environment.visible_facts)
+    source_row["evidence_links"] = [
+        {
+            "entity": fact["title"],
+            "sent_id": fact["sent_id"],
+            "source": "visible_context_index",
+        }
+        for fact in environment.visible_facts
+    ]
+    return source_row
 
 
 def normalize_answer(value: Any) -> str:
@@ -381,17 +527,21 @@ def run_code_tests(code: str, row: Dict[str, Any]) -> Dict[str, Any]:
     setup = "\n".join(str(item.get("setup", "")) for item in tests if isinstance(item, dict))
     test_text = [item.get("text", item) if isinstance(item, dict) else item for item in tests]
     imports = prompt_imports(row.get("requirements"))
-    script = "\n".join(part for part in (imports, setup, code, "\n".join(str(test) for test in test_text)) if part)
-    try:
-        completed = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True, text=True, timeout=5)
-    except subprocess.TimeoutExpired:
-        return {"correct": False, "pass_at_1": 0.0, "predicted_answer": {"code": code, "tests_passed": False, "errors": ["python test execution timed out"]}}
-    passed = completed.returncode == 0
-    error = completed.stderr[-2000:] or completed.stdout[-2000:]
+    setup = "\n".join(part for part in (imports, setup) if part)
+    verification = CodeVerifier().verify(
+        code,
+        public_tests=test_text,
+        setup=setup,
+        timeout=5,
+    )
     return {
-        "correct": passed,
-        "pass_at_1": float(passed),
-        "predicted_answer": {"code": code, "tests_passed": passed, "errors": [] if passed else [error]},
+        "correct": verification.passed,
+        "pass_at_1": float(verification.passed),
+        "predicted_answer": {
+            "code": code,
+            "tests_passed": verification.passed,
+            "errors": [] if verification.passed else [verification.failure_summary],
+        },
     }
 
 
@@ -426,8 +576,10 @@ def is_correct(workflow: Any, row: Dict[str, Any], graph: Any) -> bool:
         if result is None:
             return False
         try:
-            value = json.loads(result.content)
-            return bool(value.get("value", {}).get("tests_passed"))
+            value = json.loads(result.content) if isinstance(result.content, str) else result.content
+            if isinstance(value, dict) and isinstance(value.get("value"), dict):
+                value = value["value"]
+            return bool(value.get("tests_passed")) if isinstance(value, dict) else False
         except (TypeError, json.JSONDecodeError, AttributeError):
             return False
     final = workflow.latest_node_by_type(graph, "final_answer")
@@ -814,6 +966,9 @@ def action_token_totals(records: List[Dict[str, Any]]) -> Dict[str, int]:
         "graph_source_cross_call_reread_tokens": 0,
         "graph_role_aware_source_ref_saved_tokens": 0,
         "graph_role_aware_state_ref_saved_tokens": 0,
+        "retry_input_tokens": 0,
+        "retry_full_replay_equivalent_tokens": 0,
+        "retry_saved_input_tokens": 0,
     }
     for record in records:
         runtime = record.get("runtime_summary", {})
@@ -821,6 +976,39 @@ def action_token_totals(records: List[Dict[str, Any]]) -> Dict[str, int]:
         totals["final_round_id_sum"] += final_round_id
         totals["max_final_round_id"] = max(totals["max_final_round_id"], final_round_id)
         totals["direct_a2a_text_tokens"] += int(runtime.get("a2a_text_tokens", 0) or 0)
+        telemetry_summary = runtime.get("telemetry_summary", {})
+        if isinstance(telemetry_summary, dict) and telemetry_summary:
+            direct_keys = (
+                "graph_update_tokens", "graph_read_context_tokens", "physical_input_tokens",
+                "physical_llm_input_tokens", "logical_input_tokens",
+                "prefill_cost_tokens", "decode_cost_tokens", "forward_calls",
+                "reasoning_round_count", "solver_revision_round_count", "critic_need_fix_count",
+                "critic_verified_count", "persistent_context_tokens", "incremental_context_tokens",
+                "logical_communication_tokens", "system_prompt_tokens", "prompt_wrapper_tokens",
+                "reusable_prefix_tokens", "unique_prefix_tokens", "repeated_prefix_tokens",
+                "simulated_context_reuse_input_tokens", "graph_context_content_tokens",
+                "graph_context_wrapper_tokens", "graph_context_edge_tokens",
+                "graph_source_duplicate_in_prompt_tokens",
+                "graph_source_duplicate_in_prompt_original_tokens",
+                "graph_source_deduplicated_prompt_saved_tokens",
+                "graph_source_cross_call_reread_tokens",
+                "graph_role_aware_source_ref_saved_tokens",
+                "graph_role_aware_state_ref_saved_tokens",
+                "retry_input_tokens", "retry_full_replay_equivalent_tokens",
+                "retry_saved_input_tokens",
+            )
+            for key in direct_keys:
+                totals[key] += int(telemetry_summary.get(key, 0) or 0)
+            physical_input = int(telemetry_summary.get("physical_input_tokens", 0) or 0)
+            output_tokens = int(telemetry_summary.get("output_tokens", 0) or 0)
+            totals["total_input_tokens"] += physical_input
+            totals["total_output_tokens"] += output_tokens
+            totals["agent_output_tokens"] += output_tokens
+            totals["peak_context_tokens"] = max(
+                totals["peak_context_tokens"],
+                int(telemetry_summary.get("peak_context_tokens", 0) or 0),
+            )
+            continue
         seen_reusable_prefix_keys: set[str] = set()
         for action_log in runtime.get("records", []):
             totals["reasoning_round_count"] += 1
@@ -881,6 +1069,9 @@ def action_token_totals(records: List[Dict[str, Any]]) -> Dict[str, int]:
                 "graph_source_cross_call_reread_tokens",
                 "graph_role_aware_source_ref_saved_tokens",
                 "graph_role_aware_state_ref_saved_tokens",
+                "retry_input_tokens",
+                "retry_full_replay_equivalent_tokens",
+                "retry_saved_input_tokens",
             ):
                 totals[key] += int(telemetry.get(key, 0) or 0)
             totals["simulated_context_reuse_input_tokens"] += max(
@@ -1079,8 +1270,9 @@ def evaluate_verifier_guided_candidates(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--domain", choices=("gsm8k", "tatqa", "hotpotqa", "mbpp", "humaneval", "mmlu_pro"), required=True)
+    parser.add_argument("--domain", choices=("gsm8k", "hotpotqa", "mbpp", "humaneval", "mmlu_pro"), required=True)
     parser.add_argument("--data-path", required=True)
+    parser.add_argument("--dataset-revision", default="")
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--max-rounds", type=int, default=3)
@@ -1094,6 +1286,8 @@ def main() -> None:
         "--communication-policy",
         choices=(
             "send_all",
+            "mandatory_only",
+            "model_selected",
             "minimal_no_feedback",
             "minimal_sendall_fallback",
             "minimal_targeted_feedback",
@@ -1124,6 +1318,28 @@ def main() -> None:
     )
     parser.add_argument("--fragment-utility-table", default="")
     parser.add_argument("--task-family", default="")
+    parser.add_argument(
+        "--communication-replay-path",
+        default="",
+        help="Append pre-communication snapshots to this JSONL file for Phase 2 training.",
+    )
+    parser.add_argument(
+        "--hotpot-hidden-evidence",
+        action="store_true",
+        help="Expose only question-ranked initial HotpotQA documents and keep the remainder in a local retrieval corpus.",
+    )
+    parser.add_argument("--hotpot-initial-titles", type=int, default=1)
+    parser.add_argument(
+        "--multihop-sentence-limit",
+        type=int,
+        default=48,
+        help="Maximum question-ranked sentence_source nodes rendered per role-aware Semantic Delta call; 0 disables the limit.",
+    )
+    parser.add_argument(
+        "--telemetry-log-dir",
+        default="",
+        help="Write per-sample JSONL model/action telemetry, including Critic raw outputs, to this directory.",
+    )
     parser.add_argument("--output", default="")
     args = parser.parse_args()
 
@@ -1152,6 +1368,19 @@ def main() -> None:
             "temperature": args.temperature,
             "top_p": args.top_p,
             "max_new_tokens": args.max_new_tokens,
+            "action_protocol": "semantic_delta_v2",
+            "run_metadata": build_run_metadata(
+                protocol_version=PROTOCOL_VERSION,
+                action_protocol="semantic_delta_v2",
+                model_id=args.model_path,
+                dataset_revision=args.dataset_revision,
+                sample_ids=[row.get("sample_id", index) for index, row in enumerate(rows)],
+                seed=args.communication_seed,
+                max_rounds=args.max_rounds,
+                max_new_tokens=args.max_new_tokens,
+                policy=args.communication_policy,
+                graph_context_mode=args.graph_context_mode,
+            ),
         })
         if args.output:
             Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -1163,18 +1392,43 @@ def main() -> None:
     from workflow_runtime.communication import make_communication_policy
     from workflow_runtime.langgraph_workflow import LangGraphWorkflow, NativeLangGraphWorkflow
     from workflow_runtime.model_backend import DirectTransformersModel, TransformersModel
+    from workflow_runtime.communication_replay import CommunicationReplayBuffer
+    from workflow_runtime.hotpot_hidden_evidence import build_hotpot_hidden_environment
+    from workflow_runtime.evaluation_context import EvaluationContext
+    from workflow_runtime.telemetry import WorkflowTelemetry
     import main as workflow
 
     model = (
-        DirectTransformersModel(args.model_path)
+        DirectTransformersModel(args.model_path, max_new_tokens=args.max_new_tokens)
         if args.execution_mode == "native_langgraph"
-        else TransformersModel(args.model_path)
+        else TransformersModel(args.model_path, max_new_tokens=args.max_new_tokens)
+    )
+    replay_buffer = (
+        CommunicationReplayBuffer(args.communication_replay_path)
+        if args.communication_replay_path else None
     )
     records: List[Dict[str, Any]] = []
     for index, row in enumerate(rows):
         sample_id = f"eval_{args.domain}_{index}"
-        task = f"[domain={row['task_type']}]\n{row['question']}"
+        task_question = row.get("question_text", row["question"])
+        task = f"[domain={row['task_type']}]\n{task_question}"
         graph = None
+        sample_telemetry = None
+        if args.execution_mode != "native_langgraph":
+            telemetry_path = None
+            if args.telemetry_log_dir:
+                telemetry_path = Path(args.telemetry_log_dir) / f"{sample_id}.jsonl"
+            sample_telemetry = WorkflowTelemetry(telemetry_path, max_output_chars=12000)
+        evaluation_context = EvaluationContext(
+            task_id=sample_id,
+            task_type=row["task_type"],
+            gold_answer=row.get("gold_answer"),
+            gold_label=row.get("gold_answer") if row["task_type"] == "multiple_choice" else None,
+            gold_supporting_facts=tuple(row.get("evidence_links", ())),
+            official_tests=tuple(row.get("tests", ())),
+            private_tests=tuple(row.get("tests", ())),
+            sample_id=str(row.get("sample_id", sample_id)),
+        )
         if args.execution_mode == "native_langgraph":
             langgraph_workflow = NativeLangGraphWorkflow(
                 model=model,
@@ -1184,8 +1438,28 @@ def main() -> None:
                 max_rounds=args.max_rounds,
             )
         else:
-            graph = workflow.init_workflow_graph(task, task_id=sample_id, task_type=row["task_type"])
-            add_source_nodes(workflow, graph, row, sample_id)
+            graph = workflow.init_workflow_graph(
+                task,
+                task_id=sample_id,
+                task_type=row["task_type"],
+            )
+            source_row = row
+            hidden_environment = None
+            if args.hotpot_hidden_evidence:
+                if args.domain != "hotpotqa":
+                    raise ValueError("--hotpot-hidden-evidence is valid only for --domain hotpotqa")
+                hidden_environment = build_hotpot_hidden_environment(
+                    row["question"],
+                    row.get("supporting_facts", ()),
+                    initial_title_count=args.hotpot_initial_titles,
+                )
+                source_row = hotpot_hidden_source_row(row, hidden_environment)
+            add_source_nodes(
+                workflow,
+                graph,
+                source_row,
+                sample_id,
+            )
             langgraph_workflow = LangGraphWorkflow(
                 store=graph,
                 model=model,
@@ -1200,7 +1474,17 @@ def main() -> None:
                     task_family=args.task_family or args.domain,
                 ),
                 communication_budget_tokens=args.communication_budget_tokens,
+                communication_replay_buffer=replay_buffer,
+                replay_external_state_provider=(
+                    (lambda environment=hidden_environment: {
+                        "hotpot_hidden_evidence": environment.as_dict(),
+                    })
+                    if hidden_environment is not None else None
+                ),
                 graph_context_mode=args.graph_context_mode,
+                evaluation_context=evaluation_context,
+                telemetry=sample_telemetry,
+                multihop_sentence_limit=args.multihop_sentence_limit,
             )
         failure = ""
         started = time.time()
@@ -1232,13 +1516,34 @@ def main() -> None:
             "scores": scores,
             "gold_answer": row.get("gold_answer"),
             "failure": failure,
+            # Preserve the exact failed model output and strict-schema retry
+            # diagnostics.  This is essential for distinguishing a model
+            # generation failure from a kernel audit/verifier failure.
+            "failure_diagnostics": (
+                {
+                    "generation_errors": sample_telemetry.summary().get("generation_error_records", [])
+                    if sample_telemetry is not None else [],
+                    "compile_errors": sample_telemetry.summary().get("compile_error_records", [])
+                    if sample_telemetry is not None else [],
+                }
+                if failure else {}
+            ),
             "latency_sec": time.time() - started,
             "runtime_summary": {
                 "records": run_result.get("logs", []),
+                **(
+                    {"telemetry_summary": sample_telemetry.summary(),
+                     "action_logs": sample_telemetry.summary().get("records", [])}
+                    if sample_telemetry is not None else {}
+                ),
             },
             "final_round_id": int(run_result.get("round_id", 0) or 0),
             "graph_nodes": len(graph.snapshot().nodes) if graph is not None else 0,
             "graph_edges": len(graph.snapshot().edges) if graph is not None else 0,
+            "communication_snapshot_count": (
+                sum(1 for snapshot in replay_buffer.snapshots() if snapshot.task_id == sample_id)
+                if replay_buffer is not None else 0
+            ),
         })
         print(f"{index + 1}/{len(rows)} correct={records[-1]['correct']} failure={failure or '-'}", flush=True)
 
@@ -1266,8 +1571,25 @@ def main() -> None:
         "domain": args.domain,
         "data_path": args.data_path,
         "execution_mode": args.execution_mode,
+        "action_protocol": "semantic_delta_v2",
         "communication_policy": args.communication_policy,
         "graph_context_mode": args.graph_context_mode,
+        "run_metadata": build_run_metadata(
+            protocol_version=PROTOCOL_VERSION,
+            action_protocol="semantic_delta_v2",
+            model_id=args.model_path,
+            dataset_revision=args.dataset_revision,
+            sample_ids=[row.get("sample_id", index) for index, row in enumerate(rows)],
+            seed=args.communication_seed,
+            max_rounds=args.max_rounds,
+            max_new_tokens=args.max_new_tokens,
+            policy=args.communication_policy,
+            graph_context_mode=args.graph_context_mode,
+        ),
+        "communication_replay_path": args.communication_replay_path,
+        "hotpot_hidden_evidence": bool(args.hotpot_hidden_evidence),
+        "hotpot_initial_titles": args.hotpot_initial_titles,
+        "multihop_sentence_limit": args.multihop_sentence_limit,
         "count": len(records),
         "accuracy_or_pass_at_1": correct / len(records),
         **metric_values,

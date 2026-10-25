@@ -11,7 +11,7 @@ import types
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .common import (
     BaselineMessage,
@@ -29,6 +29,7 @@ class AFlowModelRequest:
     session_id: str
     session_reset: bool = True
     session_rollback: bool = False
+    timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -289,26 +290,98 @@ class AFlowSearchRunner:
 class _AFlowLLMBridge:
     """AFlow AsyncLLM-compatible wrapper around the repository model callable."""
 
-    def __init__(self, model: Any, tokenizer: Any) -> None:
+    def __init__(
+        self,
+        model: Any,
+        tokenizer: Any,
+        *,
+        call_timeout_seconds: float | None = None,
+        event_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.calls: list[dict[str, Any]] = []
+        self.call_timeout_seconds = call_timeout_seconds
+        self.event_callback = event_callback
+        self.call_context: dict[str, Any] = {}
+
+    def set_call_context(self, **context: Any) -> None:
+        self.call_context = dict(context)
+
+    def _emit(self, event: dict[str, Any]) -> None:
+        if self.event_callback is not None:
+            self.event_callback(event)
 
     async def __call__(self, prompt: str) -> str:
-        output = str(
-            self.model(
-                AFlowModelRequest(
-                    prompt=prompt,
-                    session_prompt=prompt,
-                    session_id=f"external:aflow:{len(self.calls) + 1}",
+        call_number = len(self.calls) + 1
+        render_prompt = getattr(self.model, "render_prompt", None)
+        rendered_prompt = render_prompt(prompt) if callable(render_prompt) else prompt
+        input_tokens = count_tokens(self.tokenizer, rendered_prompt)
+        started = time.monotonic()
+        self._emit({
+            "event": "start",
+            "call_number": call_number,
+            "input_tokens": input_tokens,
+            "timeout_seconds": self.call_timeout_seconds,
+            **self.call_context,
+        })
+        try:
+            output = str(
+                self.model(
+                    AFlowModelRequest(
+                        prompt=prompt,
+                        session_prompt=prompt,
+                        session_id=f"external:aflow:{call_number}",
+                        timeout_seconds=self.call_timeout_seconds,
+                    )
                 )
             )
-        )
-        self.calls.append({
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            call = {
+                "prompt": prompt,
+                "output": "",
+                "input_tokens": input_tokens,
+                "output_tokens": 0,
+                "elapsed_seconds": elapsed,
+                "timed_out": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                **self.call_context,
+            }
+            self.calls.append(call)
+            self._emit({
+                "event": "error",
+                "call_number": call_number,
+                "input_tokens": input_tokens,
+                "output_tokens": 0,
+                "elapsed_seconds": elapsed,
+                "error": call["error"],
+                **self.call_context,
+            })
+            raise
+        elapsed = time.monotonic() - started
+        model_metrics = dict(getattr(self.model, "last_call_metrics", {}) or {})
+        input_tokens = int(model_metrics.get("physical_input_tokens", input_tokens))
+        timed_out = bool(model_metrics.get("timed_out", False))
+        call = {
             "prompt": prompt,
             "output": output,
-            "input_tokens": count_tokens(self.tokenizer, prompt),
+            "input_tokens": input_tokens,
             "output_tokens": count_tokens(self.tokenizer, output),
+            "elapsed_seconds": elapsed,
+            "timed_out": timed_out,
+            "chat_template_applied": bool(model_metrics.get("chat_template_applied", False)),
+            **self.call_context,
+        }
+        self.calls.append(call)
+        self._emit({
+            "event": "timeout" if timed_out else "end",
+            "call_number": call_number,
+            "input_tokens": call["input_tokens"],
+            "output_tokens": call["output_tokens"],
+            "elapsed_seconds": elapsed,
+            "timed_out": timed_out,
+            **self.call_context,
         })
         return output
 
@@ -329,6 +402,7 @@ class _AFlowLLMBridge:
             "total_tokens": input_tokens + output_tokens,
             "total_cost": 0.0,
             "call_count": len(self.calls),
+            "timeout_count": sum(bool(call.get("timed_out")) for call in self.calls),
             "history": list(self.calls),
         }
 

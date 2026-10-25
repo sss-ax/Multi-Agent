@@ -1,160 +1,73 @@
-from pathlib import Path
-import json
-import sys
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
 import pytest
 
 from workflow_runtime.protocol import (
     PROTOCOL_VERSION,
     action_contract,
-    normalize_action_payload,
     parse_action,
     render_role_context,
-    require_exact_copy,
     validate_action,
 )
 
 
-def test_action_protocol_accepts_one_planner_action() -> None:
-    action = {"op": "add_fact", "id": "A", "value": 2}
+def test_protocol_accepts_only_typed_planner_action() -> None:
+    action = {
+        "op": "plan",
+        "facts": [{"content": "Alice has 2 apples", "source": "task", "quote": "2 apples"}],
+        "strategy": "add the stated quantities",
+    }
     assert validate_action("planner", action, task_type="numeric_solve") == []
-    assert parse_action('{"op":"add_fact","id":"A","value":2}', role="planner", task_type="numeric_solve") == action
-    assert PROTOCOL_VERSION == "workflow-action/1.0"
+    assert parse_action(__import__("json").dumps(action), role="planner", task_type="numeric_solve") == action
+    assert PROTOCOL_VERSION == "semantic-delta/2.0"
 
 
-def test_action_protocol_rejects_non_action_objects_and_wrong_roles() -> None:
-    assert validate_action("planner", {"protocol_version": PROTOCOL_VERSION}, task_type="numeric_solve")
-    assert validate_action("planner", {"op": "verify", "target": "result", "status": "verified"}, task_type="numeric_solve")
+def test_protocol_rejects_old_actions_and_wrapped_json() -> None:
+    assert validate_action("planner", {"op": "add_fact", "id": "A", "value": 2}, task_type="numeric_solve")
+    assert validate_action("critic", {"op": "verify", "target": "result", "status": "verified"}, task_type="numeric_solve")
+    assert validate_action("final_solver", {"op": "answer", "source": "result", "value": 5}, task_type="numeric_solve")
     with pytest.raises(ValueError):
-        parse_action("```json\n{\"op\":\"done\"}\n```", role="planner", task_type="numeric_solve")
+        parse_action('```json\n{"op":"done"}\n```', role="planner", task_type="numeric_solve")
 
 
-def test_action_fields_are_exact_and_task_is_not_an_operation() -> None:
-    assert validate_action("planner", {"op": "add_fact", "id": "A", "value": 2, "version": 1}, task_type="numeric_solve")
-    assert validate_action("planner", {"op": "add_node", "node_type": "task"}, task_type="numeric_solve")
-    assert validate_action("solver", {"op": "set_execution", "content": {}, "success": "true"}, task_type="code_generation")
+def test_domain_solver_and_critic_actions_are_role_scoped() -> None:
+    choice = {
+        "op": "choose_option", "answer": "B",
+        "slot_reasons": [{"slot": 1, "reason": "B fits"}],
+        "eliminated_options": {"A": "A contradicts the question"}, "confidence": 0.75,
+    }
+    judgment = {
+        "op": "audit_choice",
+        "selected_option_check": {"status": "supported", "reason": "B is supported"},
+        "slot_checks": [{"slot": 1, "status": "supported", "reason": "B fits"}],
+        "eliminated_checks": [{"option": "A", "status": "contradicted", "reason": "A conflicts"}],
+        "summary": "The candidate claims were checked.",
+    }
+    assert validate_action("solver", choice, task_type="multiple_choice") == []
+    assert validate_action("critic", judgment, task_type="multiple_choice") == []
+    assert validate_action("planner", choice, task_type="multiple_choice")
+    assert validate_action("solver", judgment, task_type="multiple_choice")
 
 
-def test_domain_qa_solver_results_require_structured_verifier_inputs() -> None:
-    assert validate_action("solver", {"op": "set_result", "id": "answer", "value": "B"}, task_type="multiple_choice")
-    assert validate_action(
-        "solver",
-        {
-            "op": "set_result",
-            "id": "answer",
-            "value": {
-                "answer": "B",
-                "solver_choice": "B",
-                "independent_choice": "B",
-                "option_analysis": {"B": {"support": ["reason"], "contradiction": []}},
-                "confidence": 0.8,
-            },
-        },
-        task_type="multiple_choice",
-    ) == []
-    assert validate_action("solver", {"op": "set_result", "id": "answer", "value": "London"}, task_type="multihop_qa")
-    assert validate_action(
-        "solver",
-        {
-            "op": "set_result",
-            "id": "answer",
-            "value": {
-                "answer": "London",
-                "bridge_entity": "Charles Babbage",
-                "cited_fact_ids": ["supporting_fact_1", "supporting_fact_2"],
-                "reasoning_chain": ["hop 1", "hop 2"],
-            },
-        },
-        task_type="multihop_qa",
-    ) == []
-
-
-def test_multihop_set_result_normalization_moves_top_level_fields_into_value() -> None:
-    action = normalize_action_payload({
-        "op": "set_result",
-        "id": "answer",
-        "value": {"answer": "London"},
-        "bridge_entity": "Charles Babbage",
-        "reasoning_chain": ["hop1", "hop2"],
-    })
-
-    assert action == {
-        "op": "set_result",
-        "id": "answer",
-        "value": {
-            "answer": "London",
-            "bridge_entity": "Charles Babbage",
-            "cited_fact_ids": [],
-            "reasoning_chain": ["hop1", "hop2"],
+def test_multihop_repair_patch_has_bounded_shape() -> None:
+    valid = {
+        "op": "repair_patch",
+        "action": "PATCH_CITATIONS",
+        "patch": {
+            "selected_fact_ids": ["sentence_source_1", "sentence_source_2"],
+            "preserve_answer": True,
+            "reasoning_chain": ["first hop", "second hop"],
         },
     }
-    assert validate_action("solver", action, task_type="multihop_qa") == []
+    assert validate_action("solver", valid, task_type="multihop_qa") == []
+    one_citation = {**valid, "patch": {**valid["patch"], "selected_fact_ids": ["sentence_source_1"]}}
+    assert validate_action("solver", one_citation, task_type="multihop_qa")
 
 
-def test_need_fix_verify_requires_structured_repair_feedback() -> None:
-    bare = {"op": "verify", "target": "result", "status": "need_fix"}
-    assert validate_action("critic", bare, task_type="code_generation")
-
-    detailed = {
-        "op": "verify",
-        "target": "result",
-        "status": "need_fix",
-        "error_type": "boundary_condition",
-        "error_location": "function body",
-        "reason": "The empty input case raises an index error.",
-        "repair_instruction": "Handle the empty list before reading the last element.",
-        "preserve": ["function signature"],
-        "requested_fragments": ["code#function_body"],
-    }
-    assert validate_action("critic", detailed, task_type="code_generation") == []
-
-
-def test_verify_reason_normalizes_structured_payload_before_validation() -> None:
-    action = parse_action(
-        json.dumps({
-            "op": "verify",
-            "target": "result",
-            "status": "verified",
-            "reason": {
-                "hop1_conclusion": "A points to B.",
-                "hop2_conclusion": "B points to C.",
-                "derived_answer": "C",
-                "candidate_answer": "C",
-                "match": True,
-                "contradiction": False,
-            },
-            "error_type": None,
-            "error_location": 0,
-            "repair_instruction": None,
-            "preserve": [],
-            "requested_fragments": [],
-        }),
-        role="critic",
-        task_type="multihop_qa",
-    )
-
-    assert isinstance(action["reason"], str)
-    assert json.loads(action["reason"])["derived_answer"] == "C"
-    assert action["error_type"] == ""
-    assert action["error_location"] == "0"
-    assert action["repair_instruction"] == ""
-
-
-def test_action_contract_is_role_scoped() -> None:
-    contract = action_contract("planner", "numeric_solve")
-    assert "add_fact" in contract
-    assert "GraphStore node IDs" in contract
+def test_action_contract_exposes_only_semantic_fields() -> None:
+    contract = action_contract("critic", "code_generation")
+    assert '"op":"diagnose_code"' in contract
+    assert "verification nodes" not in contract
+    assert "temporary IDs" in contract
     assert "exactly one JSON object" in contract
-
-
-def test_final_answer_must_be_exactly_executor_value() -> None:
-    require_exact_copy("18", 18)
-    with pytest.raises(ValueError):
-        require_exact_copy("44", 18)
 
 
 def test_role_contexts_use_canonical_runtime_grammar() -> None:
@@ -164,6 +77,5 @@ def test_role_contexts_use_canonical_runtime_grammar() -> None:
         "query_spec": {"task_type": "numeric_solve"},
         "facts": [],
         "plan": "add",
-        "plan_steps": [],
     })
-    assert "<PLAN_STEPS>[]</PLAN_STEPS>" in solver_context
+    assert "<PLAN>add</PLAN>" in solver_context

@@ -128,7 +128,7 @@ class HotpotSemanticVerifier:
         self.state_nodes = sorted(state_nodes, key=_node_sort_key)
         self.facts = [
             node for node in self.state_nodes
-            if getattr(node, "type", "") in {"supporting_fact", "evidence", "evidence_link"}
+            if getattr(node, "type", "") in {"supporting_fact", "sentence_source", "evidence", "evidence_link"}
         ]
         self.resolver = HotpotCitationResolver(self.facts, visible_nodes=self.state_nodes)
         self.bridge_candidates = self._bridge_candidates()
@@ -160,8 +160,8 @@ class HotpotSemanticVerifier:
                 error_location="result",
                 reason="Evidence exists, but the candidate is missing the required structured evidence chain.",
                 repair_instruction=(
-                    "Return a structured set_result.value with answer, bridge_entity, "
-                    "cited_fact_ids, and reasoning_chain grounded in visible supporting facts."
+                    "Emit answer_with_evidence with answer, bridge_entity, citations, and "
+                    "reasoning grounded in visible sentence_source facts."
                 ),
                 missing=missing,
                 packet={
@@ -294,7 +294,7 @@ class HotpotSemanticVerifier:
                     values.extend(content.get(key) for key in ("name", "entity", "title", "value"))
                 else:
                     values.append(content)
-            elif getattr(node, "type", "") in {"supporting_fact", "evidence", "evidence_link"} and isinstance(content, dict):
+            elif getattr(node, "type", "") in {"supporting_fact", "sentence_source", "evidence", "evidence_link"} and isinstance(content, dict):
                 values.extend(content.get(key) for key in ("title", "entity"))
             if len(values) >= limit * 2:
                 break

@@ -1,0 +1,177 @@
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of max_aggregate
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of sum_Of_product
+test_error of remove_duplicates
+test_error of remove_duplicates
+test_error of remove_duplicates
+test_error of remove_duplicates
+test_error of file_name_check
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of max_aggregate
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of sum_Of_product
+test_error of find_substring
+sector_area name 'math' is not defined
+test_error of count_vowels
+test_error of count_vowels
+test_error of count_vowels
+test_error of count_vowels
+test_error of find_First_Missing
+test_error of combinations_list
+test_error of combinations_list
+test_error of combinations_list
+test_error of combinations_list
+common_in_nested_lists 'int' object is not iterable
+common_in_nested_lists 'int' object is not iterable
+common_in_nested_lists 'int' object is not iterable
+common_in_nested_lists 'int' object is not iterable
+check_K argument of type 'int' is not iterable
+check_K argument of type 'int' is not iterable
+check_K argument of type 'int' is not iterable
+check_K argument of type 'int' is not iterable
+test_error of comb_sort
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+test_error of remove_Occ
+test_error of all_Bits_Set_In_The_Given_Range
+test_error of all_Bits_Set_In_The_Given_Range
+test_error of all_Bits_Set_In_The_Given_Range
+test_error of all_Bits_Set_In_The_Given_Range
+find_combinations unsupported operand type(s) for +: 'int' and 'tuple'
+find_combinations name 'r' is not defined
+find_combinations unsupported operand type(s) for +: 'int' and 'tuple'
+find_combinations unsupported operand type(s) for +: 'int' and 'tuple'
+test_error of even_bit_set_number
+test_error of even_bit_set_number
+test_error of even_bit_set_number
+test_error of even_bit_set_number
+test_error of re_arrange_array
+test_error of re_arrange_array
+test_error of re_arrange_array
+test_error of re_arrange_array
+concatenate_tuple concatenate_tuple() missing 1 required positional argument: 'delimiter'
+concatenate_tuple concatenate_tuple() missing 1 required positional argument: 'delimiter'
+concatenate_tuple concatenate_tuple() missing 1 required positional argument: 'delimiter'
+concatenate_tuple concatenate_tuple() missing 1 required positional argument: 'delimiter'
+min_Swaps sum() missing 1 required positional argument: 'b'
+min_Swaps sum() missing 1 required positional argument: 'b'
+min_Swaps sum() missing 1 required positional argument: 'b'
+min_Swaps sum() missing 1 required positional argument: 'b'
+test_error of max_sum_increasing_subseq
+test_error of max_sum_increasing_subseq
+find_adverb_position name 'find_adverb_position' is not defined
+test_error of find_adverb_position
+test_error of find_adverb_position
+test_error of find_adverb_position
+larg_nnum larg_nnum() missing 1 required positional argument: 'n'
+larg_nnum larg_nnum() missing 1 required positional argument: 'n'
+larg_nnum larg_nnum() missing 1 required positional argument: 'n'
+larg_nnum larg_nnum() missing 1 required positional argument: 'n'
+test_error of difference
+test_error of remove_kth_element
+test_error of remove_kth_element
+test_error of remove_kth_element
+test_error of remove_kth_element
+test_error of loss_amount
+test_error of loss_amount
+test_error of remove_duplicates
+test_error of remove_duplicates
+test_error of remove_duplicates
+test_error of remove_duplicates
+test_error of file_name_check
+test_error of encode
+test_error of encode
+test_error of encode
+test_error of encode
+test_error of encode
+test_error of encode
+test_error of encode
+test_error of encode
+fruit_distribution invalid literal for int() with base 10: 'apples'
+test_error of circular_shift
+test_error of circular_shift
+test_error of circular_shift
+test_error of circular_shift
+test_error of anti_shuffle
+test_error of anti_shuffle
+test_error of anti_shuffle
+test_error of anti_shuffle
+test_error of car_race_collision
+test_error of car_race_collision
+test_error of car_race_collision
+test_error of car_race_collision
+test_error of car_race_collision
+test_error of car_race_collision
+test_error of car_race_collision
+test_error of car_race_collision
+test_error of car_race_collision
+test_error of car_race_collision
+test_error of car_race_collision
+test_error of car_race_collision
+test_error of car_race_collision
+test_error of car_race_collision
+test_error of car_race_collision
+test_error of car_race_collision
+test_error of simplify
+test_error of simplify
+test_error of simplify
+test_error of count_nums
+test_error of count_nums
+test_error of count_nums
+test_error of count_nums
+test_error of median
+test_error of median
+test_error of median
+test_error of median
+sort_third '[' was never closed (<string>, line 12)
+sort_third '[' was never closed (<string>, line 12)
+sort_third '[' was never closed (<string>, line 12)
+sort_third '[' was never closed (<string>, line 12)
+test_error of make_a_pile
+test_error of intersection
+test_error of iscube
+iscube type complex doesn't define __round__ method
+iscube type complex doesn't define __round__ method
+iscube type complex doesn't define __round__ method
+test_error of exchange
+test_error of exchange
+test_error of exchange
+test_error of bf
+bf expected an indented block after function definition on line 13 (<string>, line 16)
+test_error of bf
+bf expected an indented block after function definition on line 13 (<string>, line 16)
+test_error of bf
+bf expected an indented block after function definition on line 13 (<string>, line 16)
+test_error of bf
+bf expected an indented block after function definition on line 13 (<string>, line 16)
+test_error of odd_count
+test_error of odd_count
+test_error of odd_count
+test_error of odd_count
+test_error of odd_count
+test_error of odd_count
+test_error of odd_count
+test_error of odd_count
+test_error of fix_spaces
+test_error of fix_spaces
+test_error of fix_spaces
+test_error of fix_spaces
+test_error of fix_spaces
+test_error of fix_spaces
+test_error of fix_spaces
+test_error of fix_spaces
+test_error of fix_spaces
+test_error of fix_spaces
+test_error of fix_spaces
+test_error of fix_spaces

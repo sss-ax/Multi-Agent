@@ -189,8 +189,10 @@ def summarize(items: list[dict[str, Any]]) -> dict[str, Any]:
         "gold_hop1_selected": rate("gold_hop1_selected"),
         "gold_hop2_selected": rate("gold_hop2_selected"),
         "gold_hop1_hop2_both_in_pool": rate("gold_hop1_hop2_both_in_pool"),
+        "gold_hop1_hop2_co_located": rate("gold_hop1_hop2_co_located"),
         "gold_pair_constructed": rate("gold_pair_constructed"),
         "pair_recall_given_hop1_hop2": _conditional_rate(items, "gold_pair_constructed", "gold_hop1_hop2_both_in_pool"),
+        "pair_recall_given_co_location": _conditional_rate(items, "gold_pair_constructed", "gold_hop1_hop2_co_located"),
         "bridge_entity_gold_fact1_recall": rate("bridge_entity_gold_fact1_recall"),
         "bridge_entity_inferred_bridge_correct": rate("bridge_entity_inferred_bridge_correct"),
         "bridge_entity_gold_fact2_recall_given_correct_bridge": _conditional_rate(
@@ -264,7 +266,12 @@ def audit_hop_binding(candidates: list[dict[str, Any]], gold_ordered: list[str])
     selected_hop1 = {str(item["cited_fact_ids"][0]) for item in candidates if item.get("cited_fact_ids")}
     selected_hop2 = {str(item["cited_fact_ids"][1]) for item in candidates if len(item.get("cited_fact_ids", [])) > 1}
     pair_ranks = []
+    co_located = False
     for candidate in candidates:
+        candidate_hop1_ids = _pool_ids([candidate], "hop1_pool")
+        candidate_hop2_ids = _pool_ids([candidate], "hop2_pool")
+        if gold_hop1 and gold_hop2 and gold_hop1 in candidate_hop1_ids and gold_hop2 in candidate_hop2_ids:
+            co_located = True
         for index, pair in enumerate(candidate.get("chain_pair_pool", []), start=1):
             if not isinstance(pair, dict):
                 continue
@@ -283,6 +290,7 @@ def audit_hop_binding(candidates: list[dict[str, Any]], gold_ordered: list[str])
         "gold_hop1_hop2_both_in_pool": bool(
             gold_hop1 and gold_hop2 and gold_hop1 in hop1_pool_ids and gold_hop2 in hop2_pool_ids
         ),
+        "gold_hop1_hop2_co_located": co_located,
         "gold_pair_constructed": bool(pair_ranks),
         "gold_pair_rank": min(pair_ranks) if pair_ranks else None,
     }

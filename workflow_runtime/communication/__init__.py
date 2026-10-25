@@ -4,6 +4,7 @@ from .base import GraphCommunicationPolicy
 from .fragment_ablation import FragmentAblationPolicy, FRAGMENT_ABLATION_POLICY_PREFIX, FRAGMENT_ABLATION_TARGETS
 from .heuristic import ClosureAwareHeuristicPolicy
 from .minimal import MinimalNoFeedbackPolicy, MinimalSendAllFallbackPolicy, MinimalTargetedFeedbackPolicy
+from .model_selected import MandatoryOnlyPolicy, ModelSelectedPolicy
 from .random_keep import RandomKeepPolicy
 from .send_all import SendAllPolicy
 from .utility import (
@@ -21,6 +22,8 @@ __all__ = [
     "MinimalNoFeedbackPolicy",
     "MinimalSendAllFallbackPolicy",
     "MinimalTargetedFeedbackPolicy",
+    "MandatoryOnlyPolicy",
+    "ModelSelectedPolicy",
     "RandomKeepPolicy",
     "ClosureAwareHeuristicPolicy",
     "FragmentAblationPolicy",
@@ -55,6 +58,10 @@ def make_communication_policy(
         utility_table = UtilityTable.from_path(utility_table_path, task_family=task_family)
     if key == "send_all":
         return SendAllPolicy()
+    if key == "mandatory_only":
+        return MandatoryOnlyPolicy()
+    if key == "model_selected":
+        return ModelSelectedPolicy()
     if key == "minimal_no_feedback":
         return MinimalNoFeedbackPolicy()
     if key == "minimal_sendall_fallback":

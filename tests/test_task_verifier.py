@@ -176,7 +176,7 @@ def test_choice_verifier_rejects_bare_choice_label() -> None:
     assert signal.error_type == "missing_semantic_option_verification"
 
 
-def test_choice_verifier_uses_structured_independent_option_analysis() -> None:
+def test_choice_verifier_requires_structured_slot_analysis() -> None:
     store = GraphStore()
     store.add_node(task_id="t", branch_id="main", logical_id="task", node_type="task", content="mcq", owner="user")
     for label in ("A", "B"):
@@ -198,11 +198,8 @@ def test_choice_verifier_uses_structured_independent_option_analysis() -> None:
             "value": {
                 "answer": "B",
                 "solver_choice": "B",
-                "independent_choice": "B",
-                "option_analysis": {
-                    "A": {"support": [], "contradiction": ["not supported"]},
-                    "B": {"support": ["supported"], "contradiction": []},
-                },
+                "slot_analysis": [{"slot": 1, "selected_term": "option B", "reason": "supported"}],
+                "eliminated_options": {"A": "not supported"},
                 "confidence": 0.8,
             },
         },
@@ -211,12 +208,12 @@ def test_choice_verifier_uses_structured_independent_option_analysis() -> None:
 
     signal = verify_task_candidate("multiple_choice", store, task_id="t", branch_id="main")
 
-    assert signal.status == "verified"
-    assert "independent_choice_agrees" in signal.consistency_checks
-    assert signal.metadata["independent_choice"] == "B"
+    assert signal.status == "uncertain"
+    assert "slot_analysis_present" in signal.consistency_checks
+    assert signal.metadata["slot_analysis_present"] is True
 
 
-def test_choice_verifier_rejects_structured_disagreement() -> None:
+def test_choice_verifier_rejects_missing_structured_slot_analysis() -> None:
     store = GraphStore()
     store.add_node(task_id="t", branch_id="main", logical_id="task", node_type="task", content="mcq", owner="user")
     for label in ("A", "B"):
@@ -238,11 +235,8 @@ def test_choice_verifier_rejects_structured_disagreement() -> None:
             "value": {
                 "answer": "B",
                 "solver_choice": "B",
-                "independent_choice": "A",
-                "option_analysis": {
-                    "A": {"support": ["supported"], "contradiction": []},
-                    "B": {"support": [], "contradiction": ["not supported"]},
-                },
+                "slot_analysis": [],
+                "eliminated_options": {},
                 "confidence": 0.8,
             },
         },
@@ -252,7 +246,7 @@ def test_choice_verifier_rejects_structured_disagreement() -> None:
     signal = verify_task_candidate("multiple_choice", store, task_id="t", branch_id="main")
 
     assert signal.status == "need_fix"
-    assert signal.error_type == "semantic_disagreement"
+    assert signal.error_type == "missing_semantic_option_verification"
 
 
 def test_hotpot_verifier_requires_structured_citations() -> None:

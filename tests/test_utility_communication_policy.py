@@ -17,7 +17,7 @@ def _workflow(policy_name: str, *, table: dict, task_family: str = "humaneval"):
         store=store,
         model=lambda request: {},
         task_id="t",
-        task_type=task_family,
+        task_type="code_generation",
         communication_policy=make_communication_policy(
             policy_name,
             utility_table_path=None,

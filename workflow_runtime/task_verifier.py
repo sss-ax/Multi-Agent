@@ -520,19 +520,45 @@ def _verify_choice(graph: Any, *, task_id: str, branch_id: str) -> VerificationR
     if not isinstance(payload, dict):
         return _choice_structure_need_fix("Result must be a structured option-verification object.")
     missing = [
-        key for key in ("answer", "solver_choice", "independent_choice", "option_analysis", "confidence")
+        key for key in ("answer", "solver_choice", "slot_analysis", "eliminated_options", "confidence")
         if key not in payload
     ]
-    option_analysis = payload.get("option_analysis")
-    if missing or not isinstance(option_analysis, dict) or not option_analysis:
+    slot_analysis = payload.get("slot_analysis")
+    eliminated_options = payload.get("eliminated_options")
+    structural_errors: list[str] = []
+    if not isinstance(slot_analysis, list) or not slot_analysis:
+        structural_errors.append("slot_analysis must be a non-empty array")
+    else:
+        seen_slots: set[int] = set()
+        for index, item in enumerate(slot_analysis):
+            if not isinstance(item, dict) or set(item) != {"slot", "selected_term", "reason"}:
+                structural_errors.append(f"slot_analysis[{index}] must contain slot, selected_term, reason")
+                continue
+            slot = item.get("slot")
+            if isinstance(slot, bool) or not isinstance(slot, int) or slot < 1:
+                structural_errors.append(f"slot_analysis[{index}].slot must be a positive integer")
+            elif slot in seen_slots:
+                structural_errors.append(f"slot_analysis contains duplicate slot {slot}")
+            else:
+                seen_slots.add(slot)
+            for field in ("selected_term", "reason"):
+                if not isinstance(item.get(field), str) or not item[field].strip():
+                    structural_errors.append(f"slot_analysis[{index}].{field} must be non-empty")
+    if not isinstance(eliminated_options, dict) or not eliminated_options:
+        structural_errors.append("eliminated_options must be a non-empty object")
+    else:
+        for option, reason in eliminated_options.items():
+            if not isinstance(option, str) or not option.strip():
+                structural_errors.append("eliminated_options keys must be non-empty strings")
+            if not isinstance(reason, str) or not reason.strip():
+                structural_errors.append(f"eliminated_options[{option!r}] must have a non-empty reason")
+    if missing or structural_errors:
         reason = (
             f"Structured option verification is incomplete; missing keys: {', '.join(missing)}."
-            if missing else
-            "Structured option verification requires a non-empty option_analysis object."
+            if missing else "; ".join(structural_errors)
         )
         return _choice_structure_need_fix(reason)
 
-    independent = _choice_label(payload.get("independent_choice"))
     solver_choice = _choice_label(payload.get("solver_choice"))
     if solver_choice and solver_choice != label:
         return VerificationResult(
@@ -544,53 +570,22 @@ def _verify_choice(graph: Any, *, task_id: str, branch_id: str) -> VerificationR
             error_location="solver_choice",
             reason=f"Result answer is {label}, but solver_choice is {solver_choice}.",
             repair_instruction="Make answer and solver_choice agree before verification.",
-            preserve=("question", "choices", "option_analysis"),
+            preserve=("question", "choices", "slot_analysis", "eliminated_options"),
             requested_fragments=("result#final_value", "choice#text"),
-        )
-    if labels and independent not in labels:
-        return VerificationResult(
-            status="need_fix",
-            consistency_checks=("invalid_independent_choice_label",),
-            confidence=1.0,
-            verifier_source=("ChoiceVerifier", "semantic_option_verifier"),
-            error_type="invalid_option_analysis",
-            error_location="independent_choice",
-            reason=f"Independent choice {independent!r} is not one of the available options.",
-            repair_instruction="Re-run option analysis and choose exactly one available option label.",
-            preserve=("question", "choices"),
-            requested_fragments=("result#final_value", "choice#label"),
-            metadata={"solver_choice": label, "independent_choice": independent},
-        )
-    if independent != label:
-        return VerificationResult(
-            status="need_fix",
-            consistency_checks=("independent_choice_disagrees",),
-            confidence=float(payload.get("confidence", 0.8) or 0.8),
-            verifier_source=("ChoiceVerifier", "semantic_option_verifier"),
-            error_type="semantic_disagreement",
-            error_location="final choice",
-            reason=f"Solver chose {label}, but independent option analysis chose {independent}.",
-            repair_instruction=(
-                "Revise the answer using the independent option analysis; include support "
-                "and contradiction for the competing options."
-            ),
-            preserve=("question", "choices", "option_analysis"),
-            requested_fragments=("result#final_value", "choice#text"),
-            metadata={
-                "solver_choice": label,
-                "independent_choice": independent,
-                "option_analysis_present": True,
-            },
         )
     return VerificationResult(
-        status="verified",
-        consistency_checks=("option_valid", "independent_choice_agrees", "option_analysis_present"),
-        confidence=0.85,
+        # Structure alone cannot establish the semantic correctness of an
+        # open-book multiple-choice answer. The Critic's audit is the only
+        # model-facing semantic check; the kernel must not treat a well-shaped
+        # candidate as verified before that audit is aggregated.
+        status="uncertain",
+        consistency_checks=("option_valid", "slot_analysis_present", "eliminated_options_present"),
+        confidence=0.5,
         verifier_source=("ChoiceVerifier", "semantic_option_verifier"),
         metadata={
             "solver_choice": label,
-            "independent_choice": independent,
-            "option_analysis_present": True,
+            "slot_analysis_present": True,
+            "eliminated_options_present": True,
         },
     )
 
@@ -650,8 +645,8 @@ def _choice_structure_need_fix(reason: str) -> VerificationResult:
         error_location="option analysis",
         reason=reason,
         repair_instruction=(
-            "Return set_result.value as an object with answer, solver_choice, independent_choice, "
-            "option_analysis, and confidence; support or contradict each plausible option."
+            "Emit choose_option with answer, slot_analysis, eliminated_options, and confidence; "
+            "justify each selected slot and eliminate at least one competing option."
         ),
         preserve=("question", "choices"),
         requested_fragments=("result#final_value", "choice#text"),

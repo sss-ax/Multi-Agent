@@ -199,11 +199,16 @@ def _solver_versions(record: dict[str, Any]) -> list[dict[str, Any]]:
     logs = record.get("runtime_summary", {}).get("records", [])
     for index, log in enumerate(logs):
         action = log.get("action", {})
-        if log.get("role") == "solver" and isinstance(action, dict) and action.get("op") == "set_result":
+        if log.get("role") == "solver" and isinstance(action, dict) and action.get("op") == "answer_with_evidence":
             versions.append({
                 "log_index": index,
                 "mode": log.get("mode", ""),
-                "value": action.get("value"),
+                "value": {
+                    "answer": action.get("answer"),
+                    "bridge_entity": action.get("bridge_entity"),
+                    "cited_fact_ids": action.get("citations", []),
+                    "reasoning_chain": action.get("reasoning", []),
+                },
             })
     return versions
 
@@ -328,7 +333,7 @@ def _gold_bridge_values(row: dict[str, Any]) -> set[str]:
 
 def _offline_bridge_candidates(row: dict[str, Any], *, limit: int = 24) -> list[str]:
     values: list[Any] = []
-    for entity in row.get("entities", []):
+    for entity in row.get("question_entities", []):
         values.append(entity)
     for fact in row.get("supporting_facts", []):
         if isinstance(fact, dict):

@@ -7,7 +7,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from workflow_runtime import GraphStore
-from workflow_runtime.action_compiler import ActionCompiler
 from workflow_runtime.agent_graph_view import AgentGraphViewManager
 from workflow_runtime.communication import ClosureAwareHeuristicPolicy, MinimalNoFeedbackPolicy, MinimalSendAllFallbackPolicy, MinimalTargetedFeedbackPolicy, RandomKeepPolicy, SendAllPolicy, make_communication_policy
 from workflow_runtime.delta_closure import dependency_closure
@@ -16,14 +15,29 @@ from workflow_runtime.delta_extractor import extract_delta_candidates
 
 def _numeric_graph():
     store = GraphStore()
-    store.add_node(task_id="t", branch_id="main", logical_id="task", node_type="task", content="x=5 y=3", owner="user")
-    compiler = ActionCompiler(store, task_id="t", task_type="numeric_solve")
-    compiler.apply("planner", {"op": "declare_query", "content": {"question": "sum"}})
-    compiler.apply("planner", {"op": "add_fact", "id": "A", "value": 5})
-    compiler.apply("planner", {"op": "add_fact", "id": "B", "value": 3})
-    compiler.apply("planner", {"op": "add_plan_step", "id": "R1", "operation": "add", "inputs": ["A", "B"]})
-    compiler.apply("solver", {"op": "calculate", "id": "R1", "expression": "5+3", "value": 8})
-    compiler.apply("solver", {"op": "set_result", "id": "R1", "value": 8})
+    def add(logical_id, node_type, content, owner):
+        provenance = {"origin": "source" if owner == "dataset" else "model"}
+        if logical_id == "query_spec":
+            provenance.update({"origin": "runtime", "communication_scope": "MANDATORY", "visibility_class": "public"})
+        return store.add_node(
+            task_id="t", branch_id="main", logical_id=logical_id,
+            node_type=node_type, content=content, owner=owner,
+            provenance=provenance,
+        )
+    task = add("task", "task_source", "x=5 y=3", "dataset")
+    query = add("query_spec", "query_spec", {"task_type": "numeric_solve"}, "runtime")
+    fact_a = add("fact_A", "fact", {"value": 5}, "planner")
+    fact_b = add("fact_B", "fact", {"value": 3}, "planner")
+    facts = add("facts", "facts", [{"value": 5}, {"value": 3}], "planner")
+    plan = add("plan", "plan", {"strategy": "add"}, "planner")
+    calculation = add("calculation", "calculation", {"expression": "5+3", "value": 8}, "solver")
+    result = add("result", "result", {"value": 8}, "solver")
+    for source, target, relation in (
+        (task, query, "depends_on"), (fact_a, facts, "input_to"), (fact_b, facts, "input_to"),
+        (facts, plan, "input_to"), (query, plan, "depends_on"),
+        (plan, calculation, "derived_from"), (calculation, result, "produces"),
+    ):
+        store.add_edge(source=source.node_id, target=target.node_id, relation=relation, created_by_role="runtime")
     return store
 
 

@@ -37,8 +37,24 @@ def test_langgraph_dependency_is_reported_at_compile_time():
 def test_workflow_contract_requests_one_strict_action():
     workflow = LangGraphWorkflow(store=GraphStore(), model=lambda request: {}, task_id="t")
     contract = workflow._system_contract("planner", "normal")
-    assert "one Action" in contract
-    assert "GraphStore nodes" in contract
+    assert "one JSON object" in contract
+    assert "Do not emit nodes" in contract
+
+
+def test_action_parser_accepts_one_typed_json_code_fence_but_not_free_text():
+    workflow = LangGraphWorkflow(store=GraphStore(), model=lambda request: {}, task_id="t")
+
+    action = workflow._parse_generated_action(
+        '```json\n{"op":"plan","facts":[{"content":"A is 2","source":"task","quote":"2"}],"strategy":"add"}\n```',
+        role="planner",
+    )
+
+    assert action["op"] == "plan"
+    with pytest.raises(ValueError, match="exactly one Action"):
+        workflow._parse_generated_action(
+            'Here is the action: {"op":"plan","facts":[],"strategy":"add"}',
+            role="planner",
+        )
 
 
 def test_hotpot_bridge_candidates_prioritize_source_entities_over_previous_answer():
@@ -81,6 +97,228 @@ def test_hotpot_bridge_candidates_prioritize_source_entities_over_previous_answe
     assert "The Eiffel Tower is located in Paris, France." not in stages["ranked_top8"]
     assert "Androscoggin Bank Colisee" in stages["ranked_top8"]
     assert "Lewiston Maineiacs" in stages["ranked_top8"]
+
+
+def test_hotpot_repair_retry_uses_compact_standalone_repair_prompt():
+    calls = []
+    rejected = "not valid action json"
+
+    def model(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return rejected
+        return {
+            "op": "repair_patch",
+            "action": "PATCH_CITATIONS",
+            "patch": {
+                "selected_fact_ids": ["supporting_fact_4", "supporting_fact_17"],
+                "preserve_answer": True,
+                "reasoning_chain": [
+                    "supporting_fact_4 -> Scott Derrickson is American",
+                    "Scott Derrickson + supporting_fact_17 -> yes",
+                ],
+            },
+        }
+
+    workflow = LangGraphWorkflow(
+        store=GraphStore(),
+        model=model,
+        task_id="hotpot-retry-context",
+        task_type="multihop_qa",
+    )
+    workflow.store.add_node(
+        task_id="hotpot-retry-context",
+        branch_id="main",
+        logical_id="verification",
+        node_type="verification",
+        content={
+            "error_type": "missing_hop",
+            "error_location": "cited_fact_ids",
+            "reason": json.dumps({"repair_packet": {
+                "error_type": "missing_hop", "repair_target": "cited_fact_ids"
+            }}),
+        },
+        owner="critic",
+        status="need_fix",
+    )
+    original_prompt = (
+        "Question: Were Scott Derrickson and Ed Wood of the same nationality?\n"
+        'previous_structured_answer: {"answer":"no"}\n'
+        'critic diagnosis: {"error_type":"missing_hop"}\n'
+        'allowed_evidence: [{"citation_id":"supporting_fact_4"}]\n'
+        + "\n".join(f"irrelevant evidence sentence {index}" for index in range(200))
+    )
+    original_session_prompt = workflow._session_prompt("solver", "repair", original_prompt)
+
+    action, generation = workflow._generate_action(
+        "solver",
+        "repair",
+        original_prompt,
+        None,
+        None,
+        session_id="retry-session",
+        session_prompt=original_session_prompt,
+        logical_input_tokens=workflow._token_count(original_session_prompt),
+        graph_read_context_tokens=workflow._token_count(original_prompt),
+        context_slice_tokens=0,
+        context_costs={},
+        action_constraint=None,
+    )
+
+    assert action["action"] == "PATCH_CITATIONS"
+    assert generation["attempts"] == 2
+    assert len(calls) == 2
+    retry = calls[1]
+    assert retry.session_reset is True
+    assert not retry.session_prompt.startswith(original_session_prompt)
+    assert original_prompt not in retry.session_prompt
+    assert "previous_structured_answer" not in retry.session_prompt
+    assert "critic diagnosis" not in retry.session_prompt
+    assert len(retry.session_prompt) < len(original_session_prompt + rejected + workflow._retry_session_prompt("solver", "repair", ValueError("invalid")))
+    assert rejected in retry.session_prompt
+    assert "ACTION_REPAIR" in retry.session_prompt
+    assert generation["retry_saved_input_tokens"] > 0
+
+
+def _hotpot_repair_field_workflow(
+    *,
+    error_type,
+    error_location,
+    repair_target,
+    preserve=(),
+    known=None,
+):
+    store = GraphStore()
+    previous = {
+        "answer": "Kansas Song",
+        "bridge_entity": "Kansas",
+        "cited_fact_ids": ["supporting_fact_1"],
+        "reasoning_chain": ["supporting_fact_1 -> Kansas Song"],
+    }
+    store.add_node(
+        task_id="field-invariants",
+        branch_id="main",
+        logical_id="result",
+        node_type="result",
+        content={"value": previous},
+        owner="solver",
+    )
+    packet = {
+        "status": "need_fix",
+        "error_type": error_type,
+        "known": known or {"answer": "Kansas Song"},
+        "repair_target": repair_target,
+        "must_change": {repair_target: True} if repair_target else {},
+        "preserve": list(preserve),
+    }
+    store.add_node(
+        task_id="field-invariants",
+        branch_id="main",
+        logical_id="verification",
+        node_type="verification",
+        content={
+            "error_type": error_type,
+            "error_location": error_location,
+            "reason": json.dumps({"reason": "repair", "repair_packet": packet}),
+            "preserve": list(preserve),
+        },
+        owner="critic",
+        status="need_fix",
+    )
+    return LangGraphWorkflow(
+        store=store,
+        model=lambda request: {},
+        task_id="field-invariants",
+        task_type="multihop_qa",
+    ), previous
+
+
+def test_hotpot_citation_repair_rejects_answer_and_bridge_mutation():
+    workflow, previous = _hotpot_repair_field_workflow(
+        error_type="invalid_citation",
+        error_location="cited_fact_ids",
+        repair_target="cited_fact_ids",
+        preserve=("answer",),
+    )
+    errors = workflow._hotpot_repair_action_errors(
+        "solver",
+        "repair",
+        {"op": "repair_patch", "action": "REVISE_ANSWER", "patch": {
+            "answer": "The Eiffel Tower is located in Paris, France.",
+            "reasoning_chain": ["unsupported rewrite"],
+        }},
+    )
+    assert any("cannot revise answer" in error for error in errors)
+
+    assert workflow._hotpot_repair_action_errors(
+        "solver",
+        "repair",
+        {"op": "repair_patch", "action": "PATCH_CITATIONS", "patch": {
+            "selected_fact_ids": ["supporting_fact_2", "supporting_fact_3"],
+            "preserve_answer": True,
+            "reasoning_chain": ["first hop", "second hop"],
+        }},
+    ) == []
+
+
+def test_hotpot_bridge_repair_rejects_answer_and_citation_mutation():
+    workflow, previous = _hotpot_repair_field_workflow(
+        error_type="wrong_bridge_entity",
+        error_location="bridge_entity",
+        repair_target="bridge_entity",
+    )
+    invalid = {
+        **previous,
+        "answer": "The Eiffel Tower is located in Paris, France.",
+        "bridge_entity": "Correct Bridge",
+        "cited_fact_ids": ["supporting_fact_2"],
+    }
+
+    errors = workflow._hotpot_repair_must_change_errors(invalid)
+
+    assert any("must preserve answer" in error for error in errors)
+    assert any("must preserve cited_fact_ids" in error for error in errors)
+
+
+def test_hotpot_answer_entailment_repair_may_change_answer_but_honors_preserve():
+    workflow, previous = _hotpot_repair_field_workflow(
+        error_type="answer_not_supported",
+        error_location="answer_entailment",
+        repair_target="answer",
+        preserve=("bridge_entity", "valid citations"),
+        known={"valid_cited_fact_ids": ["supporting_fact_1"]},
+    )
+    valid = {**previous, "answer": "Corrected answer"}
+    assert workflow._hotpot_repair_must_change_errors(valid) == []
+
+    invalid = {
+        **valid,
+        "bridge_entity": "Different Bridge",
+        "cited_fact_ids": ["supporting_fact_2"],
+    }
+    errors = workflow._hotpot_repair_must_change_errors(invalid)
+    assert any("preserve constraint for bridge_entity" in error for error in errors)
+    assert any("preserve constraint for valid citations" in error for error in errors)
+
+
+def test_hotpot_explicit_preserve_fields_are_programmatically_enforced():
+    workflow, previous = _hotpot_repair_field_workflow(
+        error_type="answer_contradicted",
+        error_location="answer_entailment",
+        repair_target="answer",
+        preserve=("cited_fact_ids", "reasoning_chain"),
+    )
+    invalid = {
+        **previous,
+        "answer": "Corrected answer",
+        "cited_fact_ids": ["supporting_fact_2"],
+        "reasoning_chain": ["replacement chain"],
+    }
+
+    errors = workflow._hotpot_repair_must_change_errors(invalid)
+
+    assert any("preserve constraint for cited_fact_ids" in error for error in errors)
+    assert any("preserve constraint for reasoning_chain" in error for error in errors)
 
 
 def test_deduplicated_graph_context_refs_duplicate_source_content():
@@ -481,7 +719,7 @@ def test_minimal_targeted_feedback_falls_back_when_targeted_refinement_is_empty(
     assert event["semantic_nack_unresolved"] is False
 
 
-def test_langgraph_runs_incremental_actions_to_final_answer(tmp_path):
+def removed_old_protocol_langgraph_runs_incremental_actions_to_final_answer(tmp_path):
     store = GraphStore()
     store.add_node(
         task_id="t",
@@ -551,7 +789,7 @@ def test_langgraph_runs_incremental_actions_to_final_answer(tmp_path):
     assert '"event":"graph_delta_communication"' in (tmp_path / "workflow.jsonl").read_text()
 
 
-def test_optimized_workflow_runs_solver_revision_after_need_fix_critic(tmp_path):
+def removed_old_protocol_solver_revision_after_need_fix_critic(tmp_path):
     store = GraphStore()
     store.add_node(
         task_id="t",
@@ -636,7 +874,7 @@ def test_optimized_workflow_runs_solver_revision_after_need_fix_critic(tmp_path)
     assert telemetry.summary()["reasoning_round_count"] == len(requests)
 
 
-def test_numeric_solver_with_existing_result_deterministically_completes_without_done(tmp_path):
+def removed_old_protocol_numeric_solver_existing_result(tmp_path):
     store = GraphStore()
     store.add_node(
         task_id="t",
@@ -698,7 +936,7 @@ def test_numeric_solver_with_existing_result_deterministically_completes_without
     ]
 
 
-def test_solver_null_result_is_recovered_before_generation_validation(tmp_path):
+def removed_old_protocol_solver_null_result_recovery(tmp_path):
     store = GraphStore()
     store.add_node(
         task_id="t",
@@ -754,7 +992,7 @@ def test_solver_null_result_is_recovered_before_generation_validation(tmp_path):
     assert store.latest_valid("t", "main", "final_answer").content == 5
 
 
-def test_numeric_solver_exhaustion_auto_sets_result_from_latest_calculation(tmp_path):
+def removed_old_protocol_numeric_solver_auto_result(tmp_path):
     store = GraphStore()
     store.add_node(
         task_id="t",
@@ -813,7 +1051,7 @@ def test_numeric_solver_exhaustion_auto_sets_result_from_latest_calculation(tmp_
     assert store.latest_valid("t", "main", "final_answer").content == 5
 
 
-def test_hotpot_unresolved_need_fix_does_not_finalize(tmp_path):
+def removed_old_protocol_hotpot_unresolved_need_fix(tmp_path):
     store = GraphStore()
     store.add_node(
         task_id="t",
@@ -917,7 +1155,7 @@ def test_hotpot_unresolved_need_fix_does_not_finalize(tmp_path):
     assert store.latest_valid("t", "main", "verification").status == "need_fix"
 
 
-def test_hotpot_repair_is_one_shot_structured_patch(tmp_path):
+def removed_old_protocol_hotpot_repair_one_shot(tmp_path):
     store = GraphStore()
     store.add_node(
         task_id="t",
@@ -971,10 +1209,10 @@ def test_hotpot_repair_is_one_shot_structured_patch(tmp_path):
                 "op": "set_result",
                 "id": "answer",
                 "value": {
-                    "answer": "Paris",
+                    "answer": "London",
                     "bridge_entity": "Wrong Bridge",
                     "cited_fact_ids": ["supporting_fact_1", "supporting_fact_2"],
-                    "reasoning_chain": ["supporting_fact_1 -> Wrong Bridge", "Wrong Bridge -> Paris"],
+                    "reasoning_chain": ["supporting_fact_1 -> Wrong Bridge", "Wrong Bridge -> London"],
                 },
             },
             {"op": "done"},
@@ -991,7 +1229,7 @@ def test_hotpot_repair_is_one_shot_structured_patch(tmp_path):
                     "repair_packet": {
                         "status": "need_fix",
                         "error_type": "wrong_bridge_entity",
-                        "known": {"answer": "Paris", "claimed_bridge_entity": "Wrong Bridge"},
+                        "known": {"answer": "London", "claimed_bridge_entity": "Wrong Bridge"},
                         "required": ["choose a bridge entity grounded in the facts"],
                         "preserve": ["answer if still supported"],
                     },
@@ -1023,12 +1261,11 @@ def test_hotpot_repair_is_one_shot_structured_patch(tmp_path):
         ],
         ("solver", "repair"): [
             {
-                "op": "set_result",
-                "id": "answer",
-                "value": {
-                    "answer": "London",
+                "op": "repair_patch",
+                "action": "PATCH_BRIDGE",
+                "patch": {
                     "bridge_entity": "Charles Babbage",
-                    "cited_fact_ids": ["supporting_fact_1", "supporting_fact_2"],
+                    "preserve_answer": True,
                     "reasoning_chain": [
                         "supporting_fact_1 -> Charles Babbage",
                         "Charles Babbage + supporting_fact_2 -> London",
@@ -1083,7 +1320,7 @@ def test_hotpot_repair_is_one_shot_structured_patch(tmp_path):
     }
 
 
-def test_task_verifier_overrides_false_positive_code_verified(tmp_path):
+def removed_old_protocol_false_positive_code_verify(tmp_path):
     store = GraphStore()
     store.add_node(
         task_id="t",

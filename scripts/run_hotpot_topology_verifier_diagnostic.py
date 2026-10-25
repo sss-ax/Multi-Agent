@@ -28,7 +28,7 @@ def diagnostic_cases() -> dict[str, dict[str, Any]]:
         "bridge_entity": {
             "row": {
                 "question": "Who connects Alice to Carol?",
-                "entities": ["Alice", "Carol"],
+                "question_entities": ["Alice", "Carol"],
             },
             "bridge": "Bob",
             "gold": (
@@ -53,7 +53,7 @@ def diagnostic_cases() -> dict[str, dict[str, Any]]:
         "bridge_attribute": {
             "row": {
                 "question": "What company formed the group that created 2014 S/S?",
-                "entities": ["2014 S/S"],
+                "question_entities": ["2014 S/S"],
             },
             "bridge": "WINNER",
             "gold": (
@@ -78,7 +78,7 @@ def diagnostic_cases() -> dict[str, dict[str, Any]]:
         "comparison_attribute": {
             "row": {
                 "question": "Are Museum A and Museum B located in the same neighborhood?",
-                "entities": ["Museum A", "Museum B"],
+                "question_entities": ["Museum A", "Museum B"],
             },
             "bridge": "",
             "gold": (
@@ -103,7 +103,7 @@ def diagnostic_cases() -> dict[str, dict[str, Any]]:
         "shared_property_yesno": {
             "row": {
                 "question": "Are both Alpha and Beta genus plants?",
-                "entities": ["Alpha", "Beta"],
+                "question_entities": ["Alpha", "Beta"],
             },
             "bridge": "",
             "gold": (
@@ -128,7 +128,7 @@ def diagnostic_cases() -> dict[str, dict[str, Any]]:
         "set_intersection": {
             "row": {
                 "question": "What genus property do Alpha and Beta share in common?",
-                "entities": ["Alpha", "Beta"],
+                "question_entities": ["Alpha", "Beta"],
             },
             "bridge": "",
             "gold": (
@@ -153,7 +153,7 @@ def diagnostic_cases() -> dict[str, dict[str, Any]]:
         "multi_constraint_lookup": {
             "row": {
                 "question": "Who wrote Novel X and directed Film Y?",
-                "entities": ["Novel X", "Film Y"],
+                "question_entities": ["Novel X", "Film Y"],
             },
             "bridge": "Jordan Lee",
             "gold": (

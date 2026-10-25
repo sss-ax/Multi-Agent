@@ -48,6 +48,27 @@ def test_telemetry_records_answer_accuracy(tmp_path):
     assert summary["answer_accuracy"] == 1.0
 
 
+def test_telemetry_counts_typed_critic_action_and_kernel_verdict(tmp_path):
+    telemetry = WorkflowTelemetry(tmp_path / "critic.jsonl")
+    telemetry.record_action({
+        "role": "critic",
+        "action": {
+            "op": "audit_choice",
+            "selected_option_check": {"status": "supported", "reason": "B is supported"},
+            "slot_checks": [{"slot": 1, "status": "supported", "reason": "B fits"}],
+            "eliminated_checks": [{"option": "A", "status": "contradicted", "reason": "A conflicts"}],
+            "summary": "The candidate claims were checked.",
+        },
+        "kernel_verification_status": "need_fix",
+        "protocol_valid": True,
+        "compile_success": True,
+    })
+    summary = telemetry.finish(status="success")
+    assert summary["semantic_delta_proposals"] == 1
+    assert summary["semantic_delta_commits"] == 1
+    assert summary["critic_need_fix_count"] == 1
+
+
 def test_telemetry_records_native_calls_as_unconstrained_stages(tmp_path):
     telemetry = WorkflowTelemetry(tmp_path / "native.jsonl")
     telemetry.record_native_call({

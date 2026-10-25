@@ -34,14 +34,48 @@ from .models import (
     NodeVersion,
     RecomputePlan,
     RuntimeFingerprint,
+    NodeOrigin,
+    VisibilityClass,
+    normalize_provenance,
+    node_visibility_class,
+    node_visible_to_role,
 )
 from .reuse_cache import InMemoryResultCache, ResultCache
 from .domain_executors import DomainExecution, execute_domain
+from .code_verifier import CodeVerificationResult, CodeVerifier
 from .action_compiler import ActionCompilationError, ActionCompiler, CompilationResult
+from .evaluation_context import EvaluationContext
+from .semantic_delta_ir import GroundingRef, ProposedEdge, ProposedNode, SemanticDelta, SendHint
+from .semantic_delta_validator import SemanticDeltaValidationError, ValidationIssue, ValidatedSemanticDelta, validate_semantic_delta
+from .semantic_delta_compiler import CompiledSemanticDelta, GraphMutationPlan, SemanticDeltaCompiler
+from .task_spec import TaskSpec, get_task_spec, registered_task_types
+from .run_metadata import build_run_metadata, sample_ids_sha256
 from .agent_graph_view import AgentGraphView, AgentGraphViewManager
 from .graph_delta import DeltaCandidate, GraphDelta
+from .communication_replay import (
+    CommunicationDecisionSnapshot,
+    CommunicationReplayBuffer,
+    SNAPSHOT_SCHEMA_VERSION,
+    graph_state_from_dict,
+    graph_state_to_dict,
+)
+from .communication_action import (
+    CommunicationAction,
+    CommunicationActionExecutor,
+    CommunicationActionType,
+    CommunicationPreview,
+    InformationActionAdapter,
+)
+from .replay_runner import CounterfactualReplayRunner
+from .hotpot_hidden_evidence import (
+    HotpotHiddenEvidenceEnvironment,
+    HotpotLocalInformationAdapter,
+    build_hotpot_hidden_environment,
+)
 from .communication import (
     ClosureAwareHeuristicPolicy,
+    MandatoryOnlyPolicy,
+    ModelSelectedPolicy,
     GraphCommunicationPolicy,
     MinimalNoFeedbackPolicy,
     MinimalSendAllFallbackPolicy,
@@ -58,7 +92,7 @@ from .model_backend import DirectTransformersModel, TransformersModel
 from .tools import ToolError, ToolRegistry, ToolSpec
 from .telemetry import WorkflowTelemetry
 from .evaluator import EvaluationResult, TaskEvaluator, parse_reference_answer
-from .action_constraints import ActionConstraint, build_action_constraint, explicit_fact_ids
+from .action_constraints import ActionConstraint, build_action_constraint
 from .protocol import PROTOCOL_VERSION, action_contract, parse_action, validate_action
 from .semantic_contract import (
     SemanticCheckResult,
@@ -125,6 +159,7 @@ from .semantic_packet import (
     build_initial_semantic_packet,
 )
 from .refinement_planner import RefinementPlan, RefinementPlanner, plan_refinement
+from .hotpot_graph_retriever import GraphSeed, GraphSeedRetriever, EvidencePath, MultiPathExplorer, PathReranker, QueryGuidedGraphRetriever
 
 __all__ = [
     "CachedResult",
@@ -139,6 +174,29 @@ __all__ = [
     "InvalidationReport",
     "InMemoryResultCache",
     "NodeVersion",
+    "NodeOrigin",
+    "VisibilityClass",
+    "normalize_provenance",
+    "node_visibility_class",
+    "node_visible_to_role",
+    "EvaluationContext",
+    "TaskSpec",
+    "get_task_spec",
+    "registered_task_types",
+    "build_run_metadata",
+    "sample_ids_sha256",
+    "GroundingRef",
+    "ProposedNode",
+    "ProposedEdge",
+    "SendHint",
+    "SemanticDelta",
+    "SemanticDeltaValidationError",
+    "ValidationIssue",
+    "ValidatedSemanticDelta",
+    "validate_semantic_delta",
+    "CompiledSemanticDelta",
+    "GraphMutationPlan",
+    "SemanticDeltaCompiler",
     "ROLE_REQUIREMENTS",
     "RecomputePlan",
     "ResultCache",
@@ -151,6 +209,8 @@ __all__ = [
     "downstream_dependents",
     "DomainExecution",
     "execute_domain",
+    "CodeVerificationResult",
+    "CodeVerifier",
     "ActionCompilationError",
     "ActionCompiler",
     "CompilationResult",
@@ -158,6 +218,20 @@ __all__ = [
     "AgentGraphViewManager",
     "DeltaCandidate",
     "GraphDelta",
+    "CommunicationDecisionSnapshot",
+    "CommunicationReplayBuffer",
+    "SNAPSHOT_SCHEMA_VERSION",
+    "graph_state_from_dict",
+    "graph_state_to_dict",
+    "CommunicationAction",
+    "CommunicationActionExecutor",
+    "CommunicationActionType",
+    "CommunicationPreview",
+    "InformationActionAdapter",
+    "CounterfactualReplayRunner",
+    "HotpotHiddenEvidenceEnvironment",
+    "HotpotLocalInformationAdapter",
+    "build_hotpot_hidden_environment",
     "GraphCommunicationPolicy",
     "SendAllPolicy",
     "MinimalNoFeedbackPolicy",
@@ -165,6 +239,8 @@ __all__ = [
     "MinimalTargetedFeedbackPolicy",
     "RandomKeepPolicy",
     "ClosureAwareHeuristicPolicy",
+    "MandatoryOnlyPolicy",
+    "ModelSelectedPolicy",
     "LangGraphWorkflow",
     "WorkflowState",
     "build_langgraph_workflow",
@@ -191,7 +267,6 @@ __all__ = [
     "parse_reference_answer",
     "ActionConstraint",
     "build_action_constraint",
-    "explicit_fact_ids",
     "PROTOCOL_VERSION",
     "action_contract",
     "parse_action",
@@ -218,6 +293,12 @@ __all__ = [
     "SemanticPacketBuilder",
     "RefinementPlan",
     "RefinementPlanner",
+    "GraphSeed",
+    "GraphSeedRetriever",
+    "EvidencePath",
+    "MultiPathExplorer",
+    "PathReranker",
+    "QueryGuidedGraphRetriever",
     "DECISION_SUFFICIENT",
     "VERIFICATION_SUFFICIENT",
     "RECONSTRUCTION_SUFFICIENT",

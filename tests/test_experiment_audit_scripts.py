@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from scripts.audit_hotpotqa_fixed_k_diagnostics import (
+    audit_hop_binding,
     audit_answer_evidence_coverage,
     audit_bridge_attribute_hop2_retrieval,
     audit_bridge_entity_construction,
@@ -16,6 +17,7 @@ from scripts.make_fixed_pool_budget_commands import summarize_budget
 from scripts.make_module_ablation_commands import _validate_model_path
 from scripts.audit_hotpotqa_topology_retrieval import diagnose_row as diagnose_hotpot_retrieval_row
 from scripts.run_hotpot_topology_verifier_diagnostic import run_diagnostic
+from scripts.run_hotpotqa_bridge_evidence_selection_ablation import _event, _selection_prompt_text
 from workflow_runtime.communication import make_communication_policy
 
 
@@ -162,6 +164,29 @@ def test_hotpot_stage6_separates_answer_evidence_and_grounded_coverage():
     assert audit["gold_candidate_selected"] is False
     assert audit["gold_candidate_top2"] is False
     assert audit["gold_candidate_top4"] is True
+
+
+def test_hotpot_hop_audit_distinguishes_global_availability_from_co_location():
+    split = audit_hop_binding(
+        [
+            {"hop1_pool": [{"fact_id": "g1"}], "hop2_pool": [{"fact_id": "x"}], "chain_pair_pool": []},
+            {"hop1_pool": [{"fact_id": "y"}], "hop2_pool": [{"fact_id": "g2"}], "chain_pair_pool": []},
+        ],
+        ["g1", "g2"],
+    )
+    together = audit_hop_binding(
+        [{
+            "hop1_pool": [{"fact_id": "g1"}],
+            "hop2_pool": [{"fact_id": "g2"}],
+            "chain_pair_pool": [{"hop1_fact_id": "g1", "hop2_fact_id": "g2"}],
+        }],
+        ["g1", "g2"],
+    )
+
+    assert split["gold_hop1_hop2_both_in_pool"] is True
+    assert split["gold_hop1_hop2_co_located"] is False
+    assert together["gold_hop1_hop2_co_located"] is True
+    assert together["gold_pair_constructed"] is True
 
 
 def test_hotpot_stage8_reports_selection_oracle_decomposition():
@@ -379,3 +404,65 @@ def test_hotpot_topology_diagnostic_separates_gold_from_wrong():
         assert 0.0 <= summary["wrong_valid_rate"] <= 1.0
         assert 0.0 <= summary["p_gold_score_gt_wrong"] <= 1.0
         assert summary["wrong_count"] >= 3
+
+
+def test_hotpot_selection_event_contains_erroneous_state_and_missing_slots():
+    record = {
+        "sample_id": "s1",
+        "runtime_summary": {
+            "records": [
+                {
+                    "role": "solver",
+                    "mode": "initial",
+                    "action": {
+                            "op": "answer_with_evidence",
+                            "answer": "Kansas Song",
+                            "bridge_entity": "Wrong Bridge",
+                            "citations": ["sentence_source_1", "sentence_source_2"],
+                            "reasoning": ["incomplete"],
+                    },
+                },
+                {
+                    "role": "critic",
+                    "action": {
+                            "op": "judge_evidence",
+                            "answer_support": "unsupported",
+                            "bridge_status": "invalid",
+                            "citation_status": "missing_hop",
+                            "repair_target": "cited_fact_ids",
+                        "reason": json.dumps({
+                            "repair_packet": {
+                                    "valid_cited_fact_ids": ["sentence_source_1"],
+                                "missing_slots": ["entity_2_nationality"],
+                            }
+                        }),
+                    },
+                },
+                {
+                    "role": "solver",
+                    "mode": "repair",
+                    "generation": {"hotpot_repair_packet_audit": {
+                        "bridge_candidate_stages": {"solver_visible": ["Bridge A", "Bridge B"]}
+                    }},
+                },
+            ]
+        },
+    }
+    row = {
+        "question": "Is entity 2 from the same country?",
+        "gold_answer": "yes",
+        "supporting_facts": [
+            {"title": "Bridge A", "sent_id": 0, "text": "Bridge A connects entity 1 to entity 2."},
+            {"title": "Entity 2", "sent_id": 1, "text": "Entity 2 has the required nationality."},
+        ],
+    }
+    event = _event(record, row, candidate_limit=2)
+    assert event["state"]["current_answer"] == "Kansas Song"
+    assert event["state"]["current_cited_facts"] == ["sentence_source_1", "sentence_source_2"]
+    assert event["state"]["critic_error_type"] == ""
+    assert event["state"]["valid_existing_evidence"] == ["sentence_source_1"]
+    assert event["state"]["missing_slots"] == ["entity_2_nationality"]
+    prompt = _selection_prompt_text(event, ["[CANDIDATE c1]"])
+    assert "Current erroneous state" in prompt
+    assert "entity_2_nationality" in prompt
+    assert "missing_slots" in prompt

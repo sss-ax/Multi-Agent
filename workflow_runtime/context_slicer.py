@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from .canonical import canonical_json, dependency_digest, node_order_digest
@@ -11,6 +12,8 @@ from .graph_store import GraphStore, GraphValidationError
 from .models import ContextSlice, DependencyEdge, GraphState, NodeVersion
 from .relations import DATA_DEPENDENCY_RELATIONS, VALIDATION_RELATIONS
 from .semantic_fragments import fragments_for_node, render_fragmented_content
+from .task_spec import get_task_spec
+from .hotpot_graph_retriever import GraphSeedRetriever
 
 
 class SliceError(ValueError):
@@ -53,6 +56,22 @@ NODE_ORDER = {
     "result": 13,
     "verification": 14,
     "final_answer": 15,
+    "task_source": 1,
+    "question_source": 1,
+    "document_source": 1,
+    "sentence_source": 1,
+    "entity_source": 1,
+    "choice_source": 4,
+    "requirements_source": 4,
+    "entry_point_source": 4,
+    "public_test_source": 5,
+    "plan_step": 11,
+    "candidate_answer": 13,
+    "slot_analysis": 12,
+    "selected_evidence": 6,
+    "bridge_hypothesis": 7,
+    "reasoning_step": 12,
+    "semantic_delta_boundary": 16,
 }
 
 DOMAIN_SOLVER_REQUIREMENTS: Dict[str, List[str]] = {
@@ -112,6 +131,24 @@ def _task_type_from_marker(store: GraphStore, task_id: str, branch_id: str) -> s
     return ""
 
 
+def _task_type_from_query_or_marker(store: GraphStore, task_id: str, branch_id: str) -> str:
+    """Resolve the task family from source and runtime node types."""
+    query = store.latest_valid(task_id, branch_id, "query_spec")
+    if query is not None:
+        try:
+            value = json.loads(query.content) if isinstance(query.content, str) else query.content
+            if isinstance(value, dict) and value.get("task_type"):
+                return str(value["task_type"])
+        except (TypeError, json.JSONDecodeError):
+            pass
+    return _task_type_from_marker(store, task_id, branch_id)
+
+
+def _is_semantic_source_graph(store: GraphStore, task_id: str, branch_id: str) -> bool:
+    task = store.latest_valid(task_id, branch_id, "task")
+    return task is not None and task.type.endswith("_source")
+
+
 def _node_sort_key(node: NodeVersion) -> Tuple[int, str, int, str]:
     return NODE_ORDER.get(node.type, 100), node.logical_id, node.version, node.node_id
 
@@ -158,6 +195,34 @@ def _required_roots(
 ) -> Tuple[List[str], List[str]]:
     if role not in ROLE_REQUIREMENTS:
         raise SliceError(f"unknown role: {role}")
+    # Semantic Delta v2 starts from typed Source nodes.  TaskSpec context types
+    # are selectors, not an assertion that every optional source type exists.
+    # In particular, HotpotQA has sentence_source nodes rather than generic
+    # supporting_fact/evidence_link pair.  Apply this from the very first
+    # planner call, before a semantic boundary exists.
+    if _is_semantic_source_graph(store, task_id, branch_id):
+        task_type = _task_type_from_query_or_marker(store, task_id, branch_id)
+        try:
+            allowed_context_types = set(get_task_spec(task_type).context_for(role))
+        except ValueError:
+            allowed_context_types = set()
+        roots = [
+            node.node_id
+            for node in sorted(store.snapshot().nodes.values(), key=_node_sort_key)
+            if node.task_id == task_id
+            and node.branch_id == branch_id
+            and node.is_operationally_valid()
+            and (not allowed_context_types or node.type in allowed_context_types)
+        ]
+        query = store.latest_valid(task_id, branch_id, "query_spec")
+        if query is not None and query.node_id not in roots:
+            roots.insert(0, query.node_id)
+        task = store.latest_valid(task_id, branch_id, "task")
+        if task is not None and role == "planner" and task.node_id not in roots:
+            roots.insert(0, task.node_id)
+        if not roots:
+            return [], [f"TaskSpec context for {task_type or 'unknown'}"]
+        return roots, []
     required = ROLE_REQUIREMENTS[role]
     if role == "planner":
         task = store.latest_valid(task_id, branch_id, "task")
@@ -207,6 +272,54 @@ def _required_roots(
                 pass
         task_type = task_type or _task_type_from_marker(store, task_id, branch_id)
         required = DOMAIN_FINAL_REQUIREMENTS.get(task_type, required)
+    semantic_nodes = [
+        node for node in store.snapshot().nodes.values()
+        if node.task_id == task_id
+        and node.branch_id == branch_id
+        and node.is_operationally_valid()
+        and bool(node.provenance.get("semantic_delta"))
+    ]
+    semantic_boundaries = [
+        node for node in store.snapshot().nodes.values()
+        if node.task_id == task_id
+        and node.branch_id == branch_id
+        and node.is_operationally_valid()
+        and bool(node.provenance.get("semantic_delta_boundary"))
+    ]
+    if (semantic_nodes or semantic_boundaries) and role in {"solver", "critic"}:
+        query = store.latest_valid(task_id, branch_id, "query_spec")
+        task_type = ""
+        if query is not None and isinstance(query.content, dict):
+            task_type = str(query.content.get("task_type", ""))
+        task_type = task_type or _task_type_from_marker(store, task_id, branch_id)
+        try:
+            allowed_context_types = set(get_task_spec(task_type).context_for(role))
+        except ValueError:
+            allowed_context_types = set()
+        roots = []
+        if query is not None:
+            roots.append(query.node_id)
+        if semantic_nodes:
+            roots.extend(
+                node.node_id
+                for node in sorted(semantic_nodes, key=_node_sort_key)
+                if not allowed_context_types or node.type in allowed_context_types
+            )
+            if role == "critic":
+                for logical_id in ("result", "execution", "code"):
+                    current = store.latest_valid(task_id, branch_id, logical_id)
+                    if current is not None:
+                        roots.append(current.node_id)
+        else:
+            roots.extend(
+                node.node_id
+                for node in sorted(store.snapshot().nodes.values(), key=_node_sort_key)
+                if node.task_id == task_id
+                and node.branch_id == branch_id
+                and node.is_operationally_valid()
+            )
+        return roots, []
+
     roots: List[str] = []
     missing: List[str] = []
     for logical_id in required:
@@ -290,6 +403,134 @@ def _token_count(text: str) -> int:
     return len(text.split()) if text else 0
 
 
+def _decoded_content(node: NodeVersion) -> Any:
+    content = node.content
+    if isinstance(content, str):
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return content
+    return content
+
+
+def _multihop_source_subset(
+    store: GraphStore,
+    visible_ids: Set[str],
+    *,
+    task_id: str,
+    branch_id: str,
+    sentence_limit: int,
+) -> Set[str]:
+    """Bound large Hotpot source payloads without consulting gold evidence.
+
+    Selection is deterministic and question-guided.  Sentences already used
+    as grounding for a derived node are always retained, so later critic and
+    repair calls cannot lose committed provenance.  The lexical seed set is
+    expanded by document-title mentions to recover the common two-hop bridge
+    pattern (question -> first document -> second document).
+    """
+    if sentence_limit <= 0:
+        return visible_ids
+    state = store.snapshot()
+    sentence_nodes = [
+        state.nodes[node_id]
+        for node_id in visible_ids
+        if node_id in state.nodes and state.nodes[node_id].type == "sentence_source"
+    ]
+    task = store.latest_valid(task_id, branch_id, "task")
+    question = str(task.content if task is not None else "")
+    question = re.sub(r"^\[domain=[^\]]+\]\s*", "", question).strip()
+    question_folded = question.casefold()
+    facts: list[dict[str, Any]] = []
+    node_by_ref: dict[str, NodeVersion] = {}
+    for node in sentence_nodes:
+        value = _decoded_content(node)
+        record = dict(value) if isinstance(value, dict) else {"text": str(value)}
+        record["fact_id"] = node.logical_id
+        facts.append(record)
+        node_by_ref[node.logical_id] = node
+
+    ranked = GraphSeedRetriever().select(question, facts, limit=len(facts))
+    ranked_refs = [seed.fact_id for seed in ranked if seed.fact_id in node_by_ref]
+    # Start from a small high-precision seed set so title expansion gets room
+    # inside the final budget instead of being appended after a full top-k.
+    selected_refs: list[str] = ranked_refs[: min(8, sentence_limit)]
+
+    # Preserve sources already committed as grounding, independently of their
+    # lexical score.  Dataset task->source edges do not match this condition.
+    derived_types = {
+        node.node_id: node.type
+        for node in state.nodes.values()
+        if node.task_id == task_id and node.branch_id == branch_id
+    }
+    for edge in state.edges:
+        source = state.nodes.get(edge.source)
+        if (
+            source is not None
+            and source.type == "sentence_source"
+            and source.node_id in visible_ids
+            and not derived_types.get(edge.target, "").endswith("_source")
+            and derived_types.get(edge.target, "") not in {"task", "query_spec"}
+        ):
+            selected_refs.insert(0, source.logical_id)
+
+    # Expand a seed through titles explicitly mentioned in its text.  This is
+    # a deterministic retrieval operation over public context, not gold-label
+    # selection.
+    title_to_refs: dict[str, list[str]] = {}
+    for fact in facts:
+        title = str(fact.get("title", "")).strip()
+        if title:
+            title_to_refs.setdefault(title.casefold(), []).append(str(fact["fact_id"]))
+    selected_text = " ".join(
+        str(_decoded_content(node_by_ref[ref]).get("text", ""))
+        for ref in selected_refs
+        if ref in node_by_ref and isinstance(_decoded_content(node_by_ref[ref]), dict)
+    ).casefold()
+    for title, refs in sorted(title_to_refs.items()):
+        if title and (title in question_folded or title in selected_text):
+            selected_refs.extend(refs)
+
+    selected_refs.extend(ranked_refs)
+    selected_refs = list(dict.fromkeys(selected_refs))[:sentence_limit]
+    selected_sentence_ids = {node_by_ref[ref].node_id for ref in selected_refs if ref in node_by_ref}
+    selected_titles = {
+        str((_decoded_content(state.nodes[node_id]) or {}).get("title", "")).casefold()
+        for node_id in selected_sentence_ids
+        if isinstance(_decoded_content(state.nodes[node_id]), dict)
+    }
+    selected_text = " ".join(
+        str((_decoded_content(state.nodes[node_id]) or {}).get("text", ""))
+        for node_id in selected_sentence_ids
+        if isinstance(_decoded_content(state.nodes[node_id]), dict)
+    ).casefold()
+    result: Set[str] = set()
+    entity_count = 0
+    for node_id in visible_ids:
+        node = state.nodes.get(node_id)
+        if node is None:
+            continue
+        if node.type == "sentence_source":
+            if node_id in selected_sentence_ids:
+                result.add(node_id)
+            continue
+        if node.type == "document_source":
+            value = _decoded_content(node)
+            title = str(value.get("title", "") if isinstance(value, dict) else value).casefold()
+            if title in selected_titles or (title and title in question_folded):
+                result.add(node_id)
+            continue
+        if node.type == "entity_source":
+            value = _decoded_content(node)
+            name = str(value.get("name", "") if isinstance(value, dict) else value).casefold()
+            if name and (name in question_folded or name in selected_text) and entity_count < 32:
+                result.add(node_id)
+                entity_count += 1
+            continue
+        result.add(node_id)
+    return result
+
+
 def build_context_slice(
     store: GraphStore,
     *,
@@ -300,6 +541,7 @@ def build_context_slice(
     token_budget: Optional[int] = None,
     allow_missing: bool = False,
     visible_fragment_ids: Optional[Iterable[str]] = None,
+    multihop_sentence_limit: Optional[int] = None,
 ) -> ContextSlice:
     roots, missing = _required_roots(store, task_id, branch_id, role)
     if missing and not allow_missing:
@@ -355,6 +597,17 @@ def build_context_slice(
         visible_ids = set(roots)
     else:
         raise SliceError(f"unknown context slice policy: {policy}")
+
+    if multihop_sentence_limit is not None:
+        task_type = _task_type_from_query_or_marker(store, task_id, branch_id)
+        if task_type == "multihop_qa":
+            visible_ids = _multihop_source_subset(
+                store,
+                set(visible_ids),
+                task_id=task_id,
+                branch_id=branch_id,
+                sentence_limit=int(multihop_sentence_limit),
+            )
 
     state = store.snapshot()
     visible_fragments = sorted(str(item) for item in (visible_fragment_ids or ()))

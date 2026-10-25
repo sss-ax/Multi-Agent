@@ -95,6 +95,11 @@ def main() -> None:
 
 
 def diagnose_row(row: dict[str, Any]) -> dict[str, Any]:
+    # Audit callers may still provide pre-parser rows.  Normalize that legacy
+    # fixture shape locally; production candidate construction never falls
+    # back from question_entities to the overloaded ``entities`` field.
+    if not row.get("question_entities") and row.get("entities"):
+        row = {**row, "question_entities": list(row.get("entities", []))}
     facts = rub._hotpot_facts(row)
     index = build_evidence_index(row, facts)
     reasoning_type = rub._hotpot_reasoning_type(row)

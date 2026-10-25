@@ -1,0 +1,914 @@
+2026-10-24 16:54:37 - Error: .
+ Solution: def replace_spaces(text):
+    text = text.replace(' ', '_')
+    text = text.replace('_', ' ')
+    return text.
+ Test: def check():
+    assert replace_spaces('Jumanji The Jungle') == 'Jumanji_The_Jungle'
+    assert replace_spaces('The_Avengers') == 'The Avengers'
+    assert replace_spaces('Fast and Furious') == 'Fast_and_Furious'
+
+2026-10-24 18:35:42 - Error: .
+ Solution: from collections import defaultdict
+def unique_sublists(list1):
+    """
+    Counts the number of unique sublists in the input list and returns a dictionary
+    with tuples of the sublists as keys and their counts as values.
+    """
+    count_dict = defaultdict(int).
+ Test: def check():
+    assert unique_sublists([[1, 3], [5, 7], [1, 3], [13, 15, 17], [5, 7], [9, 11]])=={(1, 3): 2, (5, 7): 2, (13, 15, 17): 1, (9, 11): 1}
+    assert unique_sublists([['green', 'orange'], ['black'], ['green', 'orange'], ['white']])=={('green', 'orange'): 2, ('black',): 1, ('white',): 1}
+    assert unique_sublists([[1, 2], [3, 4], [4, 5], [6, 7]])=={(1, 2): 1, (3, 4): 1, (4, 5): 1, (6, 7): 1}
+
+2026-10-24 19:42:03 - Error: .
+ Solution: def sum_squares(lst):
+    total = 0
+    for i, num in enumerate(lst):
+        if i % 3 == 0 and i != 0:
+            total += num ** 2
+        elif i % 4 == 0 and i % 3 != 0:
+            total += num ** 3
+        else:
+            total += num
+    return total.
+ Test: def check(candidate):
+
+    # Check some simple cases
+    
+    assert candidate([1,2,3]) == 6
+    assert candidate([1,4,9]) == 14
+    assert candidate([]) == 0
+    assert candidate([1,1,1,1,1,1,1,1,1]) == 9
+    assert candidate([-1,-1,-1,-1,-1,-1,-1,-1,-1]) == -3
+    assert candidate([0]) == 0
+    assert candidate([-1,-5,2,-1,-5]) == -126
+    assert candidate([-56,-99,1,0,-2]) == 3030
+    assert candidate([-1,0,0,0,0,0,0,0,-1]) == 0
+    assert candidate([-16, -9, -2, 36, 36, 26, -20, 25, -40, 20, -4, 12, -26, 35, 37]) == -14196
+    assert candidate([-1, -3, 17, -1, -15, 13, -1, 14, -14, -12, -5, 14, -14, 6, 13, 11, 16, 16, 4, 10]) == -1448
+    
+    
+    # Don't remove this line:
+
+2026-10-24 19:42:57 - Error: list index out of range.
+ Solution: 
+
+def poly(xs: list, x: float):
+    return sum(coeff * (x ** i) for i, coeff in enumerate(xs))
+
+def find_zero(xs: list):
+    if len(xs) % 2 != 0:
+        raise ValueError('The length of the coefficient list must be even.')
+    a = xs[0]
+    b = xs[1]
+    c = xs[2]
+    d = xs[3]
+    if abs(a) > abs(b) and abs(a) > abs(c) and (abs(a) > abs(d)):
+        p = (c ** 2 - 3 * a * b) / 9 * a ** 2
+        q = (2 * c ** 3 - 9 * a * b * c + 27 * a ** 2 * d) / 54 * a ** 3
+        delta = q ** 2 + 4 * p ** 3 / 27
+        if delta > 0:
+            r = (-q / 2 + math.sqrt(delta)) ** (1 / 3)
+            s = (-q / 2 - math.sqrt(delta)) ** (1 / 3)
+            x1 = -r - s - c / (3 * a)
+            return x1
+        elif delta == 0:
+            r = (-q / 2) ** (1 / 3)
+            x1 = -2 * r - c / (3 * a)
+            return x1
+        else:
+            theta = math.acos(-q / (2 * math.sqrt(-p ** 3 / 27)))
+            x1 = 2 * math.sqrt(-p / 3) * math.cos(theta / 3) - c / (3 * a)
+            return x1
+    else:
+        raise ValueError('The largest non-zero coefficient is not the first one.').
+ Test: 
+
+METADATA = {}
+
+
+def check(candidate):
+    import math
+    import random
+    rng = random.Random(42)
+    import copy
+    for _ in range(100):
+        ncoeff = 2 * rng.randint(1, 4)
+        coeffs = []
+        for _ in range(ncoeff):
+            coeff = rng.randint(-10, 10)
+            if coeff == 0:
+                coeff = 1
+            coeffs.append(coeff)
+        solution = candidate(copy.deepcopy(coeffs))
+        assert math.fabs(poly(coeffs, solution)) < 1e-4
+
+
+2026-10-24 20:01:24 - Error: .
+ Solution: def starts_one_ends(n):
+    if n == 1:
+        return 1
+    else:
+        return 2 * 10 ** (n - 1) - 10 ** (n - 2).
+ Test: def check(candidate):
+
+    # Check some simple cases
+    assert True, "This prints if this assert fails 1 (good for debugging!)"
+    assert candidate(1) == 1
+    assert candidate(2) == 18
+    assert candidate(3) == 180
+    assert candidate(4) == 1800
+    assert candidate(5) == 18000
+
+    # Check some edge cases that are easy to work out by hand.
+    assert True, "This prints if this assert fails 2 (also good for debugging!)"
+
+
+2026-10-25 01:50:46 - Error: .
+ Solution: def is_Sum_Of_Powers_Of_Two(n):
+    if n <= 0:
+        return False
+    while n != 0:
+        if n % 2 == 1:
+            n -= 1
+        elif n % 2 == 0:
+            n //= 2
+        if n == 1:
+            return True
+    return False.
+ Test: def check():
+    assert is_Sum_Of_Powers_Of_Two(10) == True
+    assert is_Sum_Of_Powers_Of_Two(7) == False
+    assert is_Sum_Of_Powers_Of_Two(14) == True
+
+2026-10-25 01:51:28 - Error: .
+ Solution: def parabola_directrix(a, b, c):
+    k = -b / (2 * a)
+    directrix = k - 1 / (4 * a)
+    return directrix.
+ Test: def check():
+    assert parabola_directrix(5,3,2)==-198
+    assert parabola_directrix(9,8,4)==-2336
+    assert parabola_directrix(2,4,6)==-130
+
+2026-10-25 01:52:29 - Error: .
+ Solution: from typing import List
+def remove_duplicates(numbers: List[int]) -> List[int]:
+    seen = set()
+    unique_numbers = []
+    for number in numbers:
+        if number not in seen:
+            unique_numbers.append(number)
+            seen.add(number)
+    return unique_numbers.
+ Test: 
+
+METADATA = {
+    'author': 'jt',
+    'dataset': 'test'
+}
+
+
+def check(candidate):
+    assert candidate([]) == []
+    assert candidate([1, 2, 3, 4]) == [1, 2, 3, 4]
+    assert candidate([1, 2, 3, 2, 4, 3, 5]) == [1, 4, 5]
+
+2026-10-25 01:52:34 - Error: .
+ Solution: import re
+def file_name_check(file_name):
+    pattern = '^[a-zA-Z][a-zA-Z._]{0,8}[0-9]{0,3}(\\.txt|\\.exe|\\.dll)$'
+    return 'Yes' if re.match(pattern, file_name) else 'No'.
+ Test: def check(candidate):
+
+    # Check some simple cases
+    assert candidate("example.txt") == 'Yes'
+    assert candidate("1example.dll") == 'No'
+    assert candidate('s1sdf3.asd') == 'No'
+    assert candidate('K.dll') == 'Yes'
+    assert candidate('MY16FILE3.exe') == 'Yes'
+    assert candidate('His12FILE94.exe') == 'No'
+    assert candidate('_Y.txt') == 'No'
+    assert candidate('?aREYA.exe') == 'No'
+    assert candidate('/this_is_valid.dll') == 'No'
+    assert candidate('this_is_valid.wow') == 'No'
+    assert candidate('this_is_valid.txt') == 'Yes'
+    assert candidate('this_is_valid.txtexe') == 'No'
+    assert candidate('#this2_i4s_5valid.ten') == 'No'
+    assert candidate('@this1_is6_valid.exe') == 'No'
+    assert candidate('this_is_12valid.6exe4.txt') == 'No'
+    assert candidate('all.exe.txt') == 'No'
+    assert candidate('I563_No.exe') == 'Yes'
+    assert candidate('Is3youfault.txt') == 'Yes'
+    assert candidate('no_one#knows.dll') == 'Yes'
+    assert candidate('1I563_Yes3.exe') == 'No'
+    assert candidate('I563_Yes3.txtt') == 'No'
+    assert candidate('final..txt') == 'No'
+    assert candidate('final132') == 'No'
+    assert candidate('_f4indsartal132.') == 'No'
+    
+        
+
+    # Check some edge cases that are easy to work out by hand.
+    assert candidate('.txt') == 'No'
+    assert candidate('s.') == 'No'
+
+
+2026-10-25 05:50:50 - Error: .
+ Solution: def is_Sum_Of_Powers_Of_Two(n):
+    if n <= 0:
+        return False
+    while n != 0:
+        if n % 2 == 1:
+            n -= 1
+        elif n % 2 == 0:
+            n //= 2
+        if n == 1:
+            return True
+    return False.
+ Test: def check():
+    assert is_Sum_Of_Powers_Of_Two(10) == True
+    assert is_Sum_Of_Powers_Of_Two(7) == False
+    assert is_Sum_Of_Powers_Of_Two(14) == True
+
+2026-10-25 05:51:34 - Error: .
+ Solution: def parabola_directrix(a, b, c):
+    k = -b / (2 * a)
+    directrix = k - 1 / (4 * a)
+    return directrix.
+ Test: def check():
+    assert parabola_directrix(5,3,2)==-198
+    assert parabola_directrix(9,8,4)==-2336
+    assert parabola_directrix(2,4,6)==-130
+
+2026-10-25 05:52:36 - Error: .
+ Solution: def replace_spaces(text):
+    text = text.replace(' ', '_')
+    text = text.replace('_', ' ')
+    return text.
+ Test: def check():
+    assert replace_spaces('Jumanji The Jungle') == 'Jumanji_The_Jungle'
+    assert replace_spaces('The_Avengers') == 'The Avengers'
+    assert replace_spaces('Fast and Furious') == 'Fast_and_Furious'
+
+2026-10-25 05:53:47 - Error: .
+ Solution: def count_vowels(test_str):
+    vowels = set('aeiouAEIOU')
+    count = 0
+    if test_str[0] in vowels and (len(test_str) == 1 or test_str[1] not in vowels):
+        count += 1
+    for i in range(1, len(test_str) - 1):
+        if test_str[i - 1] in vowels or test_str[i + 1] in vowels:
+            count += 1
+    if test_str[-1] in vowels and (len(test_str) == 1 or test_str[-2] not in vowels):
+        count += 1
+    return count.
+ Test: def check():
+    assert count_vowels('bestinstareels') == 7
+    assert count_vowels('partofthejourneyistheend') == 12
+    assert count_vowels('amazonprime') == 5
+
+2026-10-25 05:54:54 - Error: .
+ Solution: def find_First_Missing(array, start=0, end=None):
+    """
+    Finds the smallest missing number in a sorted list of natural numbers.
+    
+    :param array: List of sorted natural numbers
+    :param start: Starting index for the search (default is 0)
+    :param end: Ending index for the search (default is None, which means the last index of the array)
+    :return: The smallest missing number
+    """
+    if end is None:
+        end = len(array) - 1
+    if start > end:
+        return start
+    while start <= end:
+        mid = (start + end) // 2
+        if array[mid] == mid + array[0]:
+            start = mid + 1
+        else:
+            end = mid - 1
+    return start.
+ Test: def check():
+    assert find_First_Missing([0,1,2,3]) == 4
+    assert find_First_Missing([0,1,2,6,9]) == 3
+    assert find_First_Missing([2,3,5,8,9]) == 0
+
+2026-10-25 05:55:51 - Error: .
+ Solution: from typing import List
+def combinations_list(list1: List[int]) -> List[List[int]]:
+    """
+    Generate all possible combinations of the elements of a given list.
+    
+    Args:
+    list1: A list of integers.
+    
+    Returns:
+    A list of lists, where each inner list is a unique combination of elements from the input list.
+    """
+    if not list1:
+        return [[]]
+    first_element = list1[0]
+    rest_elements = list1[1:]
+    combinations_without_first = combinations_list(rest_elements)
+    combinations_with_first = [[first_element] + combo for combo in combinations_without_first]
+    all_combinations = combinations_without_first + combinations_with_first
+    return all_combinations.
+ Test: def check():
+    assert combinations_list(['orange', 'red', 'green', 'blue'])==[[], ['orange'], ['red'], ['red', 'orange'], ['green'], ['green', 'orange'], ['green', 'red'], ['green', 'red', 'orange'], ['blue'], ['blue', 'orange'], ['blue', 'red'], ['blue', 'red', 'orange'], ['blue', 'green'], ['blue', 'green', 'orange'], ['blue', 'green', 'red'], ['blue', 'green', 'red', 'orange']]
+    assert combinations_list(['red', 'green', 'blue', 'white', 'black', 'orange'])==[[], ['red'], ['green'], ['green', 'red'], ['blue'], ['blue', 'red'], ['blue', 'green'], ['blue', 'green', 'red'], ['white'], ['white', 'red'], ['white', 'green'], ['white', 'green', 'red'], ['white', 'blue'], ['white', 'blue', 'red'], ['white', 'blue', 'green'], ['white', 'blue', 'green', 'red'], ['black'], ['black', 'red'], ['black', 'green'], ['black', 'green', 'red'], ['black', 'blue'], ['black', 'blue', 'red'], ['black', 'blue', 'green'], ['black', 'blue', 'green', 'red'], ['black', 'white'], ['black', 'white', 'red'], ['black', 'white', 'green'], ['black', 'white', 'green', 'red'], ['black', 'white', 'blue'], ['black', 'white', 'blue', 'red'], ['black', 'white', 'blue', 'green'], ['black', 'white', 'blue', 'green', 'red'], ['orange'], ['orange', 'red'], ['orange', 'green'], ['orange', 'green', 'red'], ['orange', 'blue'], ['orange', 'blue', 'red'], ['orange', 'blue', 'green'], ['orange', 'blue', 'green', 'red'], ['orange', 'white'], ['orange', 'white', 'red'], ['orange', 'white', 'green'], ['orange', 'white', 'green', 'red'], ['orange', 'white', 'blue'], ['orange', 'white', 'blue', 'red'], ['orange', 'white', 'blue', 'green'], ['orange', 'white', 'blue', 'green', 'red'], ['orange', 'black'], ['orange', 'black', 'red'], ['orange', 'black', 'green'], ['orange', 'black', 'green', 'red'], ['orange', 'black', 'blue'], ['orange', 'black', 'blue', 'red'], ['orange', 'black', 'blue', 'green'], ['orange', 'black', 'blue', 'green', 'red'], ['orange', 'black', 'white'], ['orange', 'black', 'white', 'red'], ['orange', 'black', 'white', 'green'], ['orange', 'black', 'white', 'green', 'red'], ['orange', 'black', 'white', 'blue'], ['orange', 'black', 'white', 'blue', 'red'], ['orange', 'black', 'white', 'blue', 'green'], ['orange', 'black', 'white', 'blue', 'green', 'red']]
+    assert combinations_list(['red', 'green', 'black', 'orange'])==[[], ['red'], ['green'], ['green', 'red'], ['black'], ['black', 'red'], ['black', 'green'], ['black', 'green', 'red'], ['orange'], ['orange', 'red'], ['orange', 'green'], ['orange', 'green', 'red'], ['orange', 'black'], ['orange', 'black', 'red'], ['orange', 'black', 'green'], ['orange', 'black', 'green', 'red']]
+
+2026-10-25 05:56:41 - Error: argument of type 'int' is not iterable.
+ Solution: def check_K(test_tup, K):
+    return any((K in tup for tup in test_tup))
+test_tup = ((1, 2), (3, 4, 5), (6, 7, 8, 9))
+K = 5
+K = 10.
+ Test: def check():
+    assert check_K((10, 4, 5, 6, 8), 6) == True
+    assert check_K((1, 2, 3, 4, 5, 6), 7) == False
+    assert check_K((7, 8, 9, 44, 11, 12), 11) == True
+
+2026-10-25 05:57:44 - Error: unsupported operand type(s) for //: 'int' and 'tuple'.
+ Solution: def min_Jumps(steps, d):
+    """
+    Calculate the minimum number of jumps of given length required to reach a point of form (d, 0) from origin in a 2D plane.
+    
+    :param steps: int - The length of each jump.
+    :param d: int - The target distance on the x-axis.
+    :return: int - The minimum number of jumps required to reach the target. Returns -1 if it's not possible.
+    """
+    if d < 0:
+        return -1
+    if d == 0:
+        return 0
+    full_jumps = d // steps
+    remaining_distance = d % steps
+    if remaining_distance == 0:
+        return full_jumps
+    return full_jumps + 1.
+ Test: def check():
+    assert min_Jumps((3,4),11)==3.5
+    assert min_Jumps((3,4),0)==0
+    assert min_Jumps((11,14),11)==1
+
+2026-10-25 05:59:26 - Error: .
+ Solution: def all_Bits_Set_In_The_Given_Range(n, l, r):
+    """
+    Check if all bits in the range [l, r] of the integer n are set (i.e., 1).
+
+    :param n: Integer number to check bits in.
+    :param l: Left boundary of the bit range (1-based index).
+    :param r: Right boundary of the bit range (1-based index).
+    :return: True if all bits in the range [l, r] are set, False otherwise.
+    """
+    mask = (1 << r) - 1 ^ (1 << l - 1) - 1
+    mask = ~mask
+    mask >>= l - 1
+    return n & mask == mask.
+ Test: def check():
+    assert all_Bits_Set_In_The_Given_Range(4,1,2) == True
+    assert all_Bits_Set_In_The_Given_Range(17,2,4) == True
+    assert all_Bits_Set_In_The_Given_Range(39,4,6) == False
+
+2026-10-25 05:59:57 - Error: unsupported operand type(s) for +: 'int' and 'tuple'.
+ Solution: from itertools import combinations
+def find_combinations(test_list):
+    result = []
+    for r in range(1, len(test_list) + 1):
+        for comb in combinations(test_list, r):
+            result.append((sum(comb),) + comb)
+    return result.
+ Test: def check():
+    assert find_combinations([(2, 4), (6, 7), (5, 1), (6, 10)]) == [(8, 11), (7, 5), (8, 14), (11, 8), (12, 17), (11, 11)]
+    assert find_combinations([(3, 5), (7, 8), (6, 2), (7, 11)]) == [(10, 13), (9, 7), (10, 16), (13, 10), (14, 19), (13, 13)]
+    assert find_combinations([(4, 6), (8, 9), (7, 3), (8, 12)]) == [(12, 15), (11, 9), (12, 18), (15, 12), (16, 21), (15, 15)]
+
+2026-10-25 06:00:24 - Error: .
+ Solution: def even_bit_set_number(n):
+    mask = 2863311530
+    return n | mask.
+ Test: def check():
+    assert even_bit_set_number(10) == 10
+    assert even_bit_set_number(20) == 30
+    assert even_bit_set_number(30) == 30
+
+2026-10-25 06:00:43 - Error: .
+ Solution: def merge(lst):
+    first_elements = []
+    second_elements = []
+    for sub_lst in lst:
+        first_elements.append(sub_lst[0])
+        second_elements.append(sub_lst[1])
+    return [first_elements, second_elements].
+ Test: def check():
+    assert merge([['x', 'y'], ['a', 'b'], ['m', 'n']]) == [['x', 'a', 'm'], ['y', 'b', 'n']]
+    assert merge([[1, 2], [3, 4], [5, 6], [7, 8]]) == [[1, 3, 5, 7], [2, 4, 6, 8]]
+    assert merge([['x', 'y','z' ], ['a', 'b','c'], ['m', 'n','o']]) == [['x', 'a', 'm'], ['y', 'b', 'n'],['z', 'c','o']]
+
+2026-10-25 06:01:20 - Error: .
+ Solution: def count_divisors(n):
+    count = 0
+    for i in range(1, int(math.sqrt(n)) + 1):
+        if n % i == 0:
+            if n // i == i:
+                count += 1
+            else:
+                count += 2
+    return count
+n = 10.
+ Test: def check():
+    assert count_divisors(10)
+    assert not count_divisors(100)
+    assert count_divisors(125)
+
+2026-10-25 06:02:01 - Error: .
+ Solution: def re_arrange_array(arr, n):
+    first_n_elements = arr[:n]
+    negatives = [x for x in first_n_elements if x < 0]
+    positives = [x for x in first_n_elements if x >= 0]
+    rearranged = [None] * n
+    for i in range(len(negatives)):
+        rearranged[i] = negatives[i]
+    for i in range(len(positives)):
+        rearranged[len(negatives) + i] = positives[i]
+    for i in range(n):
+        arr[i] = rearranged[i]
+    return arr.
+ Test: def check():
+    assert re_arrange_array([-1, 2, -3, 4, 5, 6, -7, 8, 9], 9) == [-1, -3, -7, 4, 5, 6, 2, 8, 9]
+    assert re_arrange_array([12, -14, -26, 13, 15], 5) == [-14, -26, 12, 13, 15]
+    assert re_arrange_array([10, 24, 36, -42, -39, -78, 85], 7) == [-42, -39, -78, 10, 24, 36, 85]
+
+2026-10-25 06:03:09 - Error: .
+ Solution: def concatenate_tuple(test_tup, delimiter=' '):
+    res = delimiter.join((str(ele) for ele in test_tup))
+    return res
+test_tup = ('hello', 'world', 'this', 'is', 'a', 'tuple')
+delimiter = ' '.
+ Test: def check():
+    assert concatenate_tuple(("ID", "is", 4, "UTS") ) == 'ID-is-4-UTS'
+    assert concatenate_tuple(("QWE", "is", 4, "RTY") ) == 'QWE-is-4-RTY'
+    assert concatenate_tuple(("ZEN", "is", 4, "OP") ) == 'ZEN-is-4-OP'
+
+2026-10-25 06:04:14 - Error: .
+ Solution: def min_Swaps(str1, str2):
+    if str1.count('1') != str2.count('1'):
+        return -1
+    n = len(str1)
+    diff_indices = []
+    for i in range(n):
+        if str1[i] != str2[i]:
+            diff_indices.append(i)
+    if not diff_indices:
+        return 0
+    swaps = 0
+    i = 0
+    while i < len(diff_indices) - 1:
+        j = i + 1
+        while j < len(diff_indices) and diff_indices[j] - diff_indices[j - 1] == 1:
+            j += 1
+        swaps += (j - i - 1) // 2
+        i = j
+    return swaps.
+ Test: def check():
+    assert min_Swaps("1101","1110") == 1
+    assert min_Swaps("111","000") == "Not Possible"
+    assert min_Swaps("111","110") == "Not Possible"
+
+2026-10-25 06:05:29 - Error: .
+ Solution: def max_sum_increasing_subseq(a, n, index, k):
+    if k >= n:
+        return -1
+    dp = [0] * n
+    dp[0] = a[0]
+    for i in range(1, n):
+        dp[i] = a[i]
+        for j in range(i):
+            if a[j] < a[i]:
+                dp[i] = max(dp[i], dp[j] + a[i])
+    max_sum = 0
+    for i in range(index):
+        if a[i] < a[index]:
+            max_sum = max(max_sum, dp[i])
+    return max_sum + a[k]
+a = [1, 101, 2, 3, 100, 4, 5]
+n = len(a)
+k = 4
+index = 3.
+ Test: def check():
+    assert max_sum_increasing_subseq([1, 101, 2, 3, 100, 4, 5 ], 7, 4, 6) == 11
+    assert max_sum_increasing_subseq([1, 101, 2, 3, 100, 4, 5 ], 7, 2, 5) == 7
+    assert max_sum_increasing_subseq([11, 15, 19, 21, 26, 28, 31], 7, 2, 4) == 71
+
+2026-10-25 06:21:31 - Error: .
+ Solution: import re
+def find_adverb_position(text):
+    pattern = '\\b\\w*ly\\b'
+    matches = re.finditer(pattern, text)
+    adverbs_with_positions = [(m.group(), m.start()) for m in matches]
+    return adverbs_with_positions.
+ Test: def check():
+    assert find_adverb_position("clearly!! we can see the sky")==(0, 7, 'clearly')
+    assert find_adverb_position("seriously!! there are many roses")==(0, 9, 'seriously')
+    assert find_adverb_position("unfortunately!! sita is going to home")==(0, 13, 'unfortunately')
+
+2026-10-25 06:22:21 - Error: .
+ Solution: def min_k(test_list, K):
+    test_list.sort(key=lambda x: x[0])
+    return test_list[:K].
+ Test: def check():
+    assert min_k([('Manjeet', 10), ('Akshat', 4), ('Akash', 2), ('Nikhil', 8)], 2) == [('Akash', 2), ('Akshat', 4)]
+    assert min_k([('Sanjeev', 11), ('Angat', 5), ('Akash', 3), ('Nepin', 9)], 3) == [('Akash', 3), ('Angat', 5), ('Nepin', 9)]
+    assert min_k([('tanmay', 14), ('Amer', 11), ('Ayesha', 9), ('SKD', 16)], 1) == [('Ayesha', 9)]
+
+2026-10-25 06:22:33 - Error: .
+ Solution: def find_Rotations(s):
+    if len(s) <= 1:
+        return 0
+    concatenated = s + s
+    for i in range(1, len(s)):
+        rotated = concatenated[i:i + len(s)]
+        if rotated == s:
+            return i
+    return 0.
+ Test: def check():
+    assert find_Rotations("aaaa") == 1
+    assert find_Rotations("ab") == 2
+    assert find_Rotations("abc") == 3
+
+2026-10-25 06:24:23 - Error: .
+ Solution: def remove_kth_element(list1, L):
+    if 0 <= L < len(list1):
+        return list1[:L] + list1[L + 1:]
+    return list1.
+ Test: def check():
+    assert remove_kth_element([1,1,2,3,4,4,5,1],3)==[1, 1, 3, 4, 4, 5, 1]
+    assert remove_kth_element([0, 0, 1, 2, 3, 4, 4, 5, 6, 6, 6, 7, 8, 9, 4, 4],4)==[0, 0, 1, 3, 4, 4, 5, 6, 6, 6, 7, 8, 9, 4, 4]
+    assert remove_kth_element([10, 10, 15, 19, 18, 18, 17, 26, 26, 17, 18, 10],5)==[10,10,15,19, 18, 17, 26, 26, 17, 18, 10]
+
+2026-10-25 06:25:29 - Error: .
+ Solution: from typing import List
+def remove_duplicates(numbers: List[int]) -> List[int]:
+    seen = set()
+    unique_numbers = []
+    for number in numbers:
+        if number not in seen:
+            unique_numbers.append(number)
+            seen.add(number)
+    return unique_numbers.
+ Test: 
+
+METADATA = {
+    'author': 'jt',
+    'dataset': 'test'
+}
+
+
+def check(candidate):
+    assert candidate([]) == []
+    assert candidate([1, 2, 3, 4]) == [1, 2, 3, 4]
+    assert candidate([1, 2, 3, 2, 4, 3, 5]) == [1, 4, 5]
+
+2026-10-25 06:25:35 - Error: .
+ Solution: import re
+def file_name_check(file_name):
+    pattern = '^[a-zA-Z][a-zA-Z._]{0,8}[0-9]{0,3}(\\.txt|\\.exe|\\.dll)$'
+    return 'Yes' if re.match(pattern, file_name) else 'No'.
+ Test: def check(candidate):
+
+    # Check some simple cases
+    assert candidate("example.txt") == 'Yes'
+    assert candidate("1example.dll") == 'No'
+    assert candidate('s1sdf3.asd') == 'No'
+    assert candidate('K.dll') == 'Yes'
+    assert candidate('MY16FILE3.exe') == 'Yes'
+    assert candidate('His12FILE94.exe') == 'No'
+    assert candidate('_Y.txt') == 'No'
+    assert candidate('?aREYA.exe') == 'No'
+    assert candidate('/this_is_valid.dll') == 'No'
+    assert candidate('this_is_valid.wow') == 'No'
+    assert candidate('this_is_valid.txt') == 'Yes'
+    assert candidate('this_is_valid.txtexe') == 'No'
+    assert candidate('#this2_i4s_5valid.ten') == 'No'
+    assert candidate('@this1_is6_valid.exe') == 'No'
+    assert candidate('this_is_12valid.6exe4.txt') == 'No'
+    assert candidate('all.exe.txt') == 'No'
+    assert candidate('I563_No.exe') == 'Yes'
+    assert candidate('Is3youfault.txt') == 'Yes'
+    assert candidate('no_one#knows.dll') == 'Yes'
+    assert candidate('1I563_Yes3.exe') == 'No'
+    assert candidate('I563_Yes3.txtt') == 'No'
+    assert candidate('final..txt') == 'No'
+    assert candidate('final132') == 'No'
+    assert candidate('_f4indsartal132.') == 'No'
+    
+        
+
+    # Check some edge cases that are easy to work out by hand.
+    assert candidate('.txt') == 'No'
+    assert candidate('s.') == 'No'
+
+
+2026-10-25 06:25:58 - Error: This prints if this assert fails 1 (good for debugging!).
+ Solution: def encode(message):
+    vowels = 'aeiou'
+    vowel_shift = {'a': 'c', 'e': 'g', 'i': 'k', 'o': 'q', 'u': 'w', 'A': 'C', 'E': 'G', 'I': 'K', 'O': 'Q', 'U': 'W'}
+    encoded_message = []
+    for char in message:
+        if char in vowels:
+            encoded_message.append(vowel_shift[char])
+        else:
+            encoded_message.append(char.swapcase())
+    return ''.join(encoded_message).
+ Test: def check(candidate):
+
+    # Check some simple cases
+    assert candidate('TEST') == 'tgst', "This prints if this assert fails 1 (good for debugging!)"
+    assert candidate('Mudasir') == 'mWDCSKR', "This prints if this assert fails 2 (good for debugging!)"
+    assert candidate('YES') == 'ygs', "This prints if this assert fails 3 (good for debugging!)"
+    
+    # Check some edge cases that are easy to work out by hand.
+    assert candidate('This is a message') == 'tHKS KS C MGSSCGG', "This prints if this assert fails 2 (also good for debugging!)"
+    assert candidate("I DoNt KnOw WhAt tO WrItE") == 'k dQnT kNqW wHcT Tq wRkTg', "This prints if this assert fails 2 (also good for debugging!)"
+
+
+2026-10-25 06:26:42 - Error: .
+ Solution: def circular_shift(x, shift):
+    x_str = str(x)
+    length = len(x_str)
+    if shift >= length:
+        return x_str[::-1]
+    shift %= length
+    return x_str[-shift:] + x_str[:-shift].
+ Test: def check(candidate):
+
+    # Check some simple cases
+    assert candidate(100, 2) == "001"
+    assert candidate(12, 2) == "12"
+    assert candidate(97, 8) == "79"
+    assert candidate(12, 1) == "21", "This prints if this assert fails 1 (good for debugging!)"
+
+    # Check some edge cases that are easy to work out by hand.
+    assert candidate(11, 101) == "11", "This prints if this assert fails 2 (also good for debugging!)"
+
+
+2026-10-25 06:26:54 - Error: .
+ Solution: def anti_shuffle(s):
+    import re
+
+    def sort_word(word):
+        return ''.join(sorted(word))
+    tokens = re.findall('\\b\\w+\\b|\\S', s)
+    result = []
+    for token in tokens:
+        if token.isalpha():
+            result.append(sort_word(token))
+        else:
+            result.append(token)
+    return ''.join(result).
+ Test: def check(candidate):
+
+    # Check some simple cases
+    assert candidate('Hi') == 'Hi'
+    assert candidate('hello') == 'ehllo'
+    assert candidate('number') == 'bemnru'
+    assert candidate('abcd') == 'abcd'
+    assert candidate('Hello World!!!') == 'Hello !!!Wdlor'
+    assert candidate('') == ''
+    assert candidate('Hi. My name is Mister Robot. How are you?') == '.Hi My aemn is Meirst .Rboot How aer ?ouy'
+    # Check some edge cases that are easy to work out by hand.
+    assert True
+
+
+2026-10-25 06:27:06 - Error: .
+ Solution: def sum_squares(lst):
+    total = 0
+    for i, x in enumerate(lst):
+        if i % 3 == 0 and i % 4 != 0:
+            total += x ** 2
+        elif i % 4 == 0:
+            total += x ** 3
+    return total.
+ Test: def check(candidate):
+
+    # Check some simple cases
+    
+    assert candidate([1,2,3]) == 6
+    assert candidate([1,4,9]) == 14
+    assert candidate([]) == 0
+    assert candidate([1,1,1,1,1,1,1,1,1]) == 9
+    assert candidate([-1,-1,-1,-1,-1,-1,-1,-1,-1]) == -3
+    assert candidate([0]) == 0
+    assert candidate([-1,-5,2,-1,-5]) == -126
+    assert candidate([-56,-99,1,0,-2]) == 3030
+    assert candidate([-1,0,0,0,0,0,0,0,-1]) == 0
+    assert candidate([-16, -9, -2, 36, 36, 26, -20, 25, -40, 20, -4, 12, -26, 35, 37]) == -14196
+    assert candidate([-1, -3, 17, -1, -15, 13, -1, 14, -14, -12, -5, 14, -14, 6, 13, 11, 16, 16, 4, 10]) == -1448
+    
+    
+    # Don't remove this line:
+
+2026-10-25 06:27:41 - Error: .
+ Solution: 
+
+def poly(xs: list, x: float):
+    return sum(coeff * (x ** i) for i, coeff in enumerate(xs))
+
+import math
+def poly(xs: list, x: float):
+    return sum([coeff * math.pow(x, i) for i, coeff in enumerate(xs)])
+def find_zero(xs: list):
+    if len(xs) % 2 != 0:
+        raise ValueError('The number of coefficients must be even.')
+
+    def bisection(a, b):
+        while abs(a - b) > 1e-07:
+            mid = (a + b) / 2
+            if poly(xs, mid) == 0:
+                return mid
+            elif poly(xs, a) * poly(xs, mid) < 0:
+                b = mid
+            else:
+                a = mid
+        return (a + b) / 2
+    a, b = (-10, 10)
+    while poly(xs, a) * poly(xs, b) >= 0:
+        a, b = (a - 10, b + 10)
+    return bisection(a, b).
+ Test: 
+
+METADATA = {}
+
+
+def check(candidate):
+    import math
+    import random
+    rng = random.Random(42)
+    import copy
+    for _ in range(100):
+        ncoeff = 2 * rng.randint(1, 4)
+        coeffs = []
+        for _ in range(ncoeff):
+            coeff = rng.randint(-10, 10)
+            if coeff == 0:
+                coeff = 1
+            coeffs.append(coeff)
+        solution = candidate(copy.deepcopy(coeffs))
+        assert math.fabs(poly(coeffs, solution)) < 1e-4
+
+
+2026-10-25 06:29:22 - Error: .
+ Solution: def count_nums(arr):
+
+    def sum_of_digits(n):
+        total = 0
+        is_negative = n < 0
+        for char in str(n):
+            if char == '-':
+                continue
+            digit = int(char)
+            if is_negative and total >= 0:
+                digit = -digit
+            total += digit
+        return total if total != 0 else None
+    return sum((1 for num in arr if sum_of_digits(num) is not None)).
+ Test: def check(candidate):
+
+    # Check some simple cases
+    assert candidate([]) == 0
+    assert candidate([-1, -2, 0]) == 0
+    assert candidate([1, 1, 2, -2, 3, 4, 5]) == 6
+    assert candidate([1, 6, 9, -6, 0, 1, 5]) == 5
+    assert candidate([1, 100, 98, -7, 1, -1]) == 4
+    assert candidate([12, 23, 34, -45, -56, 0]) == 5
+    assert candidate([-0, 1**0]) == 1
+    assert candidate([1]) == 1
+
+    # Check some edge cases that are easy to work out by hand.
+    assert True, "This prints if this assert fails 2 (also good for debugging!)"
+
+
+2026-10-25 06:31:23 - Error: type complex doesn't define __round__ method.
+ Solution: def iscube(a):
+    """
+    Write a function that takes an integer a and returns True 
+    if this integer is a cube of some integer number.
+    Note: you may assume the input is always valid.
+    """
+    if a == 0:
+        return True
+    cube_root = round(a ** (1 / 3))
+    return cube_root ** 3 == abs(a).
+ Test: def check(candidate):
+
+    # Check some simple cases
+    assert candidate(1) == True, "First test error: " + str(candidate(1))
+    assert candidate(2) == False, "Second test error: " + str(candidate(2))
+    assert candidate(-1) == True, "Third test error: " + str(candidate(-1))
+    assert candidate(64) == True, "Fourth test error: " + str(candidate(64))
+    assert candidate(180) == False, "Fifth test error: " + str(candidate(180))
+    assert candidate(1000) == True, "Sixth test error: " + str(candidate(1000))
+
+
+    # Check some edge cases that are easy to work out by hand.
+    assert candidate(0) == True, "1st edge test error: " + str(candidate(0))
+    assert candidate(1729) == False, "2nd edge test error: " + str(candidate(1728))
+
+
+2026-10-25 06:31:40 - Error: .
+ Solution: def split_words(txt):
+    if ' ' in txt:
+        return txt.split(' ')
+    elif ',' in txt:
+        return txt.split(',')
+    else:
+        return sum((1 for c in txt if (ord(c) - ord('a')) % 2 == 1)).
+ Test: def check(candidate):
+
+    assert candidate("Hello world!") == ["Hello","world!"]
+    assert candidate("Hello,world!") == ["Hello","world!"]
+    assert candidate("Hello world,!") == ["Hello","world,!"]
+    assert candidate("Hello,Hello,world !") == ["Hello,Hello,world","!"]
+    assert candidate("abcdef") == 3
+    assert candidate("aaabb") == 2
+    assert candidate("aaaBb") == 1
+    assert candidate("") == 0
+
+2026-10-25 06:31:57 - Error: .
+ Solution: def starts_one_ends(n):
+    if n == 1:
+        return 1
+    return 2 * 10 ** (n - 1) - 10.
+ Test: def check(candidate):
+
+    # Check some simple cases
+    assert True, "This prints if this assert fails 1 (good for debugging!)"
+    assert candidate(1) == 1
+    assert candidate(2) == 18
+    assert candidate(3) == 180
+    assert candidate(4) == 1800
+    assert candidate(5) == 18000
+
+    # Check some edge cases that are easy to work out by hand.
+    assert True, "This prints if this assert fails 2 (also good for debugging!)"
+
+
+2026-10-25 06:32:52 - Error: Test 1.
+ Solution: def odd_count(lst):
+
+    def count_odds(s):
+        return sum((1 for c in s if int(c) % 2 != 0))
+    result = []
+    for index, s in enumerate(lst):
+        num_odds = count_odds(s)
+        result.append(f'the number of odd elements {num_odds}n the str{num_odds}ng {index + 1} of the {index + 1}nput.')
+    return result.
+ Test: def check(candidate):
+
+    # Check some simple cases
+    assert candidate(['1234567']) == ["the number of odd elements 4n the str4ng 4 of the 4nput."], "Test 1"
+    assert candidate(['3',"11111111"]) == ["the number of odd elements 1n the str1ng 1 of the 1nput.", "the number of odd elements 8n the str8ng 8 of the 8nput."], "Test 2"
+    assert candidate(['271', '137', '314']) == [
+        'the number of odd elements 2n the str2ng 2 of the 2nput.',
+        'the number of odd elements 3n the str3ng 3 of the 3nput.',
+        'the number of odd elements 2n the str2ng 2 of the 2nput.'
+    ]
+
+    # Check some edge cases that are easy to work out by hand.
+    assert True, "This prints if this assert fails 2 (also good for debugging!)"
+
+
+2026-10-25 06:33:14 - Error: This prints if this assert fails 2 (good for debugging!).
+ Solution: def fix_spaces(text):
+    result = []
+    space_count = 0
+    for char in text:
+        if char == ' ':
+            space_count += 1
+        else:
+            if space_count > 2:
+                result.append('-')
+            elif space_count == 2:
+                result.pop()
+            space_count = 0
+            result.append(char)
+    if space_count > 2:
+        result.append('-')
+    elif space_count == 2:
+        result.pop()
+    return ''.join(result).
+ Test: def check(candidate):
+
+    # Check some simple cases
+    assert candidate("Example") == "Example", "This prints if this assert fails 1 (good for debugging!)"
+    assert candidate("Mudasir Hanif ") == "Mudasir_Hanif_", "This prints if this assert fails 2 (good for debugging!)"
+    assert candidate("Yellow Yellow  Dirty  Fellow") == "Yellow_Yellow__Dirty__Fellow", "This prints if this assert fails 3 (good for debugging!)"
+    
+    # Check some edge cases that are easy to work out by hand.
+    assert candidate("Exa   mple") == "Exa-mple", "This prints if this assert fails 4 (good for debugging!)"
+    assert candidate("   Exa 1 2 2 mple") == "-Exa_1_2_2_mple", "This prints if this assert fails 4 (good for debugging!)"
+
+

@@ -204,20 +204,33 @@ def run_action_diagnosis(args: argparse.Namespace) -> dict[str, Any]:
 
 def run_communication_smoke(args: argparse.Namespace) -> dict[str, Any]:
     store = GraphStore()
-    store.add_node(task_id="smoke", branch_id="main", logical_id="task", node_type="task", content="A=5 B=3 sum", owner="user")
+    task = store.add_node(
+        task_id="smoke", branch_id="main", logical_id="task", node_type="task_source",
+        content="A=5 B=3 sum", owner="dataset",
+        provenance={"origin": "source", "visibility_class": "public"},
+    )
+    store.add_node(
+        task_id="smoke", branch_id="main", logical_id="query_spec", node_type="query_spec",
+        content={"task_type": "numeric_solve", "task_ref": task.node_id}, owner="runtime",
+        provenance={"origin": "runtime", "visibility_class": "public", "communication_scope": "MANDATORY"},
+    )
     compiler = ActionCompiler(store, task_id="smoke", task_type="numeric_solve")
     views = AgentGraphViewManager(store, task_id="smoke", branch_id="main", agents=("planner", "solver", "critic"))
     policy = make_communication_policy(args.communication_policy, seed=args.communication_seed)
     steps = [
-        ("planner", "solver", {"op": "declare_query", "content": {"question": "sum A and B", "task_type": "numeric_solve"}}),
-        ("planner", "solver", {"op": "add_fact", "id": "A", "value": 5}),
-        ("planner", "solver", {"op": "add_fact", "id": "B", "value": 3}),
-        ("planner", "solver", {"op": "add_plan_step", "id": "R1", "operation": "add", "inputs": ["A", "B"]}),
-        ("solver", "critic", {"op": "calculate", "id": "R1", "expression": "5+3", "value": 8}),
-        ("solver", "critic", {"op": "set_result", "id": "R1", "value": 8}),
+        ("planner", "solver", {
+            "op": "plan",
+            "facts": [
+                {"content": "A equals 5", "source": "task", "quote": "A=5"},
+                {"content": "B equals 3", "source": "task", "quote": "B=3"},
+            ],
+            "strategy": "add A and B",
+        }),
+        ("solver", "critic", {"op": "solve_numeric", "expression": "5+3", "value": "8"}),
     ]
     events = []
     for sender, receiver, action in steps:
+        compiler.set_node_ref_context({"visible_node_ids": tuple(store.snapshot().nodes)})
         result = compiler.apply(sender, action)
         views.grant(sender, node_ids=result.node_ids, local=True)
         state = store.snapshot()

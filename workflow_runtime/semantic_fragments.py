@@ -119,7 +119,7 @@ def all_fragment_ids(
 def render_fragmented_content(node: NodeVersion, visible_fragment_ids: Iterable[str]) -> Any:
     """Return only visible fields for a node.
 
-    An empty fragment set means the caller is using legacy node-level
+    An empty fragment set means the caller is using node-level
     visibility and should receive the full content.
     """
     visible = {str(item) for item in visible_fragment_ids}

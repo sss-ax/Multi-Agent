@@ -1,327 +1,180 @@
-"""Strict incremental Action IR used by the workflow runtime.
+"""The sole model-facing Semantic Delta v2 Action protocol.
 
-The model never writes GraphStore nodes or edges directly. It emits one small,
-role-scoped action at a time; the runtime validates and compiles that action
-into the versioned graph.
+Models emit small task-specific semantic objects. Graph identifiers, edges,
+provenance, verification nodes, routing, and finalization are kernel-owned.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Mapping
+from typing import Any, Mapping
 
-PROTOCOL_VERSION = "workflow-action/1.0"
-TASK_TYPES = frozenset({
-    "numeric_solve", "numeric_comparison", "table_qa", "multihop_qa", "multiple_choice", "code_generation",
-    "marble_research", "marble_bargaining", "marble_database",
-})
+from .semantic_actions import (
+    MODEL_TYPED_OPS,
+    TYPED_SEMANTIC_OPS,
+    model_semantic_ops,
+    semantic_action_example,
+    validate_typed_semantic_action,
+)
+from .task_spec import registered_task_types
+
+
+PROTOCOL_VERSION = "semantic-delta/2.0"
+TASK_TYPES = frozenset(registered_task_types())
 
 ROLE_SYSTEM_PROMPTS = {
-    "planner": "Read the visible task graph and emit one planner Action. Do not write GraphStore nodes directly and do not solve the task.",
-    "solver": "Read the visible dependency-aware graph and emit one solver Action that executes the plan or produces a domain artifact.",
-    "critic": "Read the visible result and dependency graph and emit one verification or error Action.",
-    "final_solver": "Read the verified result boundary and emit one answer Action that copies the verified value.",
+    "planner": "Read the visible Source Graph and emit only plan/fact semantics plus source references. The kernel owns graph structure.",
+    "solver": "Read the visible dependency-aware graph and emit only the domain solution semantics. The kernel owns result nodes and edges.",
+    "critic": "Read the visible result and dependency graph and emit only the task-specific verdict or diagnosis. The kernel owns verification and repair routing.",
+    "final_solver": "Finalization is deterministic and never calls a model.",
 }
 
 ROLE_ACTIONS = {
-    "planner": frozenset({
-        "declare_query", "add_fact", "add_evidence", "add_entity", "add_supporting_fact",
-        "add_evidence_link", "add_table", "add_table_cell", "add_requirement", "add_test",
-        "add_plan_step", "done",
-    }),
-    "solver": frozenset({
-        "calculate", "set_result", "emit_code", "set_execution", "set_test_result",
-        "call_tool", "report_error", "done",
-    }),
-    "critic": frozenset({"verify", "report_error", "done"}),
-    "final_solver": frozenset({"answer", "done"}),
+    "planner": frozenset({"plan", "done"}),
+    "solver": frozenset({*TYPED_SEMANTIC_OPS - {"plan"}, "repair_patch", "done"}),
+    "critic": frozenset({*MODEL_TYPED_OPS - TYPED_SEMANTIC_OPS, "done"}),
+    "final_solver": frozenset(),
 }
 
 ACTION_FIELDS = {
-    "declare_query": frozenset({"op", "content"}),
-    "add_fact": frozenset({"op", "id", "value"}),
-    "add_evidence": frozenset({"op", "id", "content"}),
-    "add_entity": frozenset({"op", "id", "content"}),
-    "add_supporting_fact": frozenset({"op", "id", "content"}),
-    "add_evidence_link": frozenset({"op", "id", "content"}),
-    "add_table": frozenset({"op", "content"}),
-    "add_table_cell": frozenset({"op", "id", "content"}),
-    "add_requirement": frozenset({"op", "content"}),
-    "add_test": frozenset({"op", "id", "content"}),
-    "add_plan_step": frozenset({"op", "id", "operation", "inputs"}),
-    "calculate": frozenset({"op", "id", "expression", "value"}),
-    "set_result": frozenset({"op", "id", "value"}),
-    "emit_code": frozenset({"op", "code"}),
-    "set_execution": frozenset({"op", "content", "success"}),
-    "set_test_result": frozenset({"op", "id", "content"}),
-    "call_tool": frozenset({"op", "call_id", "name", "arguments"}),
-    "verify": frozenset({
-        "op", "target", "status", "error_type", "error_location",
-        "reason", "repair_instruction", "preserve", "requested_fragments",
-    }),
-    "report_error": frozenset({"op", "content"}),
-    "answer": frozenset({"op", "source", "value"}),
+    "plan": frozenset({"op", "facts", "strategy"}),
+    "solve_numeric": frozenset({"op", "expression", "value"}),
+    "choose_option": frozenset({"op", "answer", "slot_reasons", "option_reviews", "confidence"}),
+    "submit_code": frozenset({"op", "code"}),
+    "answer_with_evidence": frozenset({"op", "answer", "bridge_entity", "citations", "reasoning"}),
+    "judge_numeric": frozenset({"op", "model_verdict", "error_type", "error_location", "reason", "repair_instruction"}),
+    "audit_choice": frozenset({"op", "candidate_version", "manifest_digest", "selected_option_check", "slot_checks", "option_checks", "summary"}),
+    "diagnose_code": frozenset({"op", "diagnosis", "repair_instruction"}),
+    "judge_evidence": frozenset({"op", "answer_support", "bridge_status", "citation_status", "repair_target", "reason"}),
+    "repair_patch": frozenset({"op", "action", "patch"}),
     "done": frozenset({"op"}),
 }
 
 
 def normalize_action_payload(payload: Any) -> Any:
-    """Normalize harmless model variations before strict validation.
-
-    Code models often include an ``id`` or ``language`` field with emitted
-    code.  The runtime stores code under a fixed logical boundary, so those
-    fields do not carry semantics and can be discarded safely.
-    """
-    if not isinstance(payload, dict):
-        return payload
-    op = payload.get("op")
-    if op == "emit_code":
-        if "code" in payload:
-            return {"op": "emit_code", "code": payload["code"]}
-        if "content" in payload:
-            return {"op": "emit_code", "code": payload["content"]}
-    if op == "set_result":
-        normalized = dict(payload)
-        value = normalized.get("value")
-        hotpot_keys = ("answer", "bridge_entity", "cited_fact_ids", "reasoning_chain")
-        option_keys = ("answer", "solver_choice", "independent_choice", "option_analysis", "confidence")
-        value_has_hotpot_shape = isinstance(value, dict) and any(key in value for key in hotpot_keys)
-        value_has_option_shape = isinstance(value, dict) and any(key in value for key in option_keys)
-        if any(key in normalized for key in hotpot_keys) or value_has_hotpot_shape:
-            value_obj = dict(value) if isinstance(value, dict) else {"answer": value}
-            for key in hotpot_keys:
-                if key in normalized and key not in value_obj:
-                    value_obj[key] = normalized[key]
-            value_obj.setdefault("answer", value_obj.get("value", ""))
-            value_obj.setdefault("bridge_entity", "")
-            value_obj.setdefault("cited_fact_ids", [])
-            value_obj.setdefault("reasoning_chain", [])
-            return {"op": "set_result", "id": normalized.get("id", "answer"), "value": value_obj}
-        if any(key in normalized for key in option_keys) or value_has_option_shape:
-            value_obj = dict(value) if isinstance(value, dict) else {"answer": value}
-            for key in option_keys:
-                if key in normalized and key not in value_obj:
-                    value_obj[key] = normalized[key]
-            value_obj.setdefault("answer", value_obj.get("value", ""))
-            value_obj.setdefault("solver_choice", value_obj.get("answer", ""))
-            value_obj.setdefault("independent_choice", "")
-            value_obj.setdefault("option_analysis", {})
-            value_obj.setdefault("confidence", 0.0)
-            return {"op": "set_result", "id": normalized.get("id", "answer"), "value": value_obj}
-    if op == "verify":
-        normalized = dict(payload)
-        for key in ("reason", "error_type", "error_location", "repair_instruction"):
-            if key not in normalized:
-                continue
-            value = normalized[key]
-            if key == "reason" and isinstance(value, (dict, list)):
-                normalized[key] = json.dumps(value, ensure_ascii=False)
-            elif value is None:
-                normalized[key] = ""
-            elif not isinstance(value, str):
-                normalized[key] = str(value)
-        normalized.setdefault("error_type", "")
-        normalized.setdefault("error_location", "")
-        normalized.setdefault("reason", "")
-        normalized.setdefault("repair_instruction", "")
-        normalized.setdefault("preserve", [])
-        normalized.setdefault("requested_fragments", [])
-        return normalized
+    """Return the payload unchanged; v2 has no compatibility normalization."""
     return payload
 
 
-def validate_action(role: str, payload: Any, *, task_type: str) -> List[str]:
-    payload = normalize_action_payload(payload)
-    errors: List[str] = []
+def _validate_repair_patch(role: str, task_type: str, payload: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if role != "solver" or task_type != "multihop_qa":
+        return ["repair_patch is only supported for multihop_qa solver repair"]
+    action_name = payload.get("action")
+    allowed = {"STOP", "ADD_EVIDENCE", "REPLACE_EVIDENCE", "PATCH_CITATIONS", "PATCH_BRIDGE", "REVISE_ANSWER"}
+    if action_name not in allowed:
+        errors.append("repair_patch.action is invalid")
+    patch = payload.get("patch")
+    if not isinstance(patch, dict):
+        return [*errors, "repair_patch.patch must be an object"]
+    if action_name == "STOP":
+        if patch:
+            errors.append("STOP repair_patch.patch must be empty")
+        return errors
+    if action_name in {"ADD_EVIDENCE", "REPLACE_EVIDENCE", "PATCH_CITATIONS"}:
+        if set(patch) != {"selected_fact_ids", "preserve_answer", "reasoning_chain"}:
+            errors.append("evidence repair patch keys must be exactly preserve_answer, reasoning_chain, selected_fact_ids")
+        if patch.get("preserve_answer") is not True:
+            errors.append("evidence repair patch must set preserve_answer=true")
+        refs = patch.get("selected_fact_ids")
+        if not isinstance(refs, list) or len(refs) < 2 or not all(isinstance(item, str) and item.strip() for item in refs):
+            errors.append("evidence repair patch requires at least two selected_fact_ids")
+    elif action_name == "PATCH_BRIDGE":
+        if set(patch) != {"bridge_entity", "preserve_answer", "reasoning_chain"}:
+            errors.append("PATCH_BRIDGE patch keys must be exactly bridge_entity, preserve_answer, reasoning_chain")
+        if patch.get("preserve_answer") is not True:
+            errors.append("PATCH_BRIDGE patch must set preserve_answer=true")
+        if not isinstance(patch.get("bridge_entity"), str) or not patch.get("bridge_entity", "").strip():
+            errors.append("PATCH_BRIDGE.bridge_entity must be non-empty")
+    elif action_name == "REVISE_ANSWER":
+        if set(patch) != {"answer", "reasoning_chain"}:
+            errors.append("REVISE_ANSWER patch keys must be exactly answer, reasoning_chain")
+        if not isinstance(patch.get("answer"), str) or not patch.get("answer", "").strip():
+            errors.append("REVISE_ANSWER.answer must be non-empty")
+    reasoning = patch.get("reasoning_chain")
+    if not isinstance(reasoning, list) or not reasoning or not all(isinstance(item, str) and item.strip() for item in reasoning):
+        errors.append("repair_patch.reasoning_chain must be a non-empty array of strings")
+    return errors
+
+
+def validate_action(
+    role: str,
+    payload: Any,
+    *,
+    task_type: str,
+    protocol_mode: str = "semantic_delta_v2",
+) -> list[str]:
+    if protocol_mode != "semantic_delta_v2":
+        return [f"unsupported action protocol: {protocol_mode}"]
     if role not in ROLE_ACTIONS:
         return [f"unknown action role: {role}"]
     if task_type not in TASK_TYPES:
-        errors.append(f"unsupported task_type: {task_type}")
+        return [f"Semantic Delta has no registered TaskSpec for {task_type}"]
     if not isinstance(payload, dict):
         return ["action must be exactly one JSON object"]
     op = payload.get("op")
     if not isinstance(op, str) or not op:
         return ["action op must be a non-empty string"]
+    errors: list[str] = []
     if op not in ROLE_ACTIONS[role]:
-        errors.append(f"{role} cannot emit action {op}")
+        errors.append(f"{role} cannot emit action {op} under {PROTOCOL_VERSION}")
     expected = ACTION_FIELDS.get(op)
     if expected is None:
-        errors.append(f"unknown action op: {op}")
-        return errors
+        return [*errors, f"unknown action op: {op}"]
     if set(payload) != expected:
         errors.append(f"{op} keys must be exactly {', '.join(sorted(expected))}")
-    for key, value in payload.items():
-        if key != "op" and value is None:
-            errors.append(f"{op}.{key} must not be null")
-    for key in ("id", "call_id"):
-        if key in payload and (not isinstance(payload[key], str) or not payload[key].strip()):
-            errors.append(f"{op}.{key} must be a non-empty string")
-    for key in ("target", "source"):
-        if key not in payload:
-            continue
-        value = payload[key]
-        if isinstance(value, str):
-            if not value.strip():
-                errors.append(f"{op}.{key} must be a non-empty string")
-        elif isinstance(value, dict):
-            allowed_ref_keys = {"logical_id", "type", "expected_type", "version"}
-            if not set(value).issubset(allowed_ref_keys):
-                errors.append(f"{op}.{key} NodeRef keys must be drawn from logical_id, type, expected_type, version")
-            if "logical_id" in value and (not isinstance(value["logical_id"], str) or not value["logical_id"].strip()):
-                errors.append(f"{op}.{key}.logical_id must be a non-empty string when present")
-            expected = value.get("expected_type", value.get("type", ""))
-            if expected and not isinstance(expected, str):
-                errors.append(f"{op}.{key}.expected_type must be a string")
-            if "version" in value and not isinstance(value["version"], int):
-                errors.append(f"{op}.{key}.version must be an integer when present")
-            if "logical_id" not in value and not expected:
-                errors.append(f"{op}.{key} NodeRef must include logical_id or expected_type/type")
-        else:
-            errors.append(f"{op}.{key} must be a string or NodeRef object")
-    if op == "add_plan_step":
-        if not isinstance(payload.get("operation"), str) or not payload["operation"].strip():
-            errors.append("add_plan_step.operation must be a non-empty string")
-        if not isinstance(payload.get("inputs"), list) or not all(isinstance(item, str) and item for item in payload["inputs"]):
-            errors.append("add_plan_step.inputs must be an array of non-empty strings")
-    if op == "set_execution" and not isinstance(payload.get("success"), bool):
-        errors.append("set_execution.success must be boolean")
-    if op == "set_result" and role == "solver" and task_type == "multiple_choice":
-        value = payload.get("value")
-        if not isinstance(value, dict):
-            errors.append(
-                "multiple_choice set_result.value must be an object with answer, "
-                "solver_choice, independent_choice, option_analysis, and confidence"
-            )
-        else:
-            required = {"answer", "solver_choice", "independent_choice", "option_analysis", "confidence"}
-            missing = sorted(key for key in required if key not in value)
-            if missing:
-                errors.append(f"multiple_choice set_result.value missing keys: {', '.join(missing)}")
-            if "option_analysis" in value and not isinstance(value.get("option_analysis"), dict):
-                errors.append("multiple_choice set_result.value.option_analysis must be an object")
-    if op == "set_result" and role == "solver" and task_type == "multihop_qa":
-        value = payload.get("value")
-        if not isinstance(value, dict):
-            errors.append(
-                "multihop_qa set_result.value must be an object with answer, "
-                "bridge_entity, cited_fact_ids, and reasoning_chain"
-            )
-        else:
-            required = {"answer", "bridge_entity", "cited_fact_ids", "reasoning_chain"}
-            missing = sorted(key for key in required if key not in value)
-            if missing:
-                errors.append(f"multihop_qa set_result.value missing keys: {', '.join(missing)}")
-            for key in ("cited_fact_ids", "reasoning_chain"):
-                if key in value and not isinstance(value.get(key), list):
-                    errors.append(f"multihop_qa set_result.value.{key} must be an array")
-    if op == "call_tool":
-        if not isinstance(payload.get("name"), str) or not payload["name"].strip():
-            errors.append("call_tool.name must be a non-empty string")
-        if not isinstance(payload.get("arguments"), dict):
-            errors.append("call_tool.arguments must be an object")
-    if op == "verify" and payload.get("status") not in {"verified", "need_fix", "uncertain"}:
-        errors.append("verify.status must be verified, need_fix, or uncertain")
-    if op == "verify":
-        for key in ("error_type", "error_location", "reason", "repair_instruction"):
-            if not isinstance(payload.get(key), str):
-                errors.append(f"verify.{key} must be a string")
-        for key in ("preserve", "requested_fragments"):
-            if not isinstance(payload.get(key), list) or not all(isinstance(item, str) for item in payload.get(key, [])):
-                errors.append(f"verify.{key} must be an array of strings")
-        if payload.get("status") == "need_fix":
-            for key in ("error_type", "error_location", "repair_instruction"):
-                if not str(payload.get(key, "")).strip():
-                    errors.append(f"need_fix verify.{key} must be non-empty")
+    if op in MODEL_TYPED_OPS:
+        errors.extend(validate_typed_semantic_action(role, task_type, payload))
+    elif op == "repair_patch":
+        errors.extend(_validate_repair_patch(role, task_type, payload))
     return errors
 
 
-def parse_action(text: str, *, role: str, task_type: str) -> Dict[str, Any]:
+def parse_action(
+    text: str,
+    *,
+    role: str,
+    task_type: str,
+    protocol_mode: str = "semantic_delta_v2",
+) -> dict[str, Any]:
     try:
-        value = normalize_action_payload(json.loads(text))
+        value = json.loads(text)
     except (json.JSONDecodeError, TypeError) as exc:
         raise ValueError(f"{role} output must be exactly one Action JSON object") from exc
-    errors = validate_action(role, value, task_type=task_type)
+    errors = validate_action(role, value, task_type=task_type, protocol_mode=protocol_mode)
     if errors:
         raise ValueError(f"invalid {role} Action: {'; '.join(errors)}")
     return value
 
 
-def action_contract(role: str, task_type: str) -> str:
-    allowed = ", ".join(sorted(ROLE_ACTIONS[role]))
-    examples = {
-        "planner": '{"op":"add_fact","id":"A","value":2}',
-        "solver": '{"op":"calculate","id":"R1","expression":"2+3","value":5}',
-        "critic": '{"op":"verify","target":"result","status":"verified","error_type":"","error_location":"","reason":"","repair_instruction":"","preserve":[],"requested_fragments":[]}',
-        "final_solver": '{"op":"answer","source":"result","value":5}',
-    }
-    solver_rule = (
-        "Solver must use calculate and set_result for numeric work; it may call an allowlisted tool with call_tool; it must not emit planner Actions."
-    )
-    if task_type == "multiple_choice":
-        solver_rule = (
-            "Solver must choose one option and emit set_result whose value is an object containing "
-            "answer, solver_choice, independent_choice, option_analysis, and confidence. Bare option "
-            "letters are invalid. It must not emit planner Actions."
-        )
-    elif task_type == "multihop_qa":
-        solver_rule = (
-            "Solver must answer from the provided evidence and emit set_result whose value is an "
-            "object containing answer, bridge_entity, cited_fact_ids, and reasoning_chain. Bare text "
-            "answers are invalid. cited_fact_ids must refer to visible supporting_fact ids, titles, "
-            "or title:sent_id references. It must not emit planner Actions."
-        )
-    elif task_type == "code_generation":
-        solver_rule = "Solver must emit executable Python code with emit_code; it must not emit planner Actions."
-    elif task_type in {"marble_research", "marble_bargaining", "marble_database"}:
-        solver_rule = "Solver must emit the domain artifact with set_result; it must not emit planner Actions."
-    critic_rule = (
-        "Critic must verify an existing result or report an error; it must not create a result. "
-        "For status=need_fix, include actionable diagnostic fields: error_type, "
-        "error_location, repair_instruction, preserve, and requested_fragments."
-    )
-    if task_type == "multihop_qa":
-        critic_rule = (
-            "Critic is the semantic entailment judge for HotpotQA. Verify only when the cited "
-            "supporting facts and reasoning_chain entail the answer through the bridge_entity. "
-            "For status=verified, verify.reason must be a JSON string with hop1_conclusion, "
-            "hop2_conclusion, derived_answer, candidate_answer, match, contradiction, and "
-            "answers_question; match and answers_question must be true and contradiction false. "
-            "If a citation is irrelevant, a hop is "
-            "missing, the bridge is wrong, the cited facts contradict the answer, or entailment "
-            "is insufficient, emit need_fix with error_type from invalid_citation, missing_hop, "
-            "incomplete_evidence_chain, wrong_bridge_entity, answer_not_supported, or "
-            "answer_contradicted. Do not mark verified merely because cited facts exist."
-        )
-    elif task_type == "multiple_choice":
-        critic_rule = (
-            "Critic must verify the semantic option analysis, not just label validity. Verify only "
-            "when option_analysis supports the solver_choice, contradicts plausible alternatives, "
-            "and independent_choice agrees with the final answer. Otherwise emit need_fix with "
-            "actionable diagnostics."
-        )
-    stage_rules = {
-        "planner": (
-            "Planner may use add_fact only for facts explicitly present in the task. "
-            "For numeric tasks, do not put a derived answer into add_fact; emit add_plan_step "
-            "for the operation and operands before finishing."
-        ),
-        "solver": solver_rule,
-        "critic": critic_rule,
-        "final_solver": "Finalizer must copy an existing verified result using answer; it must not recalculate.",
-    }[role]
+def action_contract(role: str, task_type: str, protocol_mode: str = "semantic_delta_v2") -> str:
+    if protocol_mode != "semantic_delta_v2":
+        raise ValueError(f"unsupported action protocol: {protocol_mode}")
+    if role == "final_solver":
+        return "Finalization is a deterministic kernel transition; no model Action is allowed."
+    allowed = ", ".join(sorted({*model_semantic_ops(role, task_type), "done"}))
+    # A positive Critic example is actively harmful for multiple-choice audit:
+    # it anchors a small model to copying "supported" without reading the
+    # question.  The workflow supplies the concrete manifest and audit rules
+    # in its role-specific prompt instead.
+    if role == "critic" and task_type == "multiple_choice":
+        example = "<no fixed example; copy the immutable manifest claim IDs and judge each claim independently>"
+    else:
+        example = json.dumps(semantic_action_example(role, task_type), ensure_ascii=False, separators=(",", ":"))
     return (
         f"Action protocol {PROTOCOL_VERSION}. Task type={task_type}. "
         f"Emit exactly one JSON object per call. Allowed op values: {allowed}. "
         "The object must contain exactly the fields required by its op. "
-        "Do not emit GraphStore node IDs, versions, edges, task nodes, markdown, "
-        "explanations, or a second object. Emit {\"op\":\"done\"} when the role has no more Actions. "
-        "The runtime also ends the role when its required graph boundary is complete. "
-        f"{stage_rules} "
-        f"Example shape for {role}: {examples[role]}"
+        "Emit only semantic content and visible source references. Do not emit nodes, edges, IDs, "
+        "temporary IDs, provenance, versions, status, visibility, completion flags, routing, send hints, "
+        "markdown, explanations outside JSON, or a second object. The deterministic kernel validates and "
+        "compiles the action, owns verification, and finalizes verified results. "
+        f"Example shape for {role}: {example}"
     )
 
 
 def render_role_context(role: str, values: Mapping[str, Any]) -> str:
+    """Render a compact canonical view for callers outside ContextSlicer."""
     def content(name: str) -> str:
         value = values.get(name, [])
         return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -329,37 +182,16 @@ def render_role_context(role: str, values: Mapping[str, Any]) -> str:
         return f"<GRAPH>\n<TASK>{content('task')}</TASK>\n</GRAPH>"
     if role == "solver":
         lines = ["<GRAPH>", f"<QUERY_SPEC>{content('query_spec')}</QUERY_SPEC>"]
-        domain_tags = (("table", "TABLE"), ("table_cell", "TABLE_CELL"), ("evidence", "EVIDENCE"), ("choice", "CHOICE"), ("entity", "ENTITY"), ("supporting_fact", "SUPPORTING_FACT"), ("evidence_link", "EVIDENCE_LINK"), ("requirements", "REQUIREMENTS"), ("code", "CODE"), ("test", "TEST"), ("execution", "EXECUTION"), ("error", "ERROR"))
-        if any(name in values for name, _ in domain_tags):
-            lines.extend(f"<{tag}>{content(name)}</{tag}>" for name, tag in domain_tags if name in values)
-        else:
-            lines.append(f"<FACTS>{content('facts')}</FACTS>")
-        lines.extend([f"<PLAN>{content('plan')}</PLAN>", f"<PLAN_STEPS>{content('plan_steps')}</PLAN_STEPS>", "</GRAPH>"])
+        for name, tag in (("choice", "CHOICE"), ("evidence", "EVIDENCE"), ("requirements", "REQUIREMENTS"), ("test", "TEST")):
+            if name in values:
+                lines.append(f"<{tag}>{content(name)}</{tag}>")
+        lines.extend([f"<FACTS>{content('facts')}</FACTS>", f"<PLAN>{content('plan')}</PLAN>", "</GRAPH>"])
         return "\n".join(lines)
     if role == "critic":
         lines = ["<GRAPH>", f"<TASK>{content('task')}</TASK>", f"<QUERY_SPEC>{content('query_spec')}</QUERY_SPEC>"]
-        if "choice" in values:
-            lines.append(f"<CHOICE>{content('choice')}</CHOICE>")
-        if "entity" in values:
-            lines.append(f"<ENTITY>{content('entity')}</ENTITY>")
-        if "supporting_fact" in values:
-            lines.append(f"<SUPPORTING_FACT>{content('supporting_fact')}</SUPPORTING_FACT>")
-        if "evidence_link" in values:
-            lines.append(f"<EVIDENCE_LINK>{content('evidence_link')}</EVIDENCE_LINK>")
-        if "evidence" in values:
-            lines.append(f"<EVIDENCE>{content('evidence')}</EVIDENCE>")
-        lines.extend([f"<FACTS>{content('facts')}</FACTS>", f"<CALCULATION>{content('calculation')}</CALCULATION>", f"<RESULT>{content('result')}</RESULT>", "</GRAPH>"])
+        for name, tag in (("choice", "CHOICE"), ("supporting_fact", "SUPPORTING_FACT"), ("evidence", "EVIDENCE"), ("calculation", "CALCULATION"), ("execution", "EXECUTION"), ("result", "RESULT")):
+            if name in values:
+                lines.append(f"<{tag}>{content(name)}</{tag}>")
+        lines.append("</GRAPH>")
         return "\n".join(lines)
-    if role == "final_solver":
-        result = values["result"]
-        if isinstance(result, str):
-            result = json.loads(result)
-        result = dict(result)
-        result["status"] = "verified"
-        return "\n".join(["<GRAPH>", f"<QUERY_SPEC>{content('query_spec')}</QUERY_SPEC>", f"<RESULT status=\"verified\">{json.dumps(result, ensure_ascii=False, separators=(',', ':'))}</RESULT>", '<VERIFY status="verified">verified</VERIFY>', "</GRAPH>"])
-    raise ValueError(f"no canonical context renderer for role: {role}")
-
-
-def require_exact_copy(answer: Any, result_value: Any) -> None:
-    if str(answer).strip() != str(result_value):
-        raise ValueError("final_solver answer must exactly copy RESULT.value")
+    raise ValueError(f"no model context renderer for role: {role}")

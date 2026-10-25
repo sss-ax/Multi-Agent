@@ -81,7 +81,7 @@ def test_summary_does_not_treat_unevaluated_runs_as_correct():
     assert mode["tokens_per_runtime_success"] == 12
 
 
-def test_marble_research_workflow_uses_generic_boundaries():
+def test_unregistered_marble_workflow_is_fail_closed():
     store = GraphStore()
     store.add_node(
         task_id="m",
@@ -91,36 +91,6 @@ def test_marble_research_workflow_uses_generic_boundaries():
         content="[domain=marble_research]\nWrite a proposal",
         owner="user",
     )
-    queues = {
-        "planner": [
-            {"op": "declare_query", "content": {"question": "Write a proposal", "task_type": "marble_research"}},
-            {"op": "add_plan_step", "id": "M1", "operation": "synthesize", "inputs": ["task"]},
-            {"op": "done"},
-        ],
-        "solver": [
-            {"op": "set_result", "id": "proposal", "value": "proposal text"},
-            {"op": "done"},
-        ],
-        "critic": [
-            {"op": "verify", "target": "result", "status": "verified"},
-            {"op": "done"},
-        ],
-        "final_solver": [
-            {"op": "answer", "source": "result", "value": "proposal text"},
-            {"op": "done"},
-        ],
-    }
-
-    def model(request):
-        return queues[request.role].pop(0)
-
-    workflow = LangGraphWorkflow(store=store, model=model, task_id="m", task_type="marble_research")
-    try:
-        from langgraph.checkpoint.memory import MemorySaver
-    except ImportError:
-        return
-    result = workflow.compile(checkpointer=MemorySaver()).invoke(
-        workflow.initial_state(), {"configurable": {"thread_id": "m"}}
-    )
-    assert result["status"] == "running"
-    assert store.latest_valid("m", "main", "final_answer").content == "proposal text"
+    import pytest
+    with pytest.raises(ValueError, match="does not support"):
+        LangGraphWorkflow(store=store, model=lambda request: {}, task_id="m", task_type="marble_research")

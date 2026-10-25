@@ -165,6 +165,7 @@ def main() -> None:
                 "parse_fail": bool(parse_fail),
                 "candidate_count": len(event.get("candidates", [])),
                 "selector_need": selector_need,
+                "state": event.get("state", {}),
             })
 
     settings_summary = _summarize(setting_rows)
@@ -207,6 +208,7 @@ def _event(record: dict[str, Any], row: dict[str, Any] | None, *, candidate_limi
         )
         for index, candidate in enumerate(candidates)
     ]
+    state = _error_state(record, row)
     return {
         "sample_id": str(record.get("sample_id", "")),
         "question": str(row.get("question", "")),
@@ -215,7 +217,84 @@ def _event(record: dict[str, Any], row: dict[str, Any] | None, *, candidate_limi
         "gold_in_topk": any(bridge_matches_any(candidate, gold_bridges) for candidate in candidates),
         "candidates": candidates,
         "candidate_chains": chains,
+        "state": state,
     }
+
+
+def _error_state(record: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    """Extract the erroneous intermediate result and critic diagnosis.
+
+    This deliberately uses runtime state rather than the gold answer.  Gold
+    labels remain offline-only scoring data; the selector must see what the
+    repair loop actually saw.
+    """
+    logs = record.get("runtime_summary", {}).get("records", [])
+    current: dict[str, Any] = {}
+    diagnosis: dict[str, Any] = {}
+    for log in logs if isinstance(logs, list) else []:
+        action = log.get("action") if isinstance(log, dict) else None
+        if not isinstance(action, dict):
+            continue
+        if log.get("role") == "solver" and action.get("op") == "answer_with_evidence" and not current:
+            current = {
+                "answer": action.get("answer"),
+                "bridge_entity": action.get("bridge_entity"),
+                "cited_fact_ids": action.get("citations", []),
+                "reasoning_chain": action.get("reasoning", []),
+            }
+        if log.get("role") == "critic" and action.get("op") == "judge_evidence" and action.get("repair_target") != "none":
+            diagnosis = action
+            break
+    packet = _repair_packet_from_diagnosis(diagnosis)
+    cited = [str(item) for item in current.get("cited_fact_ids", []) if str(item).strip()]
+    missing_slots = packet.get("missing_slots") if isinstance(packet.get("missing_slots"), list) else []
+    if not missing_slots:
+        required = packet.get("required") if isinstance(packet.get("required"), list) else []
+        missing_slots = [str(item) for item in required if str(item).strip()]
+    if not missing_slots:
+        missing_slots = _default_missing_slots(str(diagnosis.get("error_type", "")), str(row.get("question", "")))
+    return {
+        "current_answer": current.get("answer", ""),
+        "current_cited_facts": cited,
+        "critic_error_type": str(diagnosis.get("error_type", "") or ""),
+        "critic_error_location": str(diagnosis.get("error_location", "") or ""),
+        "valid_existing_evidence": [str(item) for item in packet.get("valid_cited_fact_ids", []) if str(item).strip()],
+        "answer_type": _answer_type(str(row.get("question", "")), str(current.get("answer", ""))),
+        "missing_slots": missing_slots,
+    }
+
+
+def _repair_packet_from_diagnosis(diagnosis: dict[str, Any]) -> dict[str, Any]:
+    reason = diagnosis.get("reason", "")
+    if isinstance(reason, dict):
+        payload = reason
+    else:
+        try:
+            payload = json.loads(str(reason))
+        except (TypeError, ValueError):
+            payload = {}
+    packet = payload.get("repair_packet", {}) if isinstance(payload, dict) else {}
+    return packet if isinstance(packet, dict) else {}
+
+
+def _default_missing_slots(error_type: str, question: str) -> list[str]:
+    if error_type == "missing_hop":
+        return ["missing_hop_evidence"]
+    if error_type in {"invalid_citation", "cited_fact_ids"}:
+        return ["valid_citation"]
+    if error_type == "wrong_bridge_entity":
+        return ["bridge_entity"]
+    if error_type in {"answer_not_supported", "answer_contradicted"}:
+        return ["answer_support"]
+    return ["answer_type_yes_no" if _answer_type(question, "") == "yes_no" else "answer_support"]
+
+
+def _answer_type(question: str, answer: str) -> str:
+    if re.search(r"\b(yes|no)\b|\b(whether|is|are|was|were|did|do|does|can)\b", question, flags=re.I):
+        return "yes_no"
+    if re.fullmatch(r"\s*(yes|no)\s*[.!]?\s*", answer, flags=re.I):
+        return "yes_no"
+    return "short_answer"
 
 
 def _delivered_candidates(record: dict[str, Any], *, limit: int) -> list[str]:
@@ -271,7 +350,13 @@ def _chain_for_bridge(candidate: str, *, facts: list[dict[str, Any]], question: 
         hop2_fact_ids=[fact["fact_id"] for fact in hop2],
         derived_answer=derived_hint,
     )
-    return view.as_dict()
+    payload = view.as_dict()
+    payload["evidence_package"] = {
+        "fact_ids": list(payload.get("cited_fact_ids", [])),
+        "hop1": payload.get("hop1_key_sentence", ""),
+        "hop2": payload.get("hop2_key_sentence", ""),
+    }
+    return payload
 
 
 def _rank_facts(query: str, facts: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
@@ -334,6 +419,7 @@ def _model_select(
     )
     raw, metrics = _call_selector_model(model, prompt, session_key=f"bridge-chain-rerank:{seed}")
     selected, parse_fail = _parse_selected_bridge(raw, event["candidate_chains"])
+    selector_need["predicted_missing_slots"] = _parse_missing_slots(raw)
     return selected, raw, metrics, parse_fail, selector_need
 
 
@@ -350,6 +436,7 @@ def _cheap_receiver_select(
     cheap_prompt = _cheap_selector_prompt(event, cheap_blocks)
     cheap_raw, cheap_metrics = _call_selector_model(model, cheap_prompt, session_key=f"cheap-provisional:{seed}")
     provisional = _parse_provisional_selection(cheap_raw, event["candidate_chains"])
+    provisional["predicted_missing_slots"] = _parse_missing_slots(cheap_raw)
     selected = provisional["selected_bridge"]
     parse_fail = bool(provisional["parse_fail"])
     gap = float(provisional.get("top1_score", 0.0) or 0.0) - float(provisional.get("top2_score", 0.0) or 0.0)
@@ -487,17 +574,25 @@ def _selection_prompt(
 
 
 def _selection_prompt_text(event: dict[str, Any], blocks: list[str]) -> str:
+    state = event.get("state", {})
     return (
-        "Given the HotpotQA question and candidate bridge/evidence chains, choose the best existing candidate.\n"
+        "You are repairing an erroneous intermediate HotpotQA state. First identify the missing information slots; "
+        "then choose the candidate evidence package that fills those slots. Do not rank evidence independently of "
+        "the current error state.\n"
         "Check whether the evidence connects the bridge to what the question asks. "
         f"There are exactly {len(event['candidate_chains'])} candidates: "
         + ", ".join(str(chain["candidate_id"]) for chain in event["candidate_chains"])
         + ". Do not create new candidates. Do not repeat or continue the candidate list. "
         "Return one JSON object only with schema: "
-        "{\"ranked_candidate_ids\":[\"c1\"],\"selected_candidate_id\":\"c1\","
-        "\"confidence\":0.0,\"decisive_evidence\":\"...\"}. "
+        "{\"missing_slots\":[\"slot\"],\"ranked_candidate_ids\":[\"c1\"],"
+        "\"selected_candidate_id\":\"c1\",\"confidence\":0.0,"
+        "\"decisive_evidence\":\"...\"}. "
         "Keep decisive_evidence under 12 words.\n\n"
         f"Question:\n{event['question']}\n\n"
+        "Current erroneous state:\n"
+        + json.dumps(state, ensure_ascii=False, sort_keys=True)
+        + "\n\n"
+        "The missing_slots field must name the information needed to repair this state before selecting a candidate.\n\n"
         "Candidates:\n"
         + "\n\n".join(blocks)
         + "\n\nSelection JSON:\n"
@@ -505,17 +600,22 @@ def _selection_prompt_text(event: dict[str, Any], blocks: list[str]) -> str:
 
 
 def _cheap_selector_prompt(event: dict[str, Any], blocks: list[str]) -> str:
+    state = event.get("state", {})
     return (
-        "Given the HotpotQA question and minimal candidate summaries, make a provisional ranking.\n"
+        "Given the erroneous HotpotQA intermediate state and minimal candidate summaries, first identify missing "
+        "information slots, then make a provisional ranking.\n"
         "Use only bridge, derived answer, answer type, and alignment-lite. Do not assume missing hop evidence. "
         f"There are exactly {len(event['candidate_chains'])} candidates: "
         + ", ".join(str(chain["candidate_id"]) for chain in event["candidate_chains"])
         + ". Return one JSON object only with schema: "
-        "{\"ranking\":[\"c1\",\"c2\"],\"selected_candidate_id\":\"c1\","
+        "{\"missing_slots\":[\"slot\"],\"ranking\":[\"c1\",\"c2\"],\"selected_candidate_id\":\"c1\","
         "\"top1_score\":0.0,\"top2_score\":0.0,\"confidence\":0.0,"
         "\"uncertainty_type\":\"low|medium|high\"}. "
         "Scores and confidence must be between 0 and 1.\n\n"
         f"Question:\n{event['question']}\n\n"
+        "Current erroneous state:\n"
+        + json.dumps(state, ensure_ascii=False, sort_keys=True)
+        + "\n\n"
         "Minimal candidates:\n"
         + "\n\n".join(blocks)
         + "\n\nProvisional JSON:\n"
@@ -897,6 +997,15 @@ def _parse_selected_bridge(raw: str, chains: list[dict[str, Any]]) -> tuple[str,
         if candidate_id in by_id:
             return by_id[candidate_id], False
     return (chains[0]["bridge_entity"] if chains else ""), True
+
+
+def _parse_missing_slots(raw: str) -> list[str]:
+    try:
+        payload = json.loads(_json_object(raw))
+    except Exception:
+        return []
+    values = payload.get("missing_slots") if isinstance(payload, dict) else None
+    return [str(item).strip() for item in values if str(item).strip()] if isinstance(values, list) else []
 
 
 def _parse_provisional_selection(raw: str, chains: list[dict[str, Any]]) -> dict[str, Any]:

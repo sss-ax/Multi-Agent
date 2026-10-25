@@ -40,7 +40,7 @@ GraphStore 节点和依赖边
 例如：
 
 ```json
-{"op":"add_fact","id":"A","value":2}
+{"op":"solve_numeric","expression":"2+3","value":"5"}
 ```
 
 模型不能直接写入 `task`、节点版本或图边；这些由 Runtime 根据角色权限和 Action 内容确定性生成。每个角色连续产生 Action，直到输出：
@@ -61,7 +61,7 @@ receiver_view += Delta_send
 
 如果 receiver 已经拥有依赖节点，closure 不会重复发送；如果 receiver 缺少依赖，closure 会自动补齐，避免发送断裂图。
 
-运行时支持工具和分支：Solver 可以通过 `call_tool` 调用 `ToolRegistry` 中的白名单工具，工具请求和结果都会写入 GraphStore；`GraphStore.create_branch`/`merge_branch` 提供隔离的分支版本空间，`LangGraphWorkflow.fork` 会生成独立的 branch workflow。
+运行时的工具调用由内核按任务类型触发并受白名单与隔离边界控制；模型不能直接提交工具调用。`GraphStore.create_branch`/`merge_branch` 提供隔离的分支版本空间，`LangGraphWorkflow.fork` 会生成独立的 branch workflow。
 
 ## 运行时边界
 
@@ -80,9 +80,63 @@ receiver_view += Delta_send
 - `GraphStore.create_branch/merge_branch`：分支 fork、隔离写入和带 provenance 的合并。
 - 模型角色不再使用 LoRA adapter。
 
+## Source Graph 与 Semantic Delta v2
+
+运行时只支持严格的 `semantic_delta_v2` 语义动作协议，其边界是：
+
+```text
+PUBLIC Source Graph
+  -> model typed semantic action (no IDs/edges/routing)
+  -> schema validator
+  -> deterministic lowering to internal Semantic Delta
+  -> SemanticDeltaValidator
+  -> atomic SemanticDeltaCompiler/GraphStore commit
+  -> receiver-relative closure and budget enforcement
+```
+
+节点 provenance 显式记录 `origin`、`trust` 和 `visibility_class`。`PUBLIC` Source 可进入模型视图；`ROLE_SCOPED` 只在 owner/授权后可见；`TOOL_ONLY` 只对工具角色可见；`EVALUATOR_ONLY` 永不进入模型视图。gold answer、Hotpot supporting-fact labels 和官方/私有代码测试由 `EvaluationContext` 保存，不写入模型 GraphStore。
+
+协议无需 CLI 选择，也不存在旧协议回退。正式通信基线包括 `send_all`、`mandatory_only` 和 `model_selected`。路由候选由内核从已提交节点生成，模型不提供 `send_hints`。
+
+## 通信决策快照与重放
+
+训练通信策略时可以显式启用决策快照。运行时会在 Policy 选择和 visibility
+grant 之前保存 GraphStore、所有 AgentGraphView、候选节点/片段、阶段、轮次、
+预算和 Workflow state：
+
+```python
+from workflow_runtime import CommunicationReplayBuffer, LangGraphWorkflow
+
+replay = CommunicationReplayBuffer(".runtime/replay/decisions.jsonl")
+workflow = LangGraphWorkflow(
+    store=store,
+    model=model,
+    task_id="task-1",
+    communication_replay_buffer=replay,
+    replay_external_state_provider=lambda: {
+        "model_seed": model_seed,
+        "environment": environment.snapshot(),
+    },
+)
+
+snapshot = replay.snapshots()[0]
+state = workflow.restore_communication_snapshot(
+    snapshot,
+    restore_external=lambda payload: environment.restore(payload["environment"]),
+)
+```
+
+快照功能默认关闭，以免普通评测写出体积较大的完整图。模型 RNG、远程服务和
+外部环境不由 Runtime 猜测恢复；需要通过 `replay_external_state_provider` 与
+`restore_external` 成对接入。
+
+Phase 2 的双风险标签、SEND 教师搜索和主动信息获取动作设计见
+[`docs/phase2_learning.md`](docs/phase2_learning.md)。Semantic Delta v2 的协议、边界和启用方式见
+[`docs/semantic_delta_v2.md`](docs/semantic_delta_v2.md)。
+
 ## Action 约束解码
 
-每次 Action 生成前，运行时根据 GraphStore 当前边界建立状态约束。例如 numeric_solve 按 `declare_query -> add_fact -> add_plan_step -> done` 推进。Transformers 后端在逐 token decode 时对 `op` 分支进行 logits mask；对于题目中可确定的 numeric fact 和 plan，还会直接约束为合法的完整 Action 序列。ActionCompiler 仍保留字段、值和图状态校验，约束解码不是语义正确性的替代品。
+`semantic_delta_v2` 对角色和领域限定唯一语义动作，例如 Planner=`plan`、GSM8K Solver=`solve_numeric`，Critic 分别使用 `judge_numeric`、MMLU-Pro 的 `audit_choice`、`diagnose_code` 或 `judge_evidence`。MMLU-Pro Critic 只能审计 Solver 已生成的候选、槽位分析和淘汰声明，不生成第二个答案。Planner、Solver 与 Critic 都使用完整 token-level Schema 约束，固定 JSON 结构、字段类型、枚举、动态引用、文本槽上限和终止位置。模型不生成节点、边、ID、状态或路由。Schema 校验、内核 lowering、SemanticDeltaValidator 和 ActionCompiler 共同负责落图正确性，约束解码不是语义正确性的替代品。
 
 Graph Memory embedding、Teacher/Student 训练和旧的角色 LoRA 训练脚本不属于当前推理入口；历史数据和模型产物暂不自动删除。
 

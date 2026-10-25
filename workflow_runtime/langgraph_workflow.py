@@ -6,17 +6,28 @@ import time
 import hashlib
 from dataclasses import dataclass
 import json
+import re
 from typing import Any, Callable, Mapping, Optional, Sequence, TypedDict
 
 from .action_compiler import ActionCompilationError, ActionCompiler
 from .action_constraints import ActionConstraint, build_action_constraint
 from .agent_graph_view import AgentGraphViewManager, MANDATORY_LOGICAL_IDS
+from .models import node_visible_to_role
 from .communication import ClosureAwareHeuristicPolicy, GraphCommunicationPolicy
+from .communication_replay import (
+    CommunicationDecisionSnapshot,
+    CommunicationReplayBuffer,
+    candidate_snapshot,
+    fragment_snapshot,
+    new_snapshot_id,
+    normalize_external_state,
+)
 from .context_slicer import build_context_slice, render_compact_context_slice, _node_sort_key
 from .delta_closure import dependency_closure
 from .delta_extractor import extract_delta_candidates
 from .delta_scoring import estimate_edge_tokens, estimate_node_tokens
-from .domain_executors import execute_domain
+from .domain_executors import DomainExecution, execute_domain
+from .code_verifier import CodeVerifier
 from .feedback_controller import FeedbackAction, decide_feedback_action
 from .graph_delta import DeltaCandidate, GraphDelta
 from .graph_store import GraphStore
@@ -54,6 +65,9 @@ from .protocol import (
     action_contract,
     parse_action,
 )
+from .semantic_actions import CRITIC_TYPED_OPS, TYPED_SEMANTIC_OPS, semantic_action_example
+from .choice_audit import build_choice_audit_manifest
+from .task_spec import get_task_spec
 from .tools import ToolRegistry
 from .telemetry import WorkflowTelemetry
 from .task_verifier import apply_verification_signal, enforce_hotpot_entailment_verdict, verify_task_candidate
@@ -67,6 +81,7 @@ from .native_tooling import (
     render_tool_results,
 )
 from .native_critic import parse_critic_verdict, render_critic_feedback, REPAIR_VERDICTS
+from .evaluation_context import EvaluationContext
 
 
 class WorkflowState(TypedDict, total=False):
@@ -126,13 +141,20 @@ class LangGraphWorkflow:
         enable_action_constraints: bool = True,
         communication_policy: Optional[GraphCommunicationPolicy] = None,
         communication_budget_tokens: Optional[int] = None,
+        communication_replay_buffer: Optional[CommunicationReplayBuffer] = None,
+        replay_external_state_provider: Optional[Callable[[], Mapping[str, Any]]] = None,
         graph_context_mode: str = "baseline",
+        action_protocol: str = "semantic_delta_v2",
+        evaluation_context: EvaluationContext | None = None,
+        multihop_sentence_limit: int = 48,
     ) -> None:
         self.store = store
         self.model = model
         self.task_id = task_id
         self.branch_id = branch_id
         self.task_type = task_type
+        if action_protocol != "semantic_delta_v2":
+            raise ValueError(f"unsupported action protocol: {action_protocol}")
         self.tokenizer = tokenizer
         self.session_id = f"workflow:{task_id}:{branch_id}"
         self.tool_registry = tool_registry or ToolRegistry.default()
@@ -149,9 +171,14 @@ class LangGraphWorkflow:
         self.enable_action_constraints = bool(enable_action_constraints)
         self.communication_policy = communication_policy or ClosureAwareHeuristicPolicy()
         self.communication_budget_tokens = communication_budget_tokens
+        self.communication_replay_buffer = communication_replay_buffer
+        self.replay_external_state_provider = replay_external_state_provider
+        self._communication_decision_index = 0
         if graph_context_mode not in {"baseline", "deduplicated", "source_state_split", "role_aware"}:
             raise ValueError(f"unsupported graph_context_mode: {graph_context_mode}")
         self.graph_context_mode = graph_context_mode
+        self.evaluation_context = evaluation_context
+        self.multihop_sentence_limit = max(0, int(multihop_sentence_limit))
         self._graph_source_seen_hashes: set[str] = set()
         self._last_hotpot_repair_packet_audit: dict[str, Any] = {}
         self.agent_views = AgentGraphViewManager(
@@ -173,7 +200,7 @@ class LangGraphWorkflow:
         graph.add_node("tool", self._tool_node)
         graph.add_node("critic", self._agent_node("critic"))
         graph.add_node("repair", self._agent_node("solver", mode="repair"))
-        graph.add_node("finalizer", self._agent_node("final_solver", mode="finalization"))
+        graph.add_node("finalizer", self._deterministic_finalizer_node)
         graph.add_node("unresolved", self._unresolved_verification_node)
         graph.add_edge(START, "planner")
         graph.add_edge("planner", "solver")
@@ -182,11 +209,60 @@ class LangGraphWorkflow:
         graph.add_conditional_edges(
             "critic",
             self._route_after_critic,
-            {"repair": "repair", "finalizer": "finalizer", "unresolved": "unresolved"},
+            {"critic": "critic", "repair": "repair", "finalizer": "finalizer", "unresolved": "unresolved"},
         )
         graph.add_edge("repair", "tool")
         graph.add_edge("finalizer", END)
         graph.add_edge("unresolved", END)
+        return graph.compile(checkpointer=checkpointer)
+
+    def compile_from_communication_snapshot(
+        self,
+        snapshot: CommunicationDecisionSnapshot,
+        *,
+        checkpointer: Any = None,
+    ) -> Any:
+        """Compile only the suffix after a captured communication decision.
+
+        The communication action has already mutated the restored receiver
+        view.  Restarting at Planner would invalidate the counterfactual, so
+        each sender/receiver edge maps to its actual downstream workflow node.
+        """
+        try:
+            from langgraph.graph import END, START, StateGraph
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError("LangGraph is required. Install it with: pip install langgraph") from exc
+        if snapshot.task_id != self.task_id or snapshot.branch_id != self.branch_id:
+            raise ValueError("communication snapshot belongs to a different workflow boundary")
+
+        graph = StateGraph(WorkflowState)
+        graph.add_node("solver", self._agent_node("solver"))
+        graph.add_node("tool", self._tool_node)
+        graph.add_node("critic", self._agent_node("critic"))
+        graph.add_node("repair", self._agent_node("solver", mode="repair"))
+        graph.add_node("finalizer", self._deterministic_finalizer_node)
+        graph.add_node("unresolved", self._unresolved_verification_node)
+        graph.add_edge("solver", "tool")
+        graph.add_edge("tool", "critic")
+        graph.add_conditional_edges(
+            "critic",
+            self._route_after_critic,
+            {"critic": "critic", "repair": "repair", "finalizer": "finalizer", "unresolved": "unresolved"},
+        )
+        graph.add_edge("repair", "tool")
+        graph.add_edge("finalizer", END)
+        graph.add_edge("unresolved", END)
+
+        start_node = {
+            ("planner", "solver"): "solver",
+            ("solver", "critic"): "critic",
+            ("tool", "critic"): "critic",
+            ("critic", "solver"): "repair",
+            ("critic", "final_solver"): "finalizer",
+        }.get((snapshot.sender, snapshot.receiver))
+        if start_node is None:
+            raise ValueError(f"unsupported communication continuation stage: {snapshot.stage}")
+        graph.add_edge(START, start_node)
         return graph.compile(checkpointer=checkpointer)
 
     def fork(self, branch_id: str) -> "LangGraphWorkflow":
@@ -210,7 +286,11 @@ class LangGraphWorkflow:
             enable_action_constraints=self.enable_action_constraints,
             communication_policy=self.communication_policy,
             communication_budget_tokens=self.communication_budget_tokens,
+            communication_replay_buffer=self.communication_replay_buffer,
+            replay_external_state_provider=self.replay_external_state_provider,
             graph_context_mode=self.graph_context_mode,
+            evaluation_context=self.evaluation_context,
+            multihop_sentence_limit=self.multihop_sentence_limit,
         )
 
     def merge_branch(
@@ -268,6 +348,11 @@ class LangGraphWorkflow:
                     ),
                     allow_missing=False,
                     visible_fragment_ids=role_view.visible_fragment_ids,
+                    multihop_sentence_limit=(
+                        self.multihop_sentence_limit
+                        if self.graph_context_mode == "role_aware"
+                        else None
+                    ),
                 )
                 graph_state = view_store.snapshot()
                 prompt = self._render_graph_context(
@@ -297,16 +382,51 @@ class LangGraphWorkflow:
                     context_slice=context_slice,
                     graph_state=graph_state,
                 ))
+                # Semantic validation is part of generation repair, so make the
+                # receiver-visible reference context available before asking the
+                # model.  build_plan is side-effect free; the live commit still
+                # happens exactly once below.
+                self.compiler.set_node_ref_context(
+                    self._node_ref_context(
+                        context_slice,
+                        visible_node_ids=role_view.visible_node_ids,
+                        known_fragment_ids=role_view.visible_fragment_ids,
+                        allowed_receivers=self._communication_receivers(role),
+                    )
+                )
                 action_constraint = (
-                    self._action_constraint(role, state.get("branch_id", self.branch_id), mode=mode)
+                    self._action_constraint(
+                        role,
+                        state.get("branch_id", self.branch_id),
+                        mode=mode,
+                        context_slice=context_slice,
+                    )
                     if self.enable_action_constraints else None
                 )
                 if self._is_hotpot_repair_mode(role, mode):
+                    diagnosis = self._latest_repair_diagnosis()
+                    packet = diagnosis.get("repair_packet") if isinstance(diagnosis, dict) else {}
+                    packet = packet if isinstance(packet, dict) else {}
+                    repair_target = str(packet.get("repair_target") or diagnosis.get("error_location") or "").strip()
+                    error_type = str(packet.get("error_type") or diagnosis.get("error_type") or "").strip()
+                    if repair_target == "answer" or error_type in {"answer_not_supported", "answer_contradicted"}:
+                        allowed_repair_actions = ("REVISE_ANSWER",)
+                    elif repair_target == "bridge_entity":
+                        allowed_repair_actions = ("PATCH_BRIDGE",)
+                    elif repair_target == "cited_fact_ids" or error_type in {"invalid_citation", "missing_hop"}:
+                        allowed_repair_actions = ("ADD_EVIDENCE", "REPLACE_EVIDENCE", "PATCH_CITATIONS")
+                    else:
+                        allowed_repair_actions = ("STOP",)
                     action_constraint = ActionConstraint(
                         role=role,
                         task_type=self.task_type,
-                        allowed_ops=("set_result",),
-                        reason="HotpotQA repair is a one-shot structured patch",
+                        allowed_ops=("repair_patch",),
+                        reason="HotpotQA repair is a bounded local patch",
+                        schema_mode="solver_repair",
+                        allowed_citation_refs=(
+                            action_constraint.allowed_citation_refs if action_constraint is not None else ()
+                        ),
+                        allowed_repair_actions=allowed_repair_actions,
                     )
                 try:
                     action, generation = self._generate_action(
@@ -339,28 +459,63 @@ class LangGraphWorkflow:
                         **generation,
                         "hotpot_repair_packet_audit": dict(self._last_hotpot_repair_packet_audit),
                     }
-                if role == "critic" and action.get("op") == "verify":
+                critic_verification_action = None
+                typed_critic_verification = role == "critic" and action.get("op") in CRITIC_TYPED_OPS
+                if typed_critic_verification:
+                    verification_action = self.compiler.critic_verification_action(action)
+                else:
+                    verification_action = None
+                if verification_action is not None:
+                    model_verification_action = dict(verification_action)
                     verification_signal = verify_task_candidate(
                         self.task_type,
                         self.store,
                         task_id=self.task_id,
                         branch_id=state.get("branch_id", self.branch_id),
                     )
-                    action = apply_verification_signal(action, verification_signal)
+                    verification_action = apply_verification_signal(verification_action, verification_signal)
+                    # The generic multiple-choice verifier can validate shape but
+                    # has no gold label.  It must not erase a critic's independent
+                    # disagreement with the solver's choice.
+                    if (
+                        typed_critic_verification
+                        and self.task_type == "multiple_choice"
+                        and action.get("op") == "audit_choice"
+                    ):
+                        # ChoiceVerifier only establishes structural validity;
+                        # it deliberately returns uncertain without gold. Do
+                        # not downgrade the Critic's claim audit with that
+                        # structural signal. The kernel audit aggregation above
+                        # is the sole source of the verification status.
+                        verification_action = model_verification_action
                     if self.task_type == "multihop_qa":
-                        action = enforce_hotpot_entailment_verdict(
-                            action,
+                        verification_action = enforce_hotpot_entailment_verdict(
+                            verification_action,
                             self.store,
                             task_id=self.task_id,
                             branch_id=state.get("branch_id", self.branch_id),
                         )
+                    if typed_critic_verification:
+                        critic_verification_action = verification_action
                     generation = {
                         **generation,
                         "task_verification": verification_signal.as_dict(),
+                        "kernel_verification_status": verification_action.get("status", "uncertain"),
                     }
                 try:
-                    self.compiler.set_node_ref_context(self._node_ref_context(context_slice))
-                    result = self.compiler.apply(role, action)
+                    self.compiler.set_node_ref_context(
+                        self._node_ref_context(
+                            context_slice,
+                            visible_node_ids=role_view.visible_node_ids,
+                            known_fragment_ids=role_view.visible_fragment_ids,
+                            allowed_receivers=self._communication_receivers(role),
+                        )
+                    )
+                    result = (
+                        self.compiler.compile_critic_verification(role, action, critic_verification_action)
+                        if critic_verification_action is not None
+                        else self.compiler.apply(role, action)
+                    )
                 except ActionCompilationError as error:
                     if self._is_hotpot_repair_mode(role, mode):
                         self._raise_stage_failure(
@@ -399,9 +554,23 @@ class LangGraphWorkflow:
                     sender=role,
                     node_ids=result.node_ids,
                     branch_id=state.get("branch_id", self.branch_id),
+                    workflow_state=state,
+                    decision_context={"mode": mode, "action_index": action_index},
+                    model_send_hints=self._model_send_hints(
+                        result.send_hints,
+                        sender=role,
+                        temp_to_node_id=result.temp_to_node_id,
+                    ),
                 )
                 if result.done:
-                    completion_errors = self._completion_errors(role, mode=mode)
+                    # STOP intentionally preserves the current result and does
+                    # not create a newer result version. It still completes the
+                    # repair stage; the critic gets the opportunity to re-check
+                    # the unchanged state on the next graph edge.
+                    if self._is_hotpot_repair_mode(role, mode) and action.get("op") == "repair_patch":
+                        completion_errors = []
+                    else:
+                        completion_errors = self._completion_errors(role, mode=mode)
                     if completion_errors:
                         error = ActionCompilationError(
                             f"{role} cannot finish workflow stage: {'; '.join(completion_errors)}"
@@ -481,66 +650,18 @@ class LangGraphWorkflow:
                     break
 
             if not completed:
-                auto_result = self._auto_complete_exhausted_stage(
-                    role=role,
-                    mode=mode,
-                    branch_id=state.get("branch_id", self.branch_id),
+                if self._is_hotpot_repair_mode(role, mode):
+                    self._raise_stage_failure(
+                        self._hotpot_repair_noop_reason(last_action),
+                        state=state,
+                        logs=logs,
+                        session_id=session_id,
+                        role=role,
+                        last_action=last_action,
+                    )
+                raise ActionCompilationError(
+                    f"{role} exceeded max_actions_per_role={action_limit} without completing its typed boundary"
                 )
-                if auto_result is not None:
-                    self.agent_views.grant_global_visibility()
-                    self.agent_views.grant(role, node_ids=auto_result.node_ids, local=True)
-                    communication_events = self._communicate_nodes(
-                        sender=role,
-                        node_ids=auto_result.node_ids,
-                        branch_id=state.get("branch_id", self.branch_id),
-                    )
-                    logs.append({
-                        "role": role,
-                        "mode": mode,
-                        "action_index": action_limit,
-                        "action": auto_result.action,
-                        "compiled_node_ids": list(auto_result.node_ids),
-                        "graph_update_tokens": self._graph_update_tokens(auto_result.node_ids),
-                        "communication": communication_events,
-                        "context_tokens": 0,
-                        "context_slice_tokens": 0,
-                        "context_slice_node_ids": [],
-                        "context_slice_edge_ids": [],
-                        "context_slice_fragment_ids": [],
-                        "context_slice_root_node_ids": [],
-                        "rendered_context_node_ids": [],
-                        "rendered_context_fragment_ids": [],
-                        "logical_context_tokens": 0,
-                        "generation": {
-                            "attempts": 0,
-                            "validation_errors": [],
-                            "auto_completed": True,
-                        },
-                        "telemetry": {},
-                        "session": self._session_snapshot(session_id),
-                        "latency_sec": time.time() - started,
-                    })
-                    completed = True
-                else:
-                    if self._is_hotpot_repair_mode(role, mode):
-                        reason = (
-                            "repair_noop: solver produced no operationally new result"
-                            if last_action.get("op") == "set_result"
-                            else "repair_invalid_patch: solver did not produce a revised set_result in one repair action"
-                        )
-                        self._raise_stage_failure(
-                            self._hotpot_repair_noop_reason(last_action)
-                            if reason.startswith("repair_noop:")
-                            else reason,
-                            state=state,
-                            logs=logs,
-                            session_id=session_id,
-                            role=role,
-                            last_action=last_action,
-                        )
-                    raise ActionCompilationError(
-                        f"{role} exceeded max_actions_per_role={action_limit} without done"
-                    )
             latest = self.store.snapshot()
             branch_id = state.get("branch_id", self.branch_id)
             return {
@@ -557,29 +678,52 @@ class LangGraphWorkflow:
 
         return node
 
-    def _auto_complete_exhausted_stage(self, *, role: str, mode: str, branch_id: str):
-        if role != "solver" or mode != "normal":
-            return None
-        if self.task_type not in {"numeric_solve", "numeric_comparison"}:
-            return None
-        if not any("result" in item for item in self._completion_errors(role, mode=mode)):
-            return None
-        calculation = self.store.latest_valid(self.task_id, branch_id, "calculation")
-        if calculation is None:
-            return None
-        content = calculation.content if isinstance(calculation.content, dict) else {}
-        value = content.get("value") if isinstance(content, dict) else None
-        if value is None:
-            return None
-        result_id = content.get("id", "answer") if isinstance(content, dict) else "answer"
-        try:
-            self.compiler.set_node_ref_context({})
-            return self.compiler.apply(
-                role,
-                {"op": "set_result", "id": str(result_id or "answer"), "value": value},
-            )
-        except ActionCompilationError:
-            return None
+    def _deterministic_finalizer_node(self, state: WorkflowState) -> dict[str, Any]:
+        """Copy the critic-verified value without another model invocation."""
+        started = time.time()
+        branch_id = state.get("branch_id", self.branch_id)
+        verification = self.store.latest_valid(self.task_id, branch_id, "verification")
+        if verification is None or verification.status != "verified":
+            raise ActionCompilationError("deterministic finalizer requires a verified verification node")
+        self.compiler.set_node_ref_context({})
+        result = self.compiler.copy_verified_result()
+        self.agent_views.grant_global_visibility()
+        self.agent_views.grant("final_solver", node_ids=result.node_ids, local=True)
+        logs = list(state.get("logs", []))
+        logs.append({
+            "role": "final_solver",
+            "mode": "deterministic_finalization",
+            "action_index": 0,
+            "action": result.action,
+            "compiled_node_ids": list(result.node_ids),
+            "graph_update_tokens": self._graph_update_tokens(result.node_ids),
+            "communication": [],
+            "context_tokens": 0,
+            "context_slice_tokens": 0,
+            "context_slice_node_ids": [],
+            "context_slice_edge_ids": [],
+            "context_slice_fragment_ids": [],
+            "context_slice_root_node_ids": [],
+            "rendered_context_node_ids": [],
+            "rendered_context_fragment_ids": [],
+            "logical_context_tokens": 0,
+            "generation": {"attempts": 0, "validation_errors": [], "model_invoked": False},
+            "telemetry": {},
+            "session": self._session_snapshot(state.get("session_id", self.session_id)),
+            "latency_sec": time.time() - started,
+        })
+        latest = self.store.snapshot()
+        return {
+            "graph_revision": len(latest.nodes),
+            "graph_snapshot_digest": self.store.branch_digest(self.task_id, branch_id),
+            "round_id": state.get("round_id", 0) + 1,
+            "action_count": state.get("action_count", 0) + 1,
+            "status": "running",
+            "last_role": "final_solver",
+            "last_action": result.action,
+            "session_id": state.get("session_id", self.session_id),
+            "logs": logs,
+        }
 
     def _is_hotpot_repair_mode(self, role: str, mode: str) -> bool:
         return role == "solver" and mode == "repair" and self.task_type == "multihop_qa"
@@ -630,6 +774,8 @@ class LangGraphWorkflow:
         attempts = 0
         validation_errors: list[str] = []
         call_metrics: list[dict[str, Any]] = []
+        retry_input_tokens = 0
+        retry_full_replay_equivalent_tokens = 0
         raw = self.model(ModelRequest(
             role=role,
             task_type=self.task_type,
@@ -649,6 +795,9 @@ class LangGraphWorkflow:
                 if isinstance(raw, dict):
                     action = self._normalize_generated_action(role, raw)
                     errors = self._validate_action_dict(role, action)
+                    errors.extend(self._semantic_action_errors(role, action))
+                    if action.get("op") == "repair_patch" and not self._is_hotpot_repair_mode(role, mode):
+                        errors.append("repair_patch is only allowed in HotpotQA repair mode")
                     errors.extend(self._hotpot_repair_action_errors(role, mode, action))
                     if errors:
                         raise ValueError(f"invalid {role} Action: {'; '.join(errors)}")
@@ -660,10 +809,18 @@ class LangGraphWorkflow:
                         "logical_input_tokens": logical_input_tokens,
                         "graph_read_context_tokens": graph_read_context_tokens,
                         "context_slice_tokens": context_slice_tokens,
+                        "retry_input_tokens": retry_input_tokens,
+                        "retry_full_replay_equivalent_tokens": retry_full_replay_equivalent_tokens,
+                        "retry_saved_input_tokens": max(0, retry_full_replay_equivalent_tokens - retry_input_tokens),
                         **context_costs,
                         "action_constraint": action_constraint.as_dict() if action_constraint else None,
                     }
                 action = self._parse_generated_action(str(raw).strip(), role=role)
+                semantic_errors = self._semantic_action_errors(role, action)
+                if semantic_errors:
+                    raise ValueError(f"invalid {role} Action: {'; '.join(semantic_errors)}")
+                if action.get("op") == "repair_patch" and not self._is_hotpot_repair_mode(role, mode):
+                    raise ValueError("invalid solver Action: repair_patch is only allowed in HotpotQA repair mode")
                 repair_errors = self._hotpot_repair_action_errors(role, mode, action)
                 if repair_errors:
                     raise ValueError(f"invalid {role} Action: {'; '.join(repair_errors)}")
@@ -675,6 +832,9 @@ class LangGraphWorkflow:
                     "logical_input_tokens": logical_input_tokens,
                     "graph_read_context_tokens": graph_read_context_tokens,
                     "context_slice_tokens": context_slice_tokens,
+                    "retry_input_tokens": retry_input_tokens,
+                    "retry_full_replay_equivalent_tokens": retry_full_replay_equivalent_tokens,
+                    "retry_saved_input_tokens": max(0, retry_full_replay_equivalent_tokens - retry_input_tokens),
                     **context_costs,
                     "action_constraint": action_constraint.as_dict() if action_constraint else None,
                 }
@@ -691,14 +851,30 @@ class LangGraphWorkflow:
                             "logical_input_tokens": logical_input_tokens,
                             "graph_read_context_tokens": graph_read_context_tokens,
                             "context_slice_tokens": context_slice_tokens,
+                            "retry_input_tokens": retry_input_tokens,
+                            "retry_full_replay_equivalent_tokens": retry_full_replay_equivalent_tokens,
+                            "retry_saved_input_tokens": max(0, retry_full_replay_equivalent_tokens - retry_input_tokens),
                             **context_costs,
                             "raw_output": raw_text,
                         })
                     raise ValueError(
                         f"{role} failed strict Action generation after 3 attempts: {error}"
                     ) from error
-                retry_prompt = self._retry_session_prompt(role, mode, error)
-                logical_input_tokens += self._token_count(retry_prompt)
+                retry_prompt = self._standalone_retry_session_prompt(
+                    role,
+                    mode,
+                    error,
+                    raw_text,
+                    context_slice=context_slice,
+                    graph_state=graph_state,
+                )
+                retry_tokens = self._token_count(retry_prompt)
+                full_replay_tokens = self._token_count(
+                    session_prompt + raw_text + self._retry_session_prompt(role, mode, error)
+                )
+                retry_input_tokens += retry_tokens
+                retry_full_replay_equivalent_tokens += full_replay_tokens
+                logical_input_tokens += retry_tokens
                 raw = self.model(ModelRequest(
                     role=role,
                     task_type=self.task_type,
@@ -716,8 +892,13 @@ class LangGraphWorkflow:
     def _parse_generated_action(self, text: str, *, role: str) -> dict[str, Any]:
         from .protocol import normalize_action_payload
 
+        candidate = text.strip()
+        if candidate.startswith("```") and candidate.endswith("```"):
+            lines = candidate.splitlines()
+            if len(lines) >= 3 and lines[0].strip().lower() in {"```", "```json"}:
+                candidate = "\n".join(lines[1:-1]).strip()
         try:
-            value = json.loads(text)
+            value = json.loads(candidate)
         except (json.JSONDecodeError, TypeError) as exc:
             raise ValueError(f"{role} output must be exactly one Action JSON object") from exc
         action = self._normalize_generated_action(role, normalize_action_payload(value))
@@ -730,21 +911,57 @@ class LangGraphWorkflow:
         if not self._is_hotpot_repair_mode(role, mode):
             return []
         if not isinstance(action, dict):
-            return ["HotpotQA repair must emit exactly one set_result Action"]
-        if action.get("op") != "set_result":
-            return ["HotpotQA repair mode allows only set_result"]
-        value = action.get("value")
-        if not isinstance(value, dict):
-            return ["HotpotQA repair set_result.value must be a structured object"]
-        missing = [
-            key for key in ("answer", "bridge_entity", "cited_fact_ids", "reasoning_chain")
-            if key not in value
-        ]
-        if missing:
-            return [f"HotpotQA repair set_result.value missing keys: {', '.join(missing)}"]
-        errors = self._hotpot_repair_must_change_errors(value)
-        if errors:
-            return errors
+            return ["HotpotQA repair must emit exactly one repair_patch Action"]
+        if action.get("op") == "repair_patch":
+            return self._hotpot_repair_patch_errors(action)
+        return ["HotpotQA repair mode allows only repair_patch"]
+
+    def _hotpot_repair_patch_errors(self, action: dict[str, Any]) -> list[str]:
+        allowed_actions = {
+            "STOP",
+            "ADD_EVIDENCE",
+            "REPLACE_EVIDENCE",
+            "PATCH_CITATIONS",
+            "PATCH_BRIDGE",
+            "REVISE_ANSWER",
+        }
+        action_name = str(action.get("action", "")).strip()
+        patch = action.get("patch")
+        if action_name not in allowed_actions:
+            return [f"HotpotQA repair_patch action must be one of {', '.join(sorted(allowed_actions))}"]
+        if not isinstance(patch, dict):
+            return ["HotpotQA repair_patch.patch must be an object"]
+        if action_name == "STOP":
+            if patch:
+                return ["HotpotQA STOP repair_patch must have an empty patch"]
+            return []
+        diagnosis = self._latest_repair_diagnosis()
+        packet = diagnosis.get("repair_packet") if isinstance(diagnosis, dict) else {}
+        packet = packet if isinstance(packet, dict) else {}
+        error_type = str(packet.get("error_type") or diagnosis.get("error_type") or "").strip()
+        error_location = str(diagnosis.get("error_location") or packet.get("error_location") or "").strip()
+        if action_name == "REVISE_ANSWER" and error_type not in {"answer_not_supported", "answer_contradicted"}:
+            return [f"HotpotQA {error_type or 'structural'} repair cannot revise answer"]
+        if action_name == "PATCH_BRIDGE" and not (
+            error_location == "bridge_entity" or packet.get("repair_target") == "bridge_entity"
+        ):
+            return ["HotpotQA PATCH_BRIDGE does not match the critic repair target"]
+        if action_name in {"ADD_EVIDENCE", "REPLACE_EVIDENCE", "PATCH_CITATIONS"} and not (
+            error_location == "cited_fact_ids"
+            or packet.get("repair_target") == "cited_fact_ids"
+            or error_type in {"invalid_citation", "missing_hop"}
+        ):
+            return ["HotpotQA evidence patch does not match the critic repair target"]
+        if action_name in {"ADD_EVIDENCE", "REPLACE_EVIDENCE", "PATCH_CITATIONS"}:
+            selected = patch.get("selected_fact_ids")
+            if not isinstance(selected, list) or not selected or not all(str(item).strip() for item in selected):
+                return [f"HotpotQA {action_name} requires non-empty selected_fact_ids"]
+        if action_name == "PATCH_BRIDGE" and not str(patch.get("bridge_entity", "")).strip():
+            return ["HotpotQA PATCH_BRIDGE requires bridge_entity"]
+        if action_name == "REVISE_ANSWER" and not str(patch.get("answer", "")).strip():
+            return ["HotpotQA REVISE_ANSWER requires answer"]
+        if action_name != "REVISE_ANSWER" and patch.get("preserve_answer") is False:
+            return ["HotpotQA structural repair must preserve answer"]
         return []
 
     def _hotpot_repair_must_change_errors(self, value: dict[str, Any]) -> list[str]:
@@ -756,8 +973,18 @@ class LangGraphWorkflow:
         if not isinstance(previous, dict):
             return []
         target = str(packet.get("repair_target", "") or "").strip()
+        error_type = str(packet.get("error_type") or diagnosis.get("error_type") or "").strip()
+        error_location = str(diagnosis.get("error_location") or packet.get("error_location") or "").strip()
         must_change = packet.get("must_change") if isinstance(packet.get("must_change"), dict) else {}
         forbidden = packet.get("forbidden_values") if isinstance(packet.get("forbidden_values"), dict) else {}
+        preserve = [
+            str(item).strip().lower()
+            for item in [
+                *self._hotpot_string_list(diagnosis.get("preserve")),
+                *self._hotpot_string_list(packet.get("preserve")),
+            ]
+            if str(item).strip()
+        ]
         errors: list[str] = []
 
         def changed(field: str) -> bool:
@@ -769,41 +996,73 @@ class LangGraphWorkflow:
 
         if (target == "bridge_entity" or must_change.get("bridge_entity")) and not changed("bridge_entity"):
             errors.append("HotpotQA repair must change bridge_entity")
-        if (target == "cited_fact_ids" or must_change.get("cited_fact_ids")) and not changed("cited_fact_ids"):
+        if (
+            target == "cited_fact_ids"
+            or must_change.get("cited_fact_ids")
+            or error_type == "invalid_citation"
+        ) and not changed("cited_fact_ids"):
             errors.append("HotpotQA repair must add or replace cited_fact_ids")
+        if (target == "answer" or must_change.get("answer")) and not changed("answer"):
+            errors.append("HotpotQA repair must change answer")
+
+        answer_change_allowed = error_type in {"answer_not_supported", "answer_contradicted"}
+        if changed("answer") and not answer_change_allowed:
+            errors.append(
+                "HotpotQA repair must preserve answer unless error_type is "
+                "answer_not_supported or answer_contradicted"
+            )
+
+        bridge_only_repair = target == "bridge_entity" or error_location == "bridge_entity"
+        citation_only_repair = (
+            target == "cited_fact_ids"
+            or error_location == "cited_fact_ids"
+            or error_type in {"invalid_citation", "missing_hop"}
+        )
+        if bridge_only_repair and changed("cited_fact_ids"):
+            errors.append("HotpotQA bridge_entity repair must preserve cited_fact_ids")
+        if citation_only_repair and changed("bridge_entity"):
+            errors.append("HotpotQA cited_fact_ids repair must preserve bridge_entity")
+
+        if any("answer" in item for item in preserve) and changed("answer"):
+            errors.append("HotpotQA repair violated preserve constraint for answer")
+        preserve_bridge = any(
+            "bridge_entity" in item or "bridge entity" in item
+            for item in preserve
+        )
+        if preserve_bridge and changed("bridge_entity"):
+            errors.append("HotpotQA repair violated preserve constraint for bridge_entity")
+        preserve_all_citations = any(
+            "cited_fact_ids" in item or item in {"citations", "cited facts"}
+            for item in preserve
+        )
+        if preserve_all_citations and changed("cited_fact_ids"):
+            errors.append("HotpotQA repair violated preserve constraint for cited_fact_ids")
+        preserve_reasoning = any(
+            "reasoning_chain" in item or "reasoning chain" in item
+            for item in preserve
+        )
+        if preserve_reasoning and changed("reasoning_chain"):
+            errors.append("HotpotQA repair violated preserve constraint for reasoning_chain")
+
+        known = packet.get("known") if isinstance(packet.get("known"), dict) else {}
+        valid_citations = self._hotpot_string_list(known.get("valid_cited_fact_ids"))
+        if valid_citations and any("valid citation" in item for item in preserve):
+            new_citations = set(self._hotpot_string_list(value.get("cited_fact_ids")))
+            dropped = [citation for citation in valid_citations if citation not in new_citations]
+            if dropped:
+                errors.append(
+                    "HotpotQA repair violated preserve constraint for valid citations: "
+                    + ", ".join(dropped)
+                )
+
         forbidden_bridge = {str(item).strip().lower() for item in forbidden.get("bridge_entity", [])} if isinstance(forbidden.get("bridge_entity"), list) else set()
         if forbidden_bridge and str(value.get("bridge_entity", "")).strip().lower() in forbidden_bridge:
             errors.append("HotpotQA repair bridge_entity repeats a forbidden value")
         return errors
 
     def _normalize_generated_action(self, role: str, payload: Any) -> Any:
-        from .protocol import normalize_action_payload
-
-        action = normalize_action_payload(payload)
-        if not isinstance(action, dict):
-            return action
-        if role != "solver" or action.get("op") != "set_result" or action.get("value") is not None:
-            return action
-        recovered = self._recover_set_result_value()
-        if recovered is None:
-            return action
-        repaired = dict(action)
-        repaired["value"] = recovered
-        return repaired
-
-    def _recover_set_result_value(self) -> Any:
-        def value_from(node: Any) -> Any:
-            if node is None:
-                return None
-            content = node.content
-            return content.get("value") if isinstance(content, dict) and "value" in content else content
-
-        for logical_id in ("calculation", "result"):
-            node = self.store.latest_valid(self.task_id, self.branch_id, logical_id)
-            value = value_from(node)
-            if value is not None:
-                return value
-        return None
+        del role
+        return payload
 
     def _last_call_metrics(self, session_id: str) -> dict[str, Any]:
         snapshot = self._session_snapshot(session_id)
@@ -843,8 +1102,8 @@ class LangGraphWorkflow:
                 continue
             if (
                 node.logical_id in MANDATORY_LOGICAL_IDS
-                or node.created_by_role in {"user", "dataset", ""}
                 or node.provenance.get("communication_scope") == "MANDATORY"
+                or node.provenance.get("visibility_class") == "public"
             ):
                 persistent_node_ids.append(node_id)
                 persistent_context_tokens += estimate_node_tokens(node)
@@ -883,7 +1142,8 @@ class LangGraphWorkflow:
         action_index: int = 0,
     ) -> str:
         if self.graph_context_mode == "baseline":
-            return render_compact_context_slice(context_slice, graph_state)
+            rendered = render_compact_context_slice(context_slice, graph_state)
+            return self._append_choice_audit_manifest(rendered, role)
         if self.graph_context_mode in {"source_state_split", "role_aware"}:
             rendered, _ = self._render_source_state_split_graph_context(
                 role=role,
@@ -893,7 +1153,7 @@ class LangGraphWorkflow:
                 graph_state=graph_state,
                 update_seen=False,
             )
-            return rendered
+            return self._append_choice_audit_manifest(rendered, role)
         rendered, _ = self._render_deduplicated_graph_context(
             role="",
             mode="",
@@ -902,7 +1162,69 @@ class LangGraphWorkflow:
             graph_state=graph_state,
             update_seen=False,
         )
-        return rendered
+        return self._append_choice_audit_manifest(rendered, role)
+
+    def _append_choice_audit_manifest(self, rendered: str, role: str) -> str:
+        if role != "critic" or self.task_type != "multiple_choice":
+            return rendered
+        manifest = build_choice_audit_manifest(self.store, task_id=self.task_id, branch_id=self.branch_id)
+        if manifest is None:
+            return rendered
+        feedback = ""
+        verification = self.store.latest_valid(self.task_id, self.branch_id, "verification")
+        if (
+            verification is not None
+            and verification.status == "uncertain"
+            and isinstance(verification.content, Mapping)
+            and verification.content.get("error_type") == "invalid_choice_audit_reason"
+        ):
+            raw_reason = verification.content.get("reason", "")
+            packet: Any = {}
+            if isinstance(raw_reason, str) and raw_reason.strip().startswith("{"):
+                try:
+                    parsed = json.loads(raw_reason)
+                except json.JSONDecodeError:
+                    parsed = {}
+                if isinstance(parsed, Mapping):
+                    packet = parsed.get("repair_packet", {})
+            feedback = (
+                "\nCRITIC REPAIR PACKET (kernel-generated; fix ONLY these reasons, preserve all statuses and claim IDs):\n"
+                + json.dumps(packet, ensure_ascii=False, sort_keys=True)
+            )
+        return (
+            rendered
+            + "\nCRITIC INPUT (kernel-assembled; source and Solver candidate are the audit object):\n"
+            + json.dumps({
+                "source": {
+                    "question": manifest.get("original_question", ""),
+                    "options": {str(item.get("option", "")): item.get("option_text", "") for item in manifest.get("elimination_claims", ()) if isinstance(item, Mapping)},
+                },
+                "solver_candidate": {
+                    "answer": manifest.get("selected_answer", ""),
+                    "slot_reasons": [
+                        {"claim_id": item.get("claim_id"), "claim_text": item.get("claim_text", ""), "slot": item.get("slot"), "selected_term": item.get("selected_term", ""), "solver_reason": item.get("solver_reason", "")}
+                        for item in manifest.get("slot_claims", ()) if isinstance(item, Mapping)
+                    ],
+                    "option_reviews": [
+                        {"claim_id": item.get("claim_id"), "claim_text": item.get("claim_text", ""), "option": item.get("option", ""), "solver_assessment": item.get("solver_assessment", ""), "solver_reason": item.get("solver_reason", ""), "option_text": item.get("option_text", "")}
+                        for item in manifest.get("elimination_claims", ()) if isinstance(item, Mapping)
+                    ],
+                },
+                "audit_manifest": {
+                    "candidate_version": manifest.get("candidate_version", ""),
+                    "manifest_digest": manifest.get("manifest_digest", ""),
+                    "required_claim_ids": [item.get("claim_id") for item in (*manifest.get("slot_claims", ()), *manifest.get("elimination_claims", ())) if isinstance(item, Mapping)],
+                },
+                "kernel_control": {
+                    "required_action": "audit_choice",
+                    "must_cover_all_claims": True,
+                    "preserve_fields": ["claim_id", "solver_assessment", "solver_reason", "solver_term"],
+                },
+            }, ensure_ascii=False, sort_keys=True)
+            + "\nAUDIT MANIFEST (kernel-owned, immutable; audit claim IDs exactly):\n"
+            + json.dumps(manifest, ensure_ascii=False, sort_keys=True)
+            + feedback
+        )
 
     @staticmethod
     def _graph_context_category(node_type: str) -> str:
@@ -920,6 +1242,16 @@ class LangGraphWorkflow:
             "table",
             "table_cell",
             "evidence",
+            "task_source",
+            "question_source",
+            "document_source",
+            "sentence_source",
+            "entity_source",
+            "choice_source",
+            "choice_schema",
+            "requirements_source",
+            "entry_point_source",
+            "public_test_source",
         }:
             return "source_payload"
         if node_type in {"error", "tool_request", "tool_result", "execution"}:
@@ -982,6 +1314,22 @@ class LangGraphWorkflow:
             "result": "R",
             "verification": "V",
             "final_answer": "A",
+            "task_source": "TS",
+            "question_source": "QS",
+            "document_source": "DS",
+            "sentence_source": "SS",
+            "entity_source": "ES",
+            "choice_source": "CS",
+            "requirements_source": "RS",
+            "entry_point_source": "EP",
+            "public_test_source": "PT",
+            "plan_step": "P1",
+            "candidate_answer": "CA",
+            "slot_analysis": "SA",
+            "selected_evidence": "SE",
+            "bridge_hypothesis": "BH",
+            "reasoning_step": "R2",
+            "semantic_delta_boundary": "DB",
         }
         nodes = [graph_state.nodes[node_id] for node_id in context_slice.visible_node_ids if node_id in graph_state.nodes]
         nodes.sort(key=_node_sort_key)
@@ -1131,6 +1479,22 @@ class LangGraphWorkflow:
             "result": "R",
             "verification": "V",
             "final_answer": "A",
+            "task_source": "TS",
+            "question_source": "QS",
+            "document_source": "DS",
+            "sentence_source": "SS",
+            "entity_source": "ES",
+            "choice_source": "CS",
+            "requirements_source": "RS",
+            "entry_point_source": "EP",
+            "public_test_source": "PT",
+            "plan_step": "P1",
+            "candidate_answer": "CA",
+            "slot_analysis": "SA",
+            "selected_evidence": "SE",
+            "bridge_hypothesis": "BH",
+            "reasoning_step": "R2",
+            "semantic_delta_boundary": "DB",
         }
         nodes = [graph_state.nodes[node_id] for node_id in context_slice.visible_node_ids if node_id in graph_state.nodes]
         nodes.sort(key=_node_sort_key)
@@ -1342,6 +1706,22 @@ class LangGraphWorkflow:
             "result": "R",
             "verification": "V",
             "final_answer": "A",
+            "task_source": "TS",
+            "question_source": "QS",
+            "document_source": "DS",
+            "sentence_source": "SS",
+            "entity_source": "ES",
+            "choice_source": "CS",
+            "requirements_source": "RS",
+            "entry_point_source": "EP",
+            "public_test_source": "PT",
+            "plan_step": "P1",
+            "candidate_answer": "CA",
+            "slot_analysis": "SA",
+            "selected_evidence": "SE",
+            "bridge_hypothesis": "BH",
+            "reasoning_step": "R2",
+            "semantic_delta_boundary": "DB",
         }
         nodes = [graph_state.nodes[node_id] for node_id in context_slice.visible_node_ids if node_id in graph_state.nodes]
         nodes.sort(key=_node_sort_key)
@@ -1466,21 +1846,148 @@ class LangGraphWorkflow:
                 total += estimate_edge_tokens(edge)
         return total
 
-    def _action_constraint(self, role: str, branch_id: str, *, mode: str = "normal") -> ActionConstraint:
-        task = self.store.latest_valid(self.task_id, branch_id, "task")
-        existing = (
-            node.logical_id
-            for node in self.store.snapshot().nodes.values()
-            if node.task_id == self.task_id
-            and node.branch_id == branch_id
-            and node.is_operationally_valid()
-        )
+    def _action_constraint(
+        self,
+        role: str,
+        branch_id: str,
+        *,
+        mode: str = "normal",
+        context_slice: Any = None,
+    ) -> ActionConstraint:
+        graph_state = self.store.snapshot()
+        source_refs: list[str] = []
+        choice_labels: list[str] = []
+        citation_refs: list[str] = []
+        required_audit_slots: list[int] = []
+        required_audit_options: list[str] = []
+        required_audit_claim_ids: list[str] = []
+        required_audit_elimination_claim_ids: list[str] = []
+        required_candidate_version = ""
+        required_manifest_digest = ""
+        forbidden_choice_labels: list[str] = []
+        required_solver_slots: list[int] = []
+        if role == "planner" and context_slice is not None:
+            visible_ids = set(getattr(context_slice, "visible_node_ids", ()) or ())
+            local_ids = dict(getattr(context_slice, "local_node_id_by_node", {}) or {})
+            public_source_types = get_task_spec(self.task_type).public_source_types
+            for node_id in getattr(context_slice, "visible_node_ids", ()) or ():
+                node = graph_state.nodes.get(node_id)
+                if (
+                    node is None
+                    or node_id not in visible_ids
+                    or node.type not in public_source_types
+                    or not node_visible_to_role(node, role)
+                ):
+                    continue
+                local_id = str(local_ids.get(node_id, "")).strip()
+                if local_id:
+                    source_refs.append(local_id)
+                if node.logical_id:
+                    source_refs.append(str(node.logical_id))
+        if role in {"solver", "critic"} and context_slice is not None:
+            local_ids = dict(getattr(context_slice, "local_node_id_by_node", {}) or {})
+            for node_id in getattr(context_slice, "visible_node_ids", ()) or ():
+                node = graph_state.nodes.get(node_id)
+                if node is None or not node_visible_to_role(node, role):
+                    continue
+                if node.type in {"choice_schema", "choice_source"}:
+                    try:
+                        content = json.loads(node.content) if isinstance(node.content, str) else node.content
+                    except (TypeError, json.JSONDecodeError):
+                        content = {}
+                    if isinstance(content, Mapping):
+                        labels = content.get("allowed_labels", ())
+                        if isinstance(labels, (list, tuple)):
+                            choice_labels.extend(str(item).strip().upper() for item in labels if str(item).strip())
+                        label = str(content.get("label", "")).strip().upper()
+                        if label:
+                            choice_labels.append(label)
+                if role == "solver" and node.type == "sentence_source":
+                    local_id = str(local_ids.get(node_id, "")).strip()
+                    if local_id:
+                        citation_refs.append(local_id)
+                    if node.logical_id:
+                        citation_refs.append(str(node.logical_id))
+        # The Critic audit scope is a kernel-owned manifest derived from the
+        # latest Solver candidate.  This prevents constrained decoding from
+        # legally closing arrays before all claims have been audited.
+        if role == "critic" and self.task_type == "multiple_choice":
+            manifest = build_choice_audit_manifest(self.store, task_id=self.task_id, branch_id=branch_id)
+            if manifest is not None:
+                required_candidate_version = str(manifest.get("candidate_version", ""))
+                required_manifest_digest = str(manifest.get("manifest_digest", ""))
+                required_audit_claim_ids = [str(item.get("claim_id")) for item in manifest.get("slot_claims", ()) if isinstance(item, Mapping) and item.get("claim_id")]
+                required_audit_elimination_claim_ids = [str(item.get("claim_id")) for item in manifest.get("elimination_claims", ()) if isinstance(item, Mapping) and item.get("claim_id")]
+            result = self.store.latest_valid(self.task_id, branch_id, "result")
+            value = result.content if result is not None else {}
+            if isinstance(value, Mapping) and "value" in value:
+                value = value.get("value")
+            if isinstance(value, Mapping):
+                for item in value.get("slot_analysis", ()):
+                    if isinstance(item, Mapping) and isinstance(item.get("slot"), int) and not isinstance(item.get("slot"), bool):
+                        required_audit_slots.append(int(item["slot"]))
+                eliminated = value.get("eliminated_options", {})
+                if isinstance(eliminated, Mapping):
+                    required_audit_options.extend(
+                        str(label).strip().upper() for label in eliminated if str(label).strip()
+                    )
+        if role == "solver" and mode == "repair" and self.task_type == "multiple_choice":
+            verification = self.store.latest_valid(self.task_id, branch_id, "verification")
+            content = verification.content if verification is not None and isinstance(verification.content, Mapping) else {}
+            reason = content.get("reason", "") if isinstance(content, Mapping) else ""
+            if isinstance(reason, str) and reason.strip().startswith("{"):
+                try:
+                    packet_wrapper = json.loads(reason)
+                except json.JSONDecodeError:
+                    packet_wrapper = {}
+                packet = packet_wrapper.get("repair_packet", {}) if isinstance(packet_wrapper, Mapping) else {}
+                if isinstance(packet, Mapping):
+                    forbidden_choice_labels.extend(
+                        str(item).strip().upper()
+                        for item in packet.get("forbidden_answers", ())
+                        if str(item).strip()
+                    )
+        if role == "solver" and self.task_type == "multiple_choice":
+            # The task adapter owns the structural shape.  MMLU-Pro fill-in
+            # questions expose one or more underscore spans; ordinary
+            # multiple-choice questions still receive one explicit slot.
+            task_node = graph_state.nodes.get("task@v1") or graph_state.nodes.get("task")
+            task_text = ""
+            if task_node is not None:
+                task_text = task_node.content if isinstance(task_node.content, str) else json.dumps(task_node.content, ensure_ascii=False)
+            slot_count = len(re.findall(r"_{2,}", task_text)) or 1
+            schema_node = graph_state.nodes.get("choice_schema@v1") or graph_state.nodes.get("choice_schema")
+            if schema_node is not None:
+                schema_content = schema_node.content
+                if isinstance(schema_content, str):
+                    try:
+                        schema_content = json.loads(schema_content)
+                    except json.JSONDecodeError:
+                        schema_content = {}
+                slot_values = schema_content.get("slot_values", {}) if isinstance(schema_content, Mapping) else {}
+                if isinstance(slot_values, Mapping):
+                    manifest_count = max(
+                        (len(values) for values in slot_values.values() if isinstance(values, (list, tuple))),
+                        default=0,
+                    )
+                    slot_count = manifest_count or slot_count
+            slot_count = min(max(slot_count, 1), 12)
+            required_solver_slots = list(range(1, slot_count + 1))
         return build_action_constraint(
             role=role,
             task_type=self.task_type,
             missing=self._completion_errors(role, mode=mode),
-            task_text=str(task.content) if task is not None else "",
-            existing_logical_ids=existing,
+            allowed_source_refs=source_refs,
+            allowed_choice_labels=choice_labels,
+            allowed_citation_refs=citation_refs,
+            required_audit_slots=required_audit_slots,
+            required_audit_options=required_audit_options,
+            required_audit_claim_ids=required_audit_claim_ids,
+            required_audit_elimination_claim_ids=required_audit_elimination_claim_ids,
+            required_candidate_version=required_candidate_version,
+            required_manifest_digest=required_manifest_digest,
+            forbidden_choice_labels=forbidden_choice_labels,
+            required_solver_slots=required_solver_slots,
         )
 
     def _telemetry_action(
@@ -1534,6 +2041,11 @@ class LangGraphWorkflow:
             "forward_calls": int(backend.get("forward_calls", 0)),
             "graph_read_context_tokens": int(generation.get("graph_read_context_tokens", 0) or 0),
             "context_slice_tokens": int(generation.get("context_slice_tokens", 0) or 0),
+            "retry_input_tokens": int(generation.get("retry_input_tokens", 0) or 0),
+            "retry_full_replay_equivalent_tokens": int(
+                generation.get("retry_full_replay_equivalent_tokens", 0) or 0
+            ),
+            "retry_saved_input_tokens": int(generation.get("retry_saved_input_tokens", 0) or 0),
             "persistent_context_tokens": int(generation.get("persistent_context_tokens", 0) or 0),
             "incremental_context_tokens": int(generation.get("incremental_context_tokens", 0) or 0),
             "logical_communication_tokens": int(generation.get("logical_communication_tokens", 0) or 0),
@@ -1578,6 +2090,7 @@ class LangGraphWorkflow:
             "reusable_prefix_key": generation.get("reusable_prefix_key", f"{role}:{mode}:{self.task_type}"),
             "graph_update_tokens": int(generation.get("graph_update_tokens", 0) or 0),
             "task_verification": generation.get("task_verification"),
+            "kernel_verification_status": generation.get("kernel_verification_status"),
             "hotpot_repair_packet_audit": generation.get("hotpot_repair_packet_audit"),
             "protocol_valid": protocol_valid,
             "compile_success": compile_success,
@@ -1588,12 +2101,54 @@ class LangGraphWorkflow:
         }
         return event
 
+    def _model_send_hints(
+        self,
+        send_hints: Sequence[Mapping[str, Any]],
+        *,
+        sender: str,
+        temp_to_node_id: Optional[Mapping[str, str]] = None,
+    ) -> dict[str, tuple[str, ...]]:
+        """Resolve model temp references into receiver-relative fragments."""
+        if not send_hints:
+            return {}
+        state = self.store.snapshot()
+        mapping = dict(temp_to_node_id or {})
+        result: dict[str, list[str]] = {}
+        for hint in send_hints:
+            receiver = str(hint.get("receiver", "")).strip()
+            if not receiver:
+                continue
+            for raw_fragment in hint.get("fragments", ()):
+                fragment = str(raw_fragment)
+                base, separator, suffix = fragment.partition("#")
+                node_id = mapping.get(base, base)
+                node = state.nodes.get(node_id)
+                if node is None:
+                    node = self.store.latest_valid(self.task_id, self.branch_id, node_id)
+                if node is None:
+                    continue
+                if separator:
+                    result.setdefault(receiver, []).append(f"{node_id}#{suffix}")
+                    continue
+                candidates = fragments_for_node(
+                    node,
+                    sender=sender,
+                    receiver=receiver,
+                    node_scope="MANDATORY_STAGE",
+                )
+                optional = [item.fragment_id for item in candidates if item.scope == OPTIONAL_FRAGMENT]
+                result.setdefault(receiver, []).extend(optional or [node_id])
+        return {receiver: tuple(dict.fromkeys(fragments)) for receiver, fragments in result.items()}
+
     def _communicate_nodes(
         self,
         *,
         sender: str,
         node_ids: Sequence[str],
         branch_id: str,
+        workflow_state: Optional[Mapping[str, Any]] = None,
+        decision_context: Optional[Mapping[str, Any]] = None,
+        model_send_hints: Optional[Mapping[str, Sequence[str]]] = None,
     ) -> list[dict[str, Any]]:
         if not node_ids:
             return []
@@ -1625,6 +2180,16 @@ class LangGraphWorkflow:
                 sender=sender,
                 receiver=receiver,
             )
+            decision_snapshot_id = self._record_communication_decision(
+                state=state,
+                sender=sender,
+                receiver=receiver,
+                branch_id=branch_id,
+                candidates=candidates,
+                fragments=fragment_candidates,
+                workflow_state=workflow_state,
+                decision_context=decision_context,
+            )
             mandatory_fragment_ids = [
                 fragment.fragment_id for fragment in fragment_candidates
                 if fragment.scope == MANDATORY_FRAGMENT
@@ -1643,9 +2208,11 @@ class LangGraphWorkflow:
             mandatory_tokens = sum(candidate.token_cost for candidate in mandatory_candidates)
             optional_tokens = sum(candidate.token_cost for candidate in optional_candidates)
             semantic_event: dict[str, Any] = {}
+            model_hint_ids = tuple(str(item) for item in (model_send_hints or {}).get(receiver, ()))
             fallback_delta = None
             targeted_deltas: list[GraphDelta] = []
             targeted_fragment_level_by_id: dict[str, str] = {}
+            budget_rejected_fragment_ids: list[str] = []
             semantic_minimal_policy = self.communication_policy.name in {
                 "minimal_no_feedback",
                 "minimal_sendall_fallback",
@@ -1706,7 +2273,53 @@ class LangGraphWorkflow:
                     "targeted_refinement_feedback": None,
                 }
             else:
-                selected_optional_fragment_ids = self.communication_policy.select_roots(
+                hinted_for_receiver = tuple(
+                    str(item) for item in (model_send_hints or {}).get(receiver, ())
+                )
+                mandatory_roots = [candidate.node_id for candidate in mandatory_candidates]
+                if self.communication_policy.name == "model_selected":
+                    valid_hinted_fragment_ids = list(dict.fromkeys(
+                        fragment_id for fragment_id in hinted_for_receiver
+                        if fragment_id in fragment_scope_by_id
+                        and fragment_scope_by_id[fragment_id] == OPTIONAL_FRAGMENT
+                        and fragment_id not in receiver_view.visible_fragment_ids
+                    ))
+                    selected_optional_fragment_ids = []
+                    if self.communication_budget_tokens is None:
+                        selected_optional_fragment_ids = valid_hinted_fragment_ids
+                    else:
+                        base_delta = dependency_closure(
+                            state,
+                            root_node_ids=mandatory_roots,
+                            sender=sender,
+                            receiver=receiver,
+                            receiver_view=receiver_view,
+                            policy=self.communication_policy.name,
+                            candidate_token_cost=candidate_tokens,
+                        )
+                        base_cost = base_delta.token_cost
+                        for fragment_id in valid_hinted_fragment_ids:
+                            trial_fragments = [*selected_optional_fragment_ids, fragment_id]
+                            trial_roots = list(dict.fromkeys([
+                                *mandatory_roots,
+                                *(node_id_from_fragment(item) for item in trial_fragments),
+                            ]))
+                            trial_delta = dependency_closure(
+                                state,
+                                root_node_ids=trial_roots,
+                                sender=sender,
+                                receiver=receiver,
+                                receiver_view=receiver_view,
+                                policy=self.communication_policy.name,
+                                candidate_token_cost=candidate_tokens,
+                            )
+                            optional_marginal_cost = max(0, trial_delta.token_cost - base_cost)
+                            if optional_marginal_cost <= self.communication_budget_tokens:
+                                selected_optional_fragment_ids.append(fragment_id)
+                            else:
+                                budget_rejected_fragment_ids.append(fragment_id)
+                else:
+                    selected_optional_fragment_ids = self.communication_policy.select_roots(
                     state=state,
                     sender_view=sender_view,
                     receiver_view=receiver_view,
@@ -1729,7 +2342,6 @@ class LangGraphWorkflow:
                     )
                     if node_id in state.nodes
                 ]
-                mandatory_roots = [candidate.node_id for candidate in mandatory_candidates]
                 roots = list(dict.fromkeys([*mandatory_roots, *optional_roots]))
             selected_optional_tokens = sum(
                 int(fragment_token_by_id.get(fragment_id, 0) or 0)
@@ -2087,6 +2699,11 @@ class LangGraphWorkflow:
                     ),
                     allow_missing=True,
                     visible_fragment_ids=receiver_view.visible_fragment_ids,
+                    multihop_sentence_limit=(
+                        self.multihop_sentence_limit
+                        if self.graph_context_mode == "role_aware"
+                        else None
+                    ),
                 )
                 rendered_context = render_compact_context_slice(
                     receiver_context_slice,
@@ -2292,6 +2909,7 @@ class LangGraphWorkflow:
                     ),
                 })
             event = {
+                "decision_snapshot_id": decision_snapshot_id,
                 "sender": sender,
                 "receiver": receiver,
                 "branch_id": branch_id,
@@ -2315,6 +2933,28 @@ class LangGraphWorkflow:
                 "mandatory_fragment_ids": mandatory_fragment_ids,
                 "optional_fragment_ids": optional_fragment_ids,
                 "selected_optional_fragment_ids": list(selected_optional_fragment_ids),
+                "model_proposed_fragment_ids": list(model_hint_ids),
+                "kernel_rejected_fragment_ids": [
+                    fragment_id for fragment_id in model_hint_ids
+                    if fragment_id not in fragment_scope_by_id
+                    or fragment_scope_by_id.get(fragment_id) != OPTIONAL_FRAGMENT
+                ] + budget_rejected_fragment_ids,
+                "unused_sent_fragment_ids": [
+                    fragment_id for fragment_id in model_hint_ids
+                    if fragment_id not in set(total_sent_fragment_ids)
+                ],
+                "model_proposed_fragments": len(model_hint_ids),
+                "kernel_rejected_fragments": sum(
+                    1 for fragment_id in model_hint_ids
+                    if fragment_id not in fragment_scope_by_id
+                    or fragment_scope_by_id.get(fragment_id) != OPTIONAL_FRAGMENT
+                ) + len(budget_rejected_fragment_ids),
+                "closure_added_fragments": max(0, len(total_sent_fragment_ids) - len(selected_optional_fragment_ids)),
+                "receiver_consumed_fragments": len(total_sent_fragment_ids),
+                "unused_sent_fragments": sum(
+                    1 for fragment_id in model_hint_ids
+                    if fragment_id not in set(total_sent_fragment_ids)
+                ),
                 "fragment_token_by_id": fragment_token_by_id,
                 "fragment_scope_by_id": fragment_scope_by_id,
                 "sent_tokens": total_sent_tokens,
@@ -2395,6 +3035,93 @@ class LangGraphWorkflow:
             events.append(event)
         return events
 
+    def _record_communication_decision(
+        self,
+        *,
+        state: Any,
+        sender: str,
+        receiver: str,
+        branch_id: str,
+        candidates: Sequence[Any],
+        fragments: Sequence[Any],
+        workflow_state: Optional[Mapping[str, Any]],
+        decision_context: Optional[Mapping[str, Any]],
+    ) -> str:
+        """Capture the exact pre-action runtime state when replay is enabled."""
+        if self.communication_replay_buffer is None:
+            return ""
+        decision_index = self._communication_decision_index
+        self._communication_decision_index += 1
+        receiver_view = self.agent_views.view(receiver)
+        checkpoint_state = dict(workflow_state or {})
+        checkpoint_state["communication_decision_context"] = dict(decision_context or {})
+        checkpoint_state["communication_budget_scope"] = "per_decision"
+        external_state = (
+            self.replay_external_state_provider()
+            if self.replay_external_state_provider is not None else {}
+        )
+        checkpoint_state["communication_runtime_state"] = {
+            "graph_source_seen_hashes": sorted(self._graph_source_seen_hashes),
+            "last_hotpot_repair_packet_audit": dict(self._last_hotpot_repair_packet_audit),
+            "next_communication_decision_index": self._communication_decision_index,
+        }
+        snapshot_id = new_snapshot_id(
+            task_id=self.task_id,
+            branch_id=branch_id,
+            stage=f"{sender}->{receiver}",
+            decision_index=decision_index,
+        )
+        snapshot = CommunicationDecisionSnapshot(
+            snapshot_id=snapshot_id,
+            task_id=self.task_id,
+            branch_id=branch_id,
+            task_type=self.task_type,
+            stage=f"{sender}->{receiver}",
+            sender=sender,
+            receiver=receiver,
+            decision_index=decision_index,
+            round_index=len(receiver_view.received_delta_ids),
+            remaining_budget=self.communication_budget_tokens,
+            policy_name=self.communication_policy.name,
+            graph_state=state,
+            agent_views=self.agent_views.snapshot(),
+            workflow_state=checkpoint_state,
+            candidates=tuple(candidate_snapshot(candidate) for candidate in candidates),
+            fragments=tuple(fragment_snapshot(fragment) for fragment in fragments),
+            external_state=normalize_external_state(external_state),
+        )
+        self.communication_replay_buffer.record(snapshot)
+        return snapshot_id
+
+    def restore_communication_snapshot(
+        self,
+        snapshot: CommunicationDecisionSnapshot,
+        *,
+        restore_external: Optional[Callable[[Mapping[str, Any]], None]] = None,
+    ) -> WorkflowState:
+        """Restore a captured decision point into this workflow instance."""
+        if snapshot.task_type != self.task_type:
+            raise ValueError(
+                f"communication snapshot task type mismatch: {snapshot.task_type}/{self.task_type}"
+            )
+        restored = snapshot.restore_runtime(
+            self.store,
+            self.agent_views,
+            restore_external=restore_external,
+        )
+        runtime_state = restored.get("communication_runtime_state", {})
+        if isinstance(runtime_state, Mapping):
+            self._graph_source_seen_hashes = {
+                str(item) for item in runtime_state.get("graph_source_seen_hashes", ())
+            }
+            audit = runtime_state.get("last_hotpot_repair_packet_audit", {})
+            self._last_hotpot_repair_packet_audit = dict(audit) if isinstance(audit, Mapping) else {}
+            self._communication_decision_index = int(
+                runtime_state.get("next_communication_decision_index", snapshot.decision_index + 1)
+            )
+        self.compiler.set_node_ref_context({})
+        return restored
+
     def _root_only_delta(
         self,
         *,
@@ -2411,6 +3138,7 @@ class LangGraphWorkflow:
             for node in state.nodes.values()
             if node.logical_id in MANDATORY_LOGICAL_IDS
             or node.provenance.get("communication_scope") == "MANDATORY"
+            or node_visible_to_role(node, receiver)
         }
         for node_id in root_node_ids:
             if node_id in state.nodes and node_id not in baseline_visible and node_id not in selected:
@@ -2527,7 +3255,13 @@ class LangGraphWorkflow:
         return tuple(dict.fromkeys(fragment_ids))
 
     @staticmethod
-    def _node_ref_context(context_slice: Any) -> dict[str, Any]:
+    def _node_ref_context(
+        context_slice: Any,
+        *,
+        visible_node_ids: Optional[Sequence[str]] = None,
+        known_fragment_ids: Optional[Sequence[str]] = None,
+        allowed_receivers: Optional[Sequence[str]] = None,
+    ) -> dict[str, Any]:
         fragment_index = dict(getattr(context_slice, "fragment_provenance", {}) or {})
         local_node_index = {
             local_id: {
@@ -2559,6 +3293,9 @@ class LangGraphWorkflow:
             "fragment_index": fragment_index,
             "local_node_index": local_node_index,
             "semantic_type_index": collapsed_semantic_index,
+            "visible_node_ids": tuple(str(item) for item in (visible_node_ids or ())),
+            "known_fragment_ids": tuple(str(item) for item in (known_fragment_ids or ())),
+            "allowed_receivers": tuple(str(item) for item in (allowed_receivers or ())),
         }
 
     @staticmethod
@@ -2608,8 +3345,9 @@ class LangGraphWorkflow:
             return (
                 "\n<|im_end|>\n<|im_start|>user\n"
                 "<RETRY role='solver' mode='repair'>\n"
-                "HotpotQA repair is a bounded local patch step. Emit ONLY one set_result Action for this attempt. "
-                "Do not emit done, plan, add_fact, add_plan_step, verify, markdown, or explanation. "
+                "HotpotQA repair is a bounded local patch step. Emit ONLY one repair_patch Action for this attempt. "
+                "Choose STOP, ADD_EVIDENCE, REPLACE_EVIDENCE, PATCH_CITATIONS, PATCH_BRIDGE, or REVISE_ANSWER. "
+                "Do not emit set_result, done, plan, add_fact, add_plan_step, verify, markdown, or explanation. "
                 f"Previous Action was rejected: {error}\n"
                 + self._hotpot_repair_schema_instruction()
                 + "\n</RETRY>\n<|im_end|>\n<|im_start|>assistant\n"
@@ -2625,37 +3363,166 @@ class LangGraphWorkflow:
             + "\n</RETRY>\n<|im_end|>\n<|im_start|>assistant\n"
         )
 
+    def _standalone_retry_session_prompt(
+        self,
+        role: str,
+        mode: str,
+        error: Exception,
+        rejected_output: str,
+        *,
+        context_slice: Any,
+        graph_state: Any,
+    ) -> str:
+        """Build a stateless repair request without replaying the full graph.
+
+        The rejected output already contains the attempted semantic content.
+        Syntax/schema repair therefore needs only that output and the validator
+        diagnostic.  For semantic reference or grounding failures, include the
+        exact graph nodes explicitly referenced by the rejected output.
+        """
+        reference_context = self._retry_reference_context(
+            rejected_output,
+            str(error),
+            context_slice=context_slice,
+            graph_state=graph_state,
+        )
+        if self._is_hotpot_repair_mode(role, mode):
+            contract = (
+                "Emit exactly one repair_patch Action. Choose STOP, ADD_EVIDENCE, "
+                "REPLACE_EVIDENCE, PATCH_CITATIONS, PATCH_BRIDGE, or REVISE_ANSWER.\n"
+                + self._hotpot_repair_schema_instruction()
+            )
+        else:
+            contract = action_contract(role, self.task_type)
+        user_content = (
+            f"<ACTION_REPAIR role={role!r} mode={mode!r}>\n"
+            "Repair the rejected Action. Preserve its intended semantic content; do not solve the task again.\n"
+            f"<ERROR>{error}</ERROR>\n"
+            f"<REJECTED_ACTION>{rejected_output}</REJECTED_ACTION>\n"
+            f"{reference_context}"
+            f"<CONTRACT>{contract}</CONTRACT>\n"
+            "Emit exactly one corrected Action JSON object and nothing else.\n"
+            "</ACTION_REPAIR>"
+        )
+        system_content = (
+            "You are a deterministic structured-output repairer. Return only one JSON object. "
+            "Do not add markdown or explanatory text."
+        )
+        if self.tokenizer is not None and hasattr(self.tokenizer, "apply_chat_template"):
+            return self.tokenizer.apply_chat_template(
+                [
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": user_content},
+                ],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        return f"<SYSTEM>{system_content}</SYSTEM>\n{user_content}\n<ASSISTANT>"
+
+    @staticmethod
+    def _retry_reference_context(
+        rejected_output: str,
+        error: str,
+        *,
+        context_slice: Any,
+        graph_state: Any,
+    ) -> str:
+        semantic_markers = (
+            "grounding",
+            "quote",
+            "source ref",
+            "source reference",
+            "unknown source",
+            "not visible",
+            "endpoint",
+        )
+        if not any(marker in error.casefold() for marker in semantic_markers):
+            return ""
+        if context_slice is None or graph_state is None:
+            return ""
+        local_ids = dict(getattr(context_slice, "local_node_id_by_node", {}) or {})
+        records: list[dict[str, Any]] = []
+        for node_id in getattr(context_slice, "visible_node_ids", ()):
+            node = graph_state.nodes.get(node_id)
+            if node is None:
+                continue
+            local_id = str(local_ids.get(node_id, ""))
+            logical_id = str(node.logical_id)
+            logical_match = bool(logical_id) and re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(logical_id)}(?![A-Za-z0-9_])",
+                rejected_output,
+            )
+            local_match = bool(local_id) and re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(local_id)}(?![A-Za-z0-9_])",
+                rejected_output,
+            )
+            if not logical_match and not local_match:
+                continue
+            records.append({
+                "local_id": local_id,
+                "logical_id": logical_id,
+                "type": node.type,
+                "content": node.content,
+            })
+            if len(records) >= 8:
+                break
+        if not records:
+            return ""
+        return (
+            "<REFERENCED_GRAPH_NODES>"
+            + json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            + "</REFERENCED_GRAPH_NODES>\n"
+        )
+
     def _validate_action_dict(self, role: str, payload: dict[str, Any]) -> list[str]:
         from .protocol import normalize_action_payload, validate_action
 
-        return validate_action(role, normalize_action_payload(payload), task_type=self.task_type)
+        normalized = normalize_action_payload(payload)
+        return validate_action(
+            role,
+            normalized,
+            task_type=self.task_type,
+        )
+
+    def _semantic_action_errors(self, role: str, action: dict[str, Any]) -> list[str]:
+        """Dry-run typed-action lowering and Delta validation for model repair."""
+        if action.get("op") not in TYPED_SEMANTIC_OPS:
+            return []
+        try:
+            self.compiler.validate_semantic(role, action)
+        except ValueError as error:
+            return [str(error)]
+        return []
 
     def _system_contract(self, role: str, mode: str) -> str:
         if self._is_hotpot_repair_mode(role, mode):
             return (
                 "You are a HotpotQA local repair operator. Task type=multihop_qa. Mode=repair. "
                 "This is one bounded local patch inside an iterative repair loop. "
-                "The only allowed action for this attempt is set_result. Forbidden actions: plan, add_plan_step, "
-                "add_fact, explain, verify, done, and any other action. "
+                "The only allowed action for this attempt is repair_patch. Forbidden actions: set_result, plan, "
+                "add_plan_step, add_fact, explain, verify, done, and any other action. "
                 + self._hotpot_repair_schema_instruction()
             )
         return (
             ROLE_SYSTEM_PROMPTS[role]
             + f" Task type={self.task_type}. Mode={mode}."
             + " The existing task is read-only input. Emit one Action only."
-            + f" Protocol version={PROTOCOL_VERSION}. "
+            + " Protocol version="
+            + PROTOCOL_VERSION
+            + ". "
             + action_contract(role, self.task_type)
         )
 
     @staticmethod
     def _hotpot_repair_schema_instruction() -> str:
         return (
-            'Output exactly one JSON object with schema {"op":"set_result","id":"answer",'
-            '"value":{"answer":"...","bridge_entity":"...","cited_fact_ids":'
-            '["supporting_fact_1","supporting_fact_2"],"reasoning_chain":'
-            '["supporting_fact_1 -> bridge","bridge + supporting_fact_2 -> answer"]}}. '
-            "Use only citation_ids visible in allowed_evidence. Prefer bridge_candidates when a "
-            "candidate fits; otherwise propose a new bridge_entity grounded by cited evidence."
+            'Output exactly one JSON object with schema {"op":"repair_patch",'
+            '"action":"PATCH_CITATIONS","patch":{"selected_fact_ids":'
+            '["sentence_source_1","sentence_source_2"],"preserve_answer":true,'
+            '"reasoning_chain":["first hop","second hop"]}}. '
+            "Allowed actions are STOP, ADD_EVIDENCE, REPLACE_EVIDENCE, PATCH_CITATIONS, "
+            "PATCH_BRIDGE, and REVISE_ANSWER. Use only citation_ids visible in allowed_evidence. "
+            "Only REVISE_ANSWER may change answer."
         )
 
     def _latest_repair_diagnosis(self) -> dict[str, Any]:
@@ -2863,24 +3730,11 @@ class LangGraphWorkflow:
         return []
 
     def _hotpot_repair_noop_reason(self, action: dict[str, Any]) -> str:
-        if action.get("op") != "set_result":
-            return "repair_invalid_patch: solver did not produce a revised set_result in one repair action"
-        old = self._latest_result_value()
-        new = action.get("value")
-        if not isinstance(old, dict) or not isinstance(new, dict):
-            return "repair_noop_same_full_result: solver produced no operationally new result"
-        deltas = []
-        if str(old.get("answer", "")).strip() != str(new.get("answer", "")).strip():
-            deltas.append("answer")
-        if str(old.get("bridge_entity", "")).strip() != str(new.get("bridge_entity", "")).strip():
-            deltas.append("bridge")
-        old_citations = [str(item) for item in old.get("cited_fact_ids", [])] if isinstance(old.get("cited_fact_ids"), list) else []
-        new_citations = [str(item) for item in new.get("cited_fact_ids", [])] if isinstance(new.get("cited_fact_ids"), list) else []
-        if old_citations != new_citations:
-            deltas.append("citations")
-        if not deltas:
-            return "repair_noop_same_answer_bridge_citations: solver repeated answer, bridge, and citations"
-        return "repair_semantically_unchanged: solver patch changed " + ",".join(deltas) + " but compiled to no new result"
+        if action.get("op") != "repair_patch":
+            return "repair_invalid_patch: solver did not produce a repair_patch"
+        if action.get("action") == "STOP":
+            return "repair_stop: solver explicitly preserved the current answer and evidence"
+        return "repair_noop: solver patch produced no operationally new result"
 
     def _action_role_suffix(self, role: str, mode: str) -> str:
         """Give the small local model an explicit, state-aware next-action target."""
@@ -2892,6 +3746,47 @@ class LangGraphWorkflow:
             instruction = f"Current stage is incomplete. Missing boundaries: {boundary}."
         else:
             instruction = "All required boundaries for this stage exist. Emit {\"op\":\"done\"}."
+        # Multiple-choice Critic is an independent auditor, not a generic semantic
+        # action generator.  Keep this branch before the generic role suffix below:
+        # otherwise the generic example is returned first and the model never sees
+        # the audit-specific rules (in particular, it tends to copy an
+        # all-supported template without checking the question).
+        if role == "critic" and self.task_type == "multiple_choice" and missing:
+            return (
+                "You are an INDEPENDENT multiple-choice auditor. The Solver answer and every "
+                "Solver reason are untrusted claims; never accept them by default. Read the "
+                "original question, the exact visible choice text, and the immutable kernel "
+                "AUDIT MANIFEST before judging. For EVERY manifest slot_claim and EVERY "
+                "elimination_claim, audit the complete Solver claim against the original question. "
+                "Emit only assessment=fits when the term or option satisfies the source, "
+                "assessment=violates when it does not, or assessment=unknown only when "
+                "the required source text is missing or genuinely undecidable. The source in this "
+                "prompt is complete, so generic Solver explanations are never a reason for "
+                "insufficient. Do not classify isolated words. "
+                "Audit the selected label itself as well. "
+                "Do not propose a replacement answer and do not omit, merge, or invent claims. "
+                "Use each exact claim_id once and copy candidate_version and manifest_digest "
+                "exactly. The claim_id already identifies the option label or slot. Every reason "
+                "MUST cite the concrete option text (or the exact selected term) and the relevant "
+                "constraint from the original question; generic reasons such as 'fits the slot', "
+                "'correctly eliminated', or 'matches the question' are invalid. Emit exactly one "
+                "Before emitting each item, check reason polarity: if the reason says 'contradicts', "
+                "'does not fit', 'wrong', or 'fails', assessment MUST be violates; if it says "
+                "'fits', 'satisfies', or 'correctly completes', assessment MUST be fits. For a "
+                "rejected option that does not satisfy the source, emit violates. Do not emit "
+                "fits for every option. "
+                "audit_choice Action JSON object and nothing else. The kernel, not the Solver or "
+                "your prose, determines verified, need_fix, or uncertain from coverage and field consistency."
+            )
+        if role in {"planner", "solver", "critic"} and mode != "repair" and not self._is_hotpot_repair_mode(role, mode):
+            return (
+                instruction
+                + " Emit exactly this domain-specific semantic Action shape: "
+                + json.dumps(semantic_action_example(role, self.task_type), ensure_ascii=False, separators=(",", ":"))
+                + ". Supply only semantic values and source citations. The kernel creates all nodes, edges, "
+                "IDs, versions, provenance, visibility, completion state, and routing. Do not emit graph "
+                "structure, propose_delta, legacy add_* operations, or set_result."
+            )
         if role == "planner":
             if "missing query_spec" in missing:
                 task = self.store.latest_valid(self.task_id, self.branch_id, "task")
@@ -2936,13 +3831,16 @@ class LangGraphWorkflow:
         if role == "solver" and "missing result" in missing:
             if self.task_type == "multiple_choice":
                 return (
-                    "The next required boundary is result. Choose one option from the CHOICE nodes "
-                    "and include semantic option verification. Emit exactly one JSON object and "
-                    "nothing else, for example: "
-                    '{"op":"set_result","id":"answer","value":{"answer":"A","solver_choice":"A",'
-                    '"independent_choice":"A","option_analysis":{"A":{"support":["..."],'
-                    '"contradiction":[]},"B":{"support":[],"contradiction":["..."]}},'
-                    '"confidence":0.8}}. Bare option letters are invalid.'
+                    "The next required boundary is result. Read the complete original question and "
+                    "all choice texts before selecting. Choose one option, give one source-grounded "
+                    "reason for every SLOT, and review every visible option exactly once. Each slot "
+                    "reason MUST quote or name the selected term and the exact question constraint "
+                    "it satisfies. Each option review MUST name the decisive term or slot from that "
+                    "option; never emit generic phrases such as 'fits the question' or 'contradicts "
+                    "the question'. "
+                    "The kernel fixes the option labels; emit option_reviews with assessment selected "
+                    "for the answer and rejected for every other label. Emit exactly one JSON object "
+                    "and nothing else. Do not put pseudo-JSON or additional option labels inside a reason."
                 )
             if self.task_type == "multihop_qa":
                 return (
@@ -2975,21 +3873,27 @@ class LangGraphWorkflow:
                     return (
                         "The critic requested typed HotpotQA repair. "
                         + repair_directive
-                        + " Use repair_packet.known as fixed context, satisfy repair_packet.required, "
-                        "prefer bridge_candidates for bridge_entity when a candidate fits, "
-                        "and preserve only the listed valid items. Emit a revised result as exactly "
-                        'one JSON object with this schema: {"op":"set_result","id":"answer",'
-                        '"value":{"answer":"...","bridge_entity":"...","cited_fact_ids":'
-                        '["supporting_fact_1","supporting_fact_2"],"reasoning_chain":'
-                        '["supporting_fact_1 -> bridge","bridge + supporting_fact_2 -> answer"]}}. '
-                        "Do not emit done until revised result exists after the latest need_fix verification."
+                        + " Use repair_packet.known as fixed context and satisfy repair_packet.required. "
+                        "Emit exactly one repair_patch Action. For citation repairs use PATCH_CITATIONS "
+                        "or ADD_EVIDENCE; for bridge repairs use PATCH_BRIDGE; for answer entailment "
+                        "repairs use REVISE_ANSWER; use STOP only when the current result should be preserved. "
+                        "Only REVISE_ANSWER may change answer."
                     )
                 return (
                     "The critic requested repair. "
                     + repair_directive
-                    + " Emit a revised result as exactly one JSON object "
-                    "using set_result. Do not emit done until revised result exists after the "
-                    "latest need_fix verification."
+                    + " The repair_packet fields contradicted_slots and contradicted_eliminations "
+                    "are mandatory feedback: address every listed item. If forbidden_answers is "
+                    "non-empty, the new answer MUST NOT use any of those labels. Emit exactly one "
+                    "choose_option Action with the complete revised answer, slot_reasons, "
+                    "option_reviews, and confidence. Prefer a label in repair_packet.viable_challengers "
+                    "when present; these are options the Critic independently judged to fit "
+                    "with the original question. Do not select an arbitrary unreviewed label merely "
+                    "to satisfy the new-answer constraint. If required_change is audited_claims, "
+                    "you may retain the answer only if you materially rewrite every listed reason "
+                    "using the exact question constraint and option text; never copy the prior action. "
+                    "The answer must be a new candidate, "
+                    "not an audit or set_result Action. Do not emit done."
                 )
             return (
                 "The critic requested repair. "
@@ -3023,12 +3927,18 @@ class LangGraphWorkflow:
                 )
             if self.task_type == "multiple_choice":
                 return (
-                    "Verify the latest structured multiple-choice result. Check option_analysis, "
-                    "support and contradiction per option, and independent_choice agreement. If "
-                    "correct, emit verify with status=verified and empty diagnostic fields. If the "
-                    "semantic option analysis is wrong or insufficient, emit need_fix with "
-                    "non-empty error_type, error_location, and repair_instruction; do not emit a "
-                    "bare need_fix flag."
+                    "Audit the Solver candidate against the complete original question and every visible choice. "
+                    "The CRITIC INPUT block is the audit object: source is authoritative, solver_candidate is untrusted. "
+                    "Emit exactly one audit_choice with exact candidate_version/manifest_digest and every required claim_id. "
+                "For selected_option_check, slot_checks, and option_checks, output only assessment=fits, violates, or unknown plus a concrete reason. "
+                "Do not output claim verdicts: the kernel derives supported or contradicted from the Solver assessment in the immutable manifest. "
+                "Audit the complete claim_text bound to each claim_id, not whether an isolated option word looks compatible. "
+                "For every option, fits means the option text satisfies the original question, and violates means it does not. "
+                "For every slot, fits means the Solver term fits that slot and violates means it does not. "
+                "The source question and all option texts are complete in this input. Do not use unknown merely because the Solver's explanation is generic; judge the term or option directly against the source. Use unknown only when the required source text is missing or genuinely undecidable. "
+                "Before emitting each item, check the polarity of your own reason: if the reason says 'contradicts', 'does not fit', 'wrong', or 'fails', the assessment MUST be violates; if it says 'fits', 'satisfies', or 'correctly completes', the assessment MUST be fits. For a rejected Solver option that does not satisfy the source, emit violates (the kernel will derive that the Solver's rejection was supported). Do not emit fits for every option. "
+                "The kernel combines this independent assessment with selected/rejected to derive claim status and routing. "
+                    "Reasons must cite concrete option/term text. Do not invent IDs, alter Solver fields, or generate a replacement answer."
                 )
             return (
                 "Verify the latest result. If correct, emit verify with status=verified and empty "
@@ -3055,6 +3965,64 @@ class LangGraphWorkflow:
         return sorted(set(ids), key=key)
 
     def _completion_errors(self, role: str, *, mode: str = "normal") -> list[str]:
+        if role in {"planner", "solver"}:
+            spec = get_task_spec(self.task_type)
+            boundary = self.store.latest_valid(
+                self.task_id,
+                self.branch_id,
+                f"semantic_delta_{role}_boundary",
+            )
+            errors: list[str] = []
+            if boundary is None:
+                errors.append(f"missing semantic_delta boundary for {role}")
+            state_nodes = [
+                node
+                for node in self.store.snapshot().nodes.values()
+                if node.task_id == self.task_id
+                and node.branch_id == self.branch_id
+                and node.is_operationally_valid()
+            ]
+            for required_type in spec.required_for(role):
+                if not any(node.type == required_type and node.owner == role for node in state_nodes):
+                    errors.append(f"missing required semantic output {required_type}")
+            if mode == "repair":
+                anchor = self.store.latest_valid(self.task_id, self.branch_id, "verification")
+                if anchor is None or anchor.status not in {"need_fix", "uncertain"}:
+                    anchor = self.store.latest_valid(self.task_id, self.branch_id, "error")
+
+                def is_newer(node: Any) -> bool:
+                    if node is None or anchor is None:
+                        return False
+                    return (
+                        float(node.created_at or 0.0), node.version, node.node_id
+                    ) > (
+                        float(anchor.created_at or 0.0), anchor.version, anchor.node_id
+                    )
+
+                if self.task_type == "multihop_qa":
+                    repaired_result = self.store.latest_valid(
+                        self.task_id,
+                        self.branch_id,
+                        "result",
+                    )
+                    return (
+                        []
+                        if is_newer(repaired_result)
+                        else ["missing post-verification Hotpot repair result"]
+                    )
+
+                if not is_newer(boundary):
+                    errors.append("missing post-verification semantic_delta boundary for solver repair")
+                for required_type in spec.required_for(role):
+                    if not any(
+                        node.type == required_type
+                        and node.owner == role
+                        and is_newer(node)
+                        for node in state_nodes
+                    ):
+                        errors.append(f"missing revised semantic output {required_type}")
+            return list(dict.fromkeys(errors))
+
         def exists(logical_id: str) -> bool:
             return self.store.latest_valid(self.task_id, self.branch_id, logical_id) is not None
 
@@ -3164,6 +4132,19 @@ class LangGraphWorkflow:
             target = current_critic_target()
             if verification is None:
                 errors.append("missing verification")
+            elif (
+                self.task_type == "multiple_choice"
+                and verification.status == "uncertain"
+                and isinstance(verification.content, Mapping)
+                and verification.content.get("error_type") in {
+                    "invalid_choice_audit_scope", "invalid_choice_audit_manifest",
+                    "invalid_choice_audit_consistency", "invalid_choice_audit_reason",
+                }
+            ):
+                # An incomplete audit is a Critic-owned protocol failure.  It
+                # must re-enter Critic, rather than being misrouted as a Solver
+                # semantic repair.
+                errors.append("critic must complete the kernel audit manifest")
             elif target is not None and not newer_than(verification, target):
                 errors.append("missing updated verification")
         elif role == "final_solver":
@@ -3182,7 +4163,39 @@ class LangGraphWorkflow:
         code_node = self.store.latest_valid(self.task_id, branch_id, "code")
         if code_node is None:
             return {"error": "solver did not produce code", "status": "failed"}
-        execution = execute_domain(self.task_type, self.store, {"code": code_node.content})
+        code_value = (
+            code_node.content.get("code", code_node.content)
+            if isinstance(code_node.content, Mapping)
+            else code_node.content
+        )
+        if self.evaluation_context is not None:
+            verification = CodeVerifier().verify(
+                str(code_value),
+                public_tests=(),
+                private_tests=self.evaluation_context.official_tests or self.evaluation_context.private_tests,
+                evaluation=self.evaluation_context,
+            )
+            execution = DomainExecution(
+                success=verification.passed,
+                value={"code": code_value, "tests_passed": verification.passed},
+                execution=verification.as_dict(),
+                errors=[verification.failure_summary] if not verification.passed else [],
+            )
+        else:
+            execution = execute_domain(self.task_type, self.store, {"code": code_value})
+        safe_context = self.evaluation_context or EvaluationContext(
+            task_id=self.task_id,
+            task_type=self.task_type,
+        )
+        execution = DomainExecution(
+            success=execution.success,
+            value=execution.value,
+            execution=safe_context.safe_verification_summary(
+                execution.execution,
+                private=self.evaluation_context is not None,
+            ),
+            errors=[] if execution.success else [str(execution.execution.get("kind", "verification_failure"))],
+        )
         node = self.store.add_node(
             task_id=self.task_id,
             branch_id=branch_id,
@@ -3196,7 +4209,7 @@ class LangGraphWorkflow:
         )
         self.store.add_edge(source=code_node.node_id, target=node.node_id, relation="produces", created_by_role="tool")
         result_value = execution.value if execution.success else {
-            "code": code_node.content,
+            "code": code_value,
             "tests_passed": False,
             "errors": list(execution.errors),
         }
@@ -3217,6 +4230,8 @@ class LangGraphWorkflow:
             sender="tool",
             node_ids=[node.node_id, result.node_id],
             branch_id=branch_id,
+            workflow_state=state,
+            decision_context={"mode": "tool_execution", "action_index": 0},
         )
         return {"status": "running", "error": None if execution.success else "; ".join(execution.errors)}
 
@@ -3265,10 +4280,24 @@ class LangGraphWorkflow:
         verification = self.store.latest_valid(self.task_id, state.get("branch_id", self.branch_id), "verification")
         if verification is not None and verification.status == "verified" and not self._completion_errors("critic"):
             return "finalizer"
+        if (
+            verification is not None
+            and verification.status == "uncertain"
+            and isinstance(verification.content, Mapping)
+            and verification.content.get("error_type") in {
+                "invalid_choice_audit_scope", "invalid_choice_audit_manifest",
+                "invalid_choice_audit_consistency", "invalid_choice_audit_reason",
+            }
+        ):
+            critic_attempts = sum(
+                1 for item in state.get("logs", [])
+                if isinstance(item, Mapping) and item.get("role") == "critic"
+            )
+            if critic_attempts < 2:
+                return "critic"
+            return "unresolved"
         if int(state.get("round_id", 0)) >= self.max_rounds:
-            if self.task_type == "multihop_qa":
-                return "unresolved"
-            return "finalizer"
+            return "unresolved"
         return "repair"
 
 

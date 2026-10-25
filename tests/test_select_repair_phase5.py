@@ -1,3 +1,5 @@
+import json
+
 import scripts.run_reasoning_upper_bounds as rub
 from scripts.run_reasoning_upper_bounds import (
     DOMAINS,
@@ -56,7 +58,7 @@ def _hotpot_row(sample_id="h0"):
         "sample_id": sample_id,
         "task_type": "multihop_qa",
         "question": "Where was Ada born?",
-        "entities": ["Ada", "London"],
+        "question_entities": ["Ada", "London"],
         "supporting_facts": [
             {"fact_id": "supporting_fact_1", "title": "Ada", "text": "Ada was born in London."},
             {"fact_id": "supporting_fact_2", "title": "London", "text": "London is a city in England."},
@@ -532,6 +534,139 @@ def test_phase2_hotpot_pair_construction_keeps_full_3x3_grid():
     assert all("semantic_chain_verification" in pair for pair in pairs)
 
 
+def test_hotpot_deduplicated_options_do_not_apply_attempt_offset_twice():
+    options = [{"id": "best_remaining"}, {"id": "next"}]
+    assert rub._hotpot_select_best_remaining_option(options) == options[0]
+
+
+def test_hotpot_soft_pair_scoring_retains_relation_uncertain_pair():
+    row = {
+        "question": "Where was the director of Film A born?",
+        "question_entities": ["Film A"],
+    }
+    hop1 = {"fact_id": "f1", "title": "Film A", "text": "Film A was directed by Jane Doe."}
+    good = {"fact_id": "f2", "title": "Jane Doe", "text": "Jane Doe was born in Paris."}
+    bad = {"fact_id": "f3", "title": "Jane Doe", "text": "Jane Doe directed another film."}
+
+    pairs = rub._hotpot_rank_chain_pairs(row, "Jane Doe", [hop1], [bad, good], hard_gate=True)
+
+    assert [pair["hop2"]["fact_id"] for pair in pairs] == ["f2", "f3"]
+    assert pairs[0]["soft_compatibility_score"] >= pairs[1]["soft_compatibility_score"]
+    assert all("compatibility_tier" in pair for pair in pairs)
+    assert pairs[0]["hard_gate_pass"] is True
+
+
+def test_hotpot_attribute_statement_is_not_misclassified_as_director_relation():
+    row = {
+        "question": "Were Scott Derrickson and Ed Wood of the same nationality?",
+        "question_entities": ["Scott Derrickson", "Ed Wood"],
+    }
+    fact = {
+        "fact_id": "f1",
+        "title": "Scott Derrickson",
+        "text": "Scott Derrickson is an American director, screenwriter and producer.",
+    }
+    semantics = rub._hotpot_fact_semantics(row, fact)
+    assert semantics["relation"] == "nationality"
+    assert semantics["object"] == "American"
+
+
+def test_hotpot_value_grounding_checks_raw_sentence_text():
+    fact = {"title": "Ed Wood", "text": "Ed Wood was an American filmmaker."}
+    assert rub._hotpot_value_grounded("American", fact) is True
+
+
+def test_hotpot_question_entities_do_not_fallback_to_context_entities():
+    row = {
+        "question": "What science fantasy series has companion books?",
+        "question_entities": [],
+        "context_titles": ["Distractor One", "Distractor Two"],
+        "context_entities": ["Distractor One", "Distractor Two"],
+        # Legacy field deliberately present: it must be ignored.
+        "entities": ["Distractor One", "Distractor Two"],
+    }
+
+    assert rub._hotpot_question_entities(row) == ("", "")
+
+
+def test_hotpot_pair_verifier_uses_candidate_topology_override():
+    row = {
+        "question": "Who wrote Novel X and directed Film Y?",
+        "question_entities": ["Novel X", "Film Y"],
+    }
+    hop1 = {"fact_id": "f1", "title": "Film A", "text": "Film A was directed by Jane Doe."}
+    hop2 = {"fact_id": "f2", "title": "Jane Doe", "text": "Jane Doe was born in Paris."}
+
+    pair = rub._hotpot_rank_chain_pairs(
+        row,
+        "Jane Doe",
+        [hop1],
+        [hop2],
+        reasoning_type="bridge_entity",
+    )[0]
+
+    assert pair["semantic_chain_verification"]["reasoning_type"] == "bridge_entity"
+
+
+def test_hotpot_endpoint_bridge_change_retrieves_new_hop2():
+    row = {
+        "question": "Where was the director of Film A born?",
+        "question_entities": ["Film A"],
+    }
+    facts = [
+        {"fact_id": "f1", "title": "Film A", "text": "Film A was directed by Jane Doe."},
+        {"fact_id": "f2", "title": "Jane Doe", "text": "Jane Doe was born in Paris."},
+        {"fact_id": "f3", "title": "Wrong", "text": "Wrong was released in 2014."},
+    ]
+    view = rub.build_hotpot_chain_view_from_facts(
+        candidate_id="c1",
+        bridge_entity="Wrong",
+        question=row["question"],
+        facts=facts,
+        hop1_fact_ids=["f1"],
+        hop2_fact_ids=["f3"],
+    )
+
+    rebound = rub._hotpot_retrieve_hop2_after_endpoint_binding(
+        row=row,
+        facts=facts,
+        view=view,
+        inferred_bridge="Jane Doe",
+        reasoning_type="bridge_entity",
+    )
+
+    assert rebound is not None
+    rebound_view, binding = rebound
+    assert rebound_view.bridge_entity == "Jane Doe"
+    assert rebound_view.hop2_fact_ids == ["f2"]
+    assert binding["endpoint_rebound"] is True
+
+
+def test_hotpot_comparison_answer_is_deterministic_from_bound_attributes():
+    row = {"question": "Who is older, Alice or Bob?", "question_entities": ["Alice", "Bob"]}
+    facts = [
+        {"fact_id": "f1", "title": "Alice", "text": "Alice was born in 1980."},
+        {"fact_id": "f2", "title": "Bob", "text": "Bob was born in 1990."},
+    ]
+    view = rub.build_hotpot_chain_view_from_facts(
+        candidate_id="c1",
+        bridge_entity="",
+        question=row["question"],
+        facts=facts,
+        hop1_fact_ids=["f1"],
+        hop2_fact_ids=["f2"],
+    )
+
+    answer = rub._hotpot_deterministic_topology_answer(
+        row=row,
+        facts=facts,
+        view=view,
+        reasoning_type="comparison_attribute",
+    )
+
+    assert answer == "Alice"
+
+
 def test_phase2_hotpot_semantic_chain_score_is_separate_from_retrieval_score():
     low_retrieval_pair = rub._hotpot_rank_chain_pairs(
         _hotpot_row(),
@@ -648,7 +783,7 @@ def test_phase2_hotpot_candidate_bridge_is_hypothesis_not_verifier_anchor():
     row = {
         **_hotpot_row(),
         "question": "2014 S/S is the debut album of a South Korean boy group that was formed by who?",
-        "entities": ["2014 S/S", "Winner (band)"],
+        "question_entities": ["2014 S/S", "Winner (band)"],
     }
     pair = rub._hotpot_rank_chain_pairs(
         row,
@@ -683,7 +818,7 @@ def test_phase2_hotpot_reasoning_type_routes_parallel_comparison_without_bridge_
     row = {
         **_hotpot_row(),
         "question": "Are both Dictyosperma and Huernia described as a genus?",
-        "entities": ["Dictyosperma", "Huernia"],
+        "question_entities": ["Dictyosperma", "Huernia"],
     }
     pair = rub._hotpot_rank_chain_pairs(
         row,
@@ -703,7 +838,7 @@ def test_phase2_hotpot_topology_specific_construction_bypasses_bridge_pool_for_p
     row = {
         **_hotpot_row(),
         "question": "Are both Dictyosperma and Huernia described as a genus?",
-        "entities": ["Dictyosperma", "Huernia"],
+        "question_entities": ["Dictyosperma", "Huernia"],
     }
     facts = [
         {"fact_id": "f1", "title": "Dictyosperma", "text": "Dictyosperma is a monotypic genus of flowering plant."},
@@ -731,7 +866,7 @@ def test_phase9_hotpot_parallel_retrieval_is_entity_side_and_relation_compatible
     row = {
         **_hotpot_row(),
         "question": "Are both Dictyosperma and Huernia described as a genus?",
-        "entities": ["Dictyosperma", "Huernia"],
+        "question_entities": ["Dictyosperma", "Huernia"],
     }
     facts = [
         {"fact_id": "f1", "title": "Dictyosperma", "text": "Dictyosperma is a monotypic genus of flowering plant."},
@@ -763,7 +898,7 @@ def test_phase9_hotpot_bridge_family_construction_derives_bridge_from_evidence()
     row = {
         **_hotpot_row(),
         "question": "What company formed the group that created 2014 S/S?",
-        "entities": ["2014 S/S"],
+        "question_entities": ["2014 S/S"],
     }
     facts = [
         {"fact_id": "f1", "title": "2014 S/S", "text": "2014 S/S was created by WINNER."},
@@ -791,7 +926,7 @@ def test_phase9_hotpot_bridge_attribute_hop2_is_relation_conditioned():
     row = {
         **_hotpot_row(),
         "question": "What company formed the group that created 2014 S/S?",
-        "entities": ["2014 S/S"],
+        "question_entities": ["2014 S/S"],
     }
     facts = [
         {"fact_id": "f_wrong", "title": "WINNER", "text": "WINNER is a South Korean boy band."},
@@ -817,7 +952,7 @@ def test_phase9_hotpot_constraint_construction_intersects_targets():
     row = {
         **_hotpot_row(),
         "question": "Who wrote Novel X and directed Film Y?",
-        "entities": ["Novel X", "Film Y"],
+        "question_entities": ["Novel X", "Film Y"],
     }
     facts = [
         {"fact_id": "f1", "title": "Novel X", "text": "Novel X was written by Jordan Lee."},
@@ -847,7 +982,7 @@ def test_phase9_hotpot_constraint_construction_requires_shared_target_before_pai
     row = {
         **_hotpot_row(),
         "question": "Who wrote Novel X and directed Film Y?",
-        "entities": ["Novel X", "Film Y"],
+        "question_entities": ["Novel X", "Film Y"],
     }
     facts = [
         {"fact_id": "f1", "title": "Novel X", "text": "Novel X was written by Jordan Lee."},
@@ -870,11 +1005,32 @@ def test_phase9_hotpot_constraint_construction_requires_shared_target_before_pai
     assert telemetry["shared_targets"] == ["Jordan Lee"]
 
 
+def test_hotpot_constraint_constructor_uses_bounded_semantic_fallback():
+    row = {
+        "question": "Who wrote Novel X and directed Film Y?",
+        "question_entities": ["Novel X", "Film Y"],
+    }
+    facts = [
+        {"fact_id": "f1", "title": "Novel X", "text": "Novel X was written by Jordan Lee."},
+        {"fact_id": "f2", "title": "Film Y", "text": "Film Y was directed by Morgan Park."},
+    ]
+
+    options = rub._hotpot_constraint_chain_options(
+        row=row,
+        facts=facts,
+        reasoning_type="multi_constraint_lookup",
+        previous_signatures=set(),
+    )
+
+    assert 0 < len(options) <= 16
+    assert all(option["constructor_family"] == "bounded_constraint_fallback" for option in options)
+
+
 def test_phase2_hotpot_reasoning_type_routes_bridge_attribute():
     row = {
         **_hotpot_row(),
         "question": "2014 S/S is the debut album of a South Korean boy group that was formed by who?",
-        "entities": ["2014 S/S", "Winner (band)"],
+        "question_entities": ["2014 S/S", "Winner (band)"],
     }
     assert rub._hotpot_reasoning_type(row) == "bridge_attribute"
 
@@ -883,7 +1039,7 @@ def test_phase2_hotpot_bridge_pool_filters_attribute_values_by_role():
     row = {
         **_hotpot_row(),
         "question": "Are both Dictyosperma and Huernia described as a genus?",
-        "entities": ["Dictyosperma", "Huernia"],
+        "question_entities": ["Dictyosperma", "Huernia"],
     }
     facts = [
         {"fact_id": "f1", "title": "Dictyosperma", "text": "Dictyosperma is a South Korean genus from Eastern islands."},
@@ -906,7 +1062,7 @@ def test_phase2_hotpot_fact_semantics_keeps_attribute_value_role():
     row = {
         **_hotpot_row(),
         "question": "Are both Dictyosperma and Huernia described as a genus?",
-        "entities": ["Dictyosperma", "Huernia"],
+        "question_entities": ["Dictyosperma", "Huernia"],
     }
     semantics = rub._hotpot_fact_semantics(
         row,
@@ -920,7 +1076,7 @@ def test_phase2_hotpot_fact_semantics_keeps_attribute_value_role():
 def test_phase3_hotpot_semantic_chain_records_reasoning_candidate_and_verification_result():
     row = {
         "question": "What company formed the group that created 2014 S/S?",
-        "entities": ["2014 S/S"],
+        "question_entities": ["2014 S/S"],
     }
     pair = rub._hotpot_rank_chain_pairs(
         row,
@@ -940,12 +1096,18 @@ def test_phase3_hotpot_semantic_chain_records_reasoning_candidate_and_verificati
     assert result["evidence_valid"] is True
     assert result["reasoning_complete"] is True
     assert result["answer_supported"] is True
+    alignment = verdict["question_alignment"]
+    assert alignment["pass"] is True
+    assert alignment["question_anchor_covered"] is True
+    assert alignment["requested_relation_covered"] is True
+    assert alignment["answer_target_covered"] is True
+    assert alignment["topology_consistent_with_question"] is True
 
 
 def test_phase3_hotpot_bridge_attribute_rejects_wrong_requested_relation():
     row = {
         "question": "What company formed the group that created 2014 S/S?",
-        "entities": ["2014 S/S"],
+        "question_entities": ["2014 S/S"],
     }
     pair = rub._hotpot_rank_chain_pairs(
         row,
@@ -971,7 +1133,7 @@ def test_phase3_hotpot_bridge_attribute_rejects_wrong_requested_relation():
 def test_phase3_hotpot_bridge_attribute_accepts_compatible_relation_alias():
     row = {
         "question": "What company founded the group that created 2014 S/S?",
-        "entities": ["2014 S/S"],
+        "question_entities": ["2014 S/S"],
     }
     pair = rub._hotpot_rank_chain_pairs(
         row,
@@ -990,10 +1152,33 @@ def test_phase3_hotpot_bridge_attribute_accepts_compatible_relation_alias():
     assert verifier["answer_supported"] is True
 
 
+def test_hotpot_question_alignment_rejects_self_consistent_distractor_chain():
+    """A coherent Shinee chain must not answer a question anchored on 2014 S/S."""
+    row = {
+        "question": "What company formed the group that created 2014 S/S?",
+        "question_entities": ["2014 S/S"],
+    }
+    pair = rub._hotpot_rank_chain_pairs(
+        row,
+        "Shinee",
+        [{"fact_id": "f1", "title": "Shinee", "text": "Shinee is a South Korean boy group."}],
+        [{"fact_id": "f2", "title": "Shinee", "text": "Shinee was formed by S.M. Entertainment."}],
+    )[0]
+
+    verifier = pair["semantic_chain_verification"]
+    alignment = verifier["question_alignment"]
+    assert alignment["question_anchor_covered"] is False
+    assert alignment["requested_relation_covered"] is True
+    assert alignment["pass"] is False
+    assert verifier["gate_results"]["question_alignment"]["pass"] is False
+    assert verifier["evidence_valid"] is False
+    assert verifier["answer_supported"] is False
+
+
 def test_phase3_hotpot_multi_constraint_rejects_wrong_anchor_even_with_shared_target():
     row = {
         "question": "Who wrote Novel X and directed Film Y?",
-        "entities": ["Novel X", "Film Y"],
+        "question_entities": ["Novel X", "Film Y"],
     }
     pair = rub._hotpot_rank_chain_pairs(
         row,
@@ -1016,7 +1201,7 @@ def test_phase3_hotpot_multi_constraint_rejects_wrong_anchor_even_with_shared_ta
 def test_phase3_hotpot_multi_constraint_requires_anchor_relation_and_same_target():
     row = {
         "question": "Who wrote Novel X and directed Film Y?",
-        "entities": ["Novel X", "Film Y"],
+        "question_entities": ["Novel X", "Film Y"],
     }
     pair = rub._hotpot_rank_chain_pairs(
         row,
@@ -1039,7 +1224,7 @@ def test_phase3_hotpot_multi_constraint_requires_anchor_relation_and_same_target
 def test_phase9_hotpot_question_semantics_validates_multi_constraint_schema():
     row = {
         "question": "Who wrote Novel X and directed Film Y?",
-        "entities": ["Novel X", "Film Y"],
+        "question_entities": ["Novel X", "Film Y"],
         "supporting_facts": [
             {"fact_id": "f1", "title": "Novel X", "text": "Novel X was written by Jordan Lee."},
             {"fact_id": "f2", "title": "Film Y", "text": "Film Y was directed by Jordan Lee."},
@@ -1063,7 +1248,7 @@ def test_phase9_hotpot_question_semantics_validates_multi_constraint_schema():
 def test_phase9_hotpot_question_semantics_supports_serial_constraints():
     row = {
         "question": "What government position was held by the woman who portrayed Corliss Archer?",
-        "entities": ["Corliss Archer", "Shirley Temple"],
+        "question_entities": ["Corliss Archer", "Shirley Temple"],
         "supporting_facts": [
             {"fact_id": "f1", "title": "Shirley Temple", "text": "Shirley Temple portrayed Corliss Archer in the radio series."},
             {"fact_id": "f2", "title": "Shirley Temple", "text": "Shirley Temple served as Chief of Protocol of the United States."},
@@ -1081,10 +1266,59 @@ def test_phase9_hotpot_question_semantics_supports_serial_constraints():
     assert qs.constraints[1].depends_on == "X"
 
 
+def test_phase9_hotpot_first_hop_plan_distinguishes_explicit_reverse_and_descriptive():
+    explicit = {
+        "question": "What position did Ada hold?",
+        "question_entities": ["Ada"],
+    }
+    reverse = {
+        "question": "What is the fight song of the university whose main campus is in Lawrence, Kansas and whose branch campuses are in the Kansas City metropolitan area?",
+        "question_entities": ["Lawrence", "Kansas", "Kansas City"],
+    }
+    descriptive = {
+        "question": "What government position was held by the woman who portrayed Corliss Archer?",
+        "question_entities": ["Corliss Archer"],
+    }
+
+    assert rub._hotpot_first_hop_plan(explicit)["mode"] == "explicit_entity"
+    reverse_plan = rub._hotpot_first_hop_plan(reverse)
+    assert reverse_plan["mode"] == "attribute_reverse"
+    assert reverse_plan["variable"] == "X"
+    assert [item["anchor"] for item in reverse_plan["constraints"]] == ["Lawrence", "Kansas City"]
+    assert all(item["direction"] == "target_to_source" for item in reverse_plan["constraints"])
+    descriptive_plan = rub._hotpot_first_hop_plan(descriptive)
+    assert descriptive_plan["mode"] == "descriptive_entity"
+    assert descriptive_plan["variable"] == "X"
+    assert descriptive_plan["constraints"][0]["anchor"] == "Corliss Archer"
+    assert descriptive_plan["constraints"][0]["source_var"] == "X"
+
+
+def test_phase9_hotpot_reverse_object_anchor_binds_fact_subject():
+    row = {
+        "question": "What is the fight song of the university whose main campus is in Lawrence?",
+        "question_entities": ["Lawrence"],
+    }
+    plan = rub._hotpot_first_hop_plan(row)
+    constraint = plan["constraints"][0]
+    binding = rub._hotpot_best_constraint_binding(
+        row,
+        constraint,
+        [{
+            "fact_id": "f1",
+            "title": "University of Kansas",
+            "text": "The main campus of the University of Kansas is in Lawrence.",
+        }],
+        used_fact_ids=set(),
+    )
+    assert binding["anchor_match"] is True
+    assert binding["anchor_direction"] == "object_to_subject"
+    assert binding["target"] == "University of Kansas"
+
+
 def test_phase9_hotpot_serial_constraint_constructor_binds_intermediate_then_answer():
     row = {
         "question": "What government position was held by the woman who portrayed Corliss Archer?",
-        "entities": ["Corliss Archer", "Shirley Temple"],
+        "question_entities": ["Corliss Archer", "Shirley Temple"],
     }
     facts = [
         {"fact_id": "f1", "title": "Shirley Temple", "text": "Shirley Temple portrayed Corliss Archer in the radio series."},
@@ -1115,7 +1349,7 @@ def test_phase9_hotpot_serial_constraint_constructor_binds_intermediate_then_ans
 def test_phase9_hotpot_constraint_retrieval_prefers_bound_title_before_global_distractor():
     row = {
         "question": "Who wrote Novel X and directed Film Y?",
-        "entities": ["Novel X", "Film Y"],
+        "question_entities": ["Novel X", "Film Y"],
         "supporting_facts": [
             {"fact_id": "gold", "title": "Novel X", "text": "Novel X was written by Jordan Lee."},
             {"fact_id": "distractor", "title": "Novel Z", "text": "Novel Z was written by Jordan Lee."},
@@ -1143,7 +1377,7 @@ def test_phase9_hotpot_constraint_retrieval_prefers_bound_title_before_global_di
 def test_phase9_hotpot_relation_semantics_preserves_written_by_direction():
     row = {
         "question": "Who wrote Novel X?",
-        "entities": ["Novel X"],
+        "question_entities": ["Novel X"],
     }
 
     passive = rub._hotpot_fact_semantics(
@@ -1166,7 +1400,7 @@ def test_phase9_hotpot_relation_semantics_preserves_written_by_direction():
 def test_phase9_hotpot_bridge_inference_uses_relation_endpoint_not_ner_order():
     row = {
         "question": "Where was the director of Film A born?",
-        "entities": ["Film A"],
+        "question_entities": ["Film A"],
     }
     fact = {"fact_id": "f1", "title": "Film A", "text": "Film A was directed by Jane Doe in 2011."}
 
@@ -1176,7 +1410,7 @@ def test_phase9_hotpot_bridge_inference_uses_relation_endpoint_not_ner_order():
 def test_phase3_hotpot_bridge_entity_uses_source_fact_to_infer_bridge_then_answer_fact():
     row = {
         "question": "Where was the director of Film A born?",
-        "entities": ["Film A"],
+        "question_entities": ["Film A"],
     }
     facts = [
         {"fact_id": "supporting_fact_1", "title": "Film A", "text": "Film A was directed by Jane Doe."},
@@ -1203,10 +1437,113 @@ def test_phase3_hotpot_bridge_entity_uses_source_fact_to_infer_bridge_then_answe
     assert "supporting_fact_2" in telemetry["hop2_pool_fact_ids"]
 
 
+def test_hotpot_bridge_constructor_discards_context_title_without_question_anchor():
+    row = {
+        "question": "Where was the director of Film A born?",
+        "question_entities": ["Film A"],
+    }
+    facts = [
+        {"fact_id": "gold_1", "title": "Film A", "text": "Film A was directed by Jane Doe."},
+        {"fact_id": "gold_2", "title": "Jane Doe", "text": "Jane Doe was born in Paris."},
+        {"fact_id": "distractor", "title": "Context Only", "text": "Context Only was directed by Jane Doe."},
+    ]
+
+    options = rub._hotpot_bridge_entity_chain_options(row=row, facts=facts, previous_signatures=set())
+
+    assert options
+    assert all(option["view"].hop1_fact_ids == ["gold_1"] for option in options)
+
+
+def test_hotpot_comparison_constructor_does_not_use_context_titles_as_entities():
+    row = {
+        "question": "Are Alice and Bob both from the United States?",
+        "question_entities": ["Alice", "Bob"],
+    }
+    facts = [
+        {"fact_id": "d1", "title": "Context Only", "text": "Context Only is American."},
+        {"fact_id": "d2", "title": "Another Context", "text": "Another Context is American."},
+    ]
+
+    options = rub._hotpot_topology_chain_options(
+        row=row,
+        facts=facts,
+        reasoning_type="shared_property_yesno",
+        previous_signatures=set(),
+    )
+
+    assert options == []
+
+
+def test_hotpot_multi_constraint_constructor_requires_question_constraint_anchors():
+    row = {
+        "question": "Who wrote Novel X and directed Film Y?",
+        "question_entities": ["Novel X", "Film Y"],
+    }
+    facts = [
+        {"fact_id": "d1", "title": "Novel Z", "text": "Novel Z was written by Jordan Lee."},
+        {"fact_id": "d2", "title": "Film Z", "text": "Film Z was directed by Jordan Lee."},
+    ]
+
+    options = rub._hotpot_constraint_chain_options(
+        row=row,
+        facts=facts,
+        reasoning_type="multi_constraint_lookup",
+        previous_signatures=set(),
+    )
+
+    assert options == []
+
+
+def test_hotpot_effective_candidate_diversity_ignores_unaligned_chain_variants():
+    candidates = [
+        {
+            "hotpot_chain_signature": f"wrong_chain_{index}",
+            "question_alignment": {
+                "pass": False,
+                "question_anchor_covered": False,
+                "anchor_checks": {"2014 S/S": False},
+            },
+        }
+        for index in range(8)
+    ]
+
+    telemetry = rub._hotpot_candidate_diversity(candidates)
+
+    assert telemetry["question_anchor_coverage_count"] == 0
+    assert telemetry["unique_question_aligned_chains"] == 0
+    assert telemetry["unique_valid_first_hop_anchors"] == 0
+    assert telemetry["effective_candidate_diversity"] == 0
+    assert telemetry["effective_candidate_diversity_ratio"] == 0.0
+
+
+def test_hotpot_effective_candidate_diversity_counts_unique_aligned_chains():
+    candidates = [
+        {
+            "hotpot_chain_signature": "aligned_chain_a",
+            "question_alignment": {"pass": True, "question_anchor_covered": True, "anchor_checks": {"A": True}},
+        },
+        {
+            "hotpot_chain_signature": "aligned_chain_a",
+            "question_alignment": {"pass": True, "question_anchor_covered": True, "anchor_checks": {"A": True}},
+        },
+        {
+            "hotpot_chain_signature": "aligned_chain_b",
+            "question_alignment": {"pass": True, "question_anchor_covered": True, "anchor_checks": {"A": True}},
+        },
+    ]
+
+    telemetry = rub._hotpot_candidate_diversity(candidates)
+
+    assert telemetry["question_anchor_coverage_count"] == 3
+    assert telemetry["unique_question_aligned_chains"] == 2
+    assert telemetry["unique_valid_first_hop_anchors"] == 1
+    assert telemetry["effective_candidate_diversity"] == 2
+
+
 def test_phase9_hotpot_bridge_entity_does_not_infer_answer_side_location_as_bridge():
     row = {
         "question": "Big Stone Gap's director is based in what New York city?",
-        "entities": ["Big Stone Gap"],
+        "question_entities": ["Big Stone Gap"],
     }
     director_fact = {
         "fact_id": "f_director",
@@ -1234,7 +1571,7 @@ def test_phase9_hotpot_bridge_entity_does_not_infer_answer_side_location_as_brid
 def test_phase9_hotpot_home_venue_capacity_bridge_uses_arena_not_location():
     row = {
         "question": "The Lewiston Maineiacs home games arena can seat how many?",
-        "entities": ["Lewiston Maineiacs"],
+        "question_entities": ["Lewiston Maineiacs"],
     }
     team_fact = {
         "fact_id": "f_team",
@@ -1258,10 +1595,57 @@ def test_phase9_hotpot_home_venue_capacity_bridge_uses_arena_not_location():
     assert verdict["derived_answer"] == "3,677"
 
 
+def test_hotpot_location_object_span_preserves_full_relation_target():
+    row = {
+        "question": "Big Stone Gap's director is based in what New York city?",
+        "question_entities": ["Big Stone Gap"],
+    }
+    facts = [
+        {"fact_id": "f1", "title": "Big Stone Gap", "text": "Big Stone Gap was directed by Adriana Trigiani."},
+        {"fact_id": "f2", "title": "Adriana Trigiani", "text": "Adriana Trigiani is based in Greenwich Village, New York City."},
+    ]
+    view = rub.build_hotpot_chain_view_from_facts(
+        candidate_id="location_span",
+        bridge_entity="Adriana Trigiani",
+        question=row["question"],
+        facts=facts,
+        hop1_fact_ids=["f1"],
+        hop2_fact_ids=["f2"],
+    )
+
+    semantics = rub._hotpot_fact_semantics(row, facts[1])
+    answer = rub._hotpot_deterministic_topology_answer(
+        row=row,
+        facts=facts,
+        view=view,
+        reasoning_type="bridge_entity",
+    )
+
+    assert semantics["object"] == "Greenwich Village, New York City"
+    assert answer == "Greenwich Village, New York City"
+
+
+def test_hotpot_capacity_attribute_slot_prefers_seated_number():
+    row = {
+        "question": "How many people can the arena seat?",
+        "question_entities": ["Arena"],
+    }
+    fact = {
+        "fact_id": "capacity",
+        "title": "Arena",
+        "text": "The arena has a 4,000 capacity (3,677 seated).",
+    }
+
+    assert rub._hotpot_question_attribute_slot(row) == "seated_capacity"
+    semantics = rub._hotpot_fact_semantics(row, fact)
+    assert semantics["object"] == "3,677"
+    assert rub._hotpot_derive_answer_hint(row["question"], fact, fact) == "3,677"
+
+
 def test_phase9_hotpot_yes_no_both_routes_to_parallel_not_bridge_entity():
     row = {
         "question": "Are Giuseppe Verdi and Ambroise Thomas both Opera composers?",
-        "entities": ["Giuseppe Verdi", "Ambroise Thomas"],
+        "question_entities": ["Giuseppe Verdi", "Ambroise Thomas"],
     }
 
     assert rub._hotpot_reasoning_type(row) == "shared_property_yesno"
@@ -1275,7 +1659,7 @@ def test_phase9_hotpot_yes_no_both_routes_to_parallel_not_bridge_entity():
 def test_phase9_hotpot_low_confidence_compositional_keeps_compatible_backups():
     row = {
         "question": "What company formed the group that created 2014 S/S?",
-        "entities": ["2014 S/S"],
+        "question_entities": ["2014 S/S"],
     }
 
     classification = rub._hotpot_topology_classification(row)
@@ -1290,7 +1674,7 @@ def test_phase9_hotpot_low_confidence_compositional_keeps_compatible_backups():
 def test_phase9_hotpot_constraint_binding_can_invert_portrayed_relation():
     row = {
         "question": "What government position was held by the woman who portrayed Corliss Archer?",
-        "entities": ["Corliss Archer", "Shirley Temple"],
+        "question_entities": ["Corliss Archer", "Shirley Temple"],
     }
     constraint = {"anchor": "Corliss Archer", "relation": "acted_in"}
     fact = {
@@ -1305,6 +1689,137 @@ def test_phase9_hotpot_constraint_binding_can_invert_portrayed_relation():
     assert binding["relation_match"] is True
     assert binding["target"] == "Shirley Temple"
     assert binding["satisfied"] is True
+
+
+def test_phase9_model_semantic_plan_is_normalized_to_executable_reverse_hop():
+    plan = rub._hotpot_normalize_semantic_plan({
+        "reasoning_family": "constraint",
+        "reasoning_type": "multi_constraint_lookup",
+        "confidence": 0.91,
+        "first_hop": {
+            "mode": "reverse_relation",
+            "known_entity": "Lawrence",
+            "relation": "main_campus_location",
+            "direction": "reverse",
+            "unknown_variable": "U",
+        },
+        "requested_relation": "fight_song",
+    })
+
+    assert plan is not None
+    assert plan["first_hop_mode"] == "attribute_reverse"
+    assert plan["first_hop_constraints"][0]["direction"] == "target_to_source"
+    assert plan["first_hop_constraints"][0]["target_var"] == "U"
+    assert plan["requested_relation"] == "fight_song"
+
+
+def test_phase9_model_plan_overrides_heuristic_topology_without_bypassing_question_anchor():
+    row = {
+        "question": "What is the fight song of the university whose main campus is in Lawrence?",
+        "question_entities": [],
+        "_model_semantic_plan": rub._hotpot_normalize_semantic_plan({
+            "reasoning_family": "constraint",
+            "reasoning_type": "multi_constraint_lookup",
+            "confidence": 0.94,
+            "first_hop": {
+                "mode": "reverse_relation",
+                "known_entity": "Lawrence",
+                "relation": "main_campus_location",
+                "direction": "reverse",
+                "unknown_variable": "U",
+            },
+            "requested_relation": "fight_song",
+        }),
+    }
+
+    classification = rub._hotpot_topology_classification(row)
+    assert classification["reasoning_type"] == "multi_constraint_lookup"
+    assert classification["first_hop_mode"] == "attribute_reverse"
+    assert classification["first_hop_constraints"][0]["anchor"] == "Lawrence"
+    assert classification["requested_relation"] == "fight_song"
+    constraints = rub._hotpot_parse_multi_constraints(row)
+    assert len(constraints) == 2
+    assert constraints[1]["source_var"] == "U"
+    assert constraints[1]["relation"] == "fight_song"
+
+
+def test_phase9_model_plan_cannot_replace_answer_relation_with_first_hop_relation():
+    row = {
+        "question": "What government position was held by the woman who portrayed Corliss Archer?",
+        "question_entities": ["Corliss Archer", "Shirley Temple"],
+    }
+    plan = rub._hotpot_normalize_semantic_plan({
+        "reasoning_family": "compositional",
+        "reasoning_type": "bridge_entity",
+        "confidence": 0.9,
+        "first_hop": {"mode": "explicit_entity", "known_entity": "Corliss Archer"},
+        "requested_relation": "portrayed_by",
+    })
+
+    accepted, reason = rub._hotpot_semantic_plan_compatibility(row, plan)
+    assert accepted is False
+    assert reason == "answer_relation_conflict:portrayed_by!=position"
+
+
+def test_phase10_level2_model_reasoner_returns_candidate_with_program_alignment():
+    model = QueueModel([json.dumps({
+        "reasoning_type": "bridge_attribute",
+        "evidence_ids": ["supporting_fact_1", "supporting_fact_2"],
+        "bridge_entity": "Ada",
+        "answer": "London",
+        "confidence": 0.9,
+    })])
+    candidate = rub.generate_hotpot_model_mode_candidate(
+        model,
+        _hotpot_row(),
+        attempt=0,
+        previous_candidates=[],
+        seed=0,
+        temperature=0.0,
+        top_p=1.0,
+        do_sample=False,
+        mode="level2_reasoner",
+    )
+    payload = json.loads(candidate.text)
+    assert payload["generation_mode"] == "level2_reasoner"
+    assert payload["answer"] == "London"
+    assert payload["cited_fact_ids"] == ["supporting_fact_1", "supporting_fact_2"]
+    assert "question_alignment" in payload
+    record = rub.candidate_record(candidate, domain="hotpotqa", candidate_id="c0")
+    assert record["cited_fact_ids"] == ["supporting_fact_1", "supporting_fact_2"]
+    assert "question_alignment" in record
+
+
+def test_phase10_level3_runs_model_verifier_and_stops_on_valid_candidate():
+    model = QueueModel([
+        json.dumps({
+            "reasoning_type": "bridge_attribute",
+            "evidence_ids": ["supporting_fact_1", "supporting_fact_2"],
+            "bridge_entity": "Ada",
+            "answer": "London",
+        }),
+        json.dumps({"valid": True, "question_aligned": True, "answer_grounded": True}),
+    ])
+    old_rounds = rub.HOTPOT_MODEL_REPAIR_ROUNDS
+    rub.HOTPOT_MODEL_REPAIR_ROUNDS = 1
+    try:
+        candidate = rub.generate_hotpot_model_mode_candidate(
+            model,
+            _hotpot_row(),
+            attempt=0,
+            previous_candidates=[],
+            seed=0,
+            temperature=0.0,
+            top_p=1.0,
+            do_sample=False,
+            mode="level3_pure_model",
+        )
+    finally:
+        rub.HOTPOT_MODEL_REPAIR_ROUNDS = old_rounds
+    payload = json.loads(candidate.text)
+    assert payload["generation_mode"] == "level3_pure_model"
+    assert payload["model_verifier"]["valid"] is True
+    assert len(model.prompts) == 2
 
 
 def test_phase5_mbpp_missing_public_tests_passed_does_not_trigger_repair():

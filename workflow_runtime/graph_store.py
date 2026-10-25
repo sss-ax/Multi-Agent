@@ -13,7 +13,7 @@ from .canonical import (
     full_digest,
     node_content_digest,
 )
-from .models import DependencyEdge, GraphState, NodeVersion, RuntimeFingerprint
+from .models import DependencyEdge, GraphState, NodeVersion, RuntimeFingerprint, normalize_provenance
 from .relations import DATA_DEPENDENCY_RELATIONS, RELATION_SPECS
 
 
@@ -45,11 +45,32 @@ class GraphStore:
     def snapshot(self) -> GraphState:
         return copy.deepcopy(self._state)
 
+    def clone(self) -> "GraphStore":
+        """Return a complete transactional clone, including branch ancestry."""
+        cloned = GraphStore(self._state)
+        cloned._counters = copy.deepcopy(self._counters)
+        cloned._branches = copy.deepcopy(self._branches)
+        return cloned
+
+    def replace_from(self, other: "GraphStore") -> None:
+        """Atomically adopt another store's complete internal checkpoint."""
+        self._state = copy.deepcopy(other._state)
+        self._counters = copy.deepcopy(other._counters)
+        self._branches = copy.deepcopy(other._branches)
+
     def replace_state(self, state: GraphState) -> None:
         """Atomically replace the store contents after a validated batch."""
+        previous_branches = copy.deepcopy(self._branches)
         self._state = copy.deepcopy(state)
         self._counters = {}
-        self._branches = {}
+        self._branches = {
+            key: value
+            for key, value in previous_branches.items()
+            if any(
+                node.task_id == key[0] and node.branch_id == key[1]
+                for node in self._state.nodes.values()
+            )
+        }
         for node in self._state.nodes.values():
             key = node.slot
             self._counters[key] = max(self._counters.get(key, 0), node.version)
@@ -125,7 +146,12 @@ class GraphStore:
             dependency_versions=dict(dependency_versions or {}),
             source_refs=list(source_refs or []),
             evidence_refs=list(evidence_refs or []),
-            provenance=dict(provenance or {}),
+            provenance=normalize_provenance(
+                provenance,
+                owner=owner,
+                created_by_role=created_by_role,
+                node_type=node_type,
+            ),
             validation=dict(validation or {}),
             parent_version_id=parent.node_id if parent is not None else None,
             created_at=time.time(),
@@ -198,6 +224,14 @@ class GraphStore:
             self._populate_digests(target_node, None)
         elif relation == "verifies" and source_node.status == "verified":
             target_node.validation["model_judged_correct"] = True
+            target_node.validation.pop("model_judged_incorrect", None)
+            self._populate_digests(target_node, None)
+        elif relation == "contradicts" and source_node.status in {"need_fix", "uncertain"}:
+            # Keep the artifact readable as repair input, but invalidate it as
+            # a finalizable semantic result. Superseding repairs create a new
+            # version instead of mutating or deleting this evidence trail.
+            target_node.validation["model_judged_correct"] = False
+            target_node.validation["model_judged_incorrect"] = True
             self._populate_digests(target_node, None)
         return copy.deepcopy(edge)
 

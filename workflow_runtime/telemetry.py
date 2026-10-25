@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from .semantic_actions import MODEL_TYPED_OPS
+
 
 class WorkflowTelemetry:
     """Append JSONL events while keeping an in-memory run summary."""
@@ -22,6 +24,11 @@ class WorkflowTelemetry:
         self._native_stage_roles: set[str] = set()
         self._native_message_ids: set[str] = set()
         self._seen_reusable_prefix_keys: set[str] = set()
+        # Keep structured model-action events available to the evaluation
+        # report as well as the optional JSONL sink.  This is intentionally
+        # bounded so a long run cannot grow memory without limit.
+        self._records: list[dict[str, Any]] = []
+        self._max_records = 200
         self._summary: dict[str, Any] = {
             "action_events": 0,
             "native_model_calls": 0,
@@ -84,12 +91,26 @@ class WorkflowTelemetry:
             "targeted_refinement_skipped_count": 0,
             "quality_refinement_budget_exceeded_count": 0,
             "invalid_action_events": 0,
+            "semantic_delta_proposals": 0,
+            "semantic_delta_commits": 0,
+            "semantic_delta_validation_failures": 0,
+            "grounding_validation_failures": 0,
+            "model_proposed_fragments": 0,
+            "kernel_rejected_fragments": 0,
+            "closure_added_fragments": 0,
+            "receiver_consumed_fragments": 0,
+            "unused_sent_fragments": 0,
             "compile_failures": 0,
             "generation_errors": 0,
+            "generation_error_records": [],
+            "compile_error_records": [],
             "evaluated_answers": 0,
             "correct_answers": 0,
             "incorrect_answers": 0,
             "retry_count": 0,
+            "retry_input_tokens": 0,
+            "retry_full_replay_equivalent_tokens": 0,
+            "retry_saved_input_tokens": 0,
             "logical_input_tokens": 0,
             "physical_input_tokens": 0,
             "physical_llm_input_tokens": 0,
@@ -148,22 +169,41 @@ class WorkflowTelemetry:
         event["raw_output_sha256"] = self._digest(raw_output)
         event["raw_output"] = raw_output[: self.max_output_chars]
         self.emit("model_action", event)
+        self._records.append({"event": "model_action", **dict(event)})
+        self._records = self._records[-self._max_records:]
 
         self._summary["action_events"] += 1
         self._summary["reasoning_round_count"] += 1
         if event.get("role") == "solver" and event.get("mode") == "repair":
             self._summary["solver_revision_round_count"] += 1
         action_payload = event.get("action") if isinstance(event.get("action"), dict) else {}
+        if isinstance(action_payload, dict) and action_payload.get("op") in MODEL_TYPED_OPS:
+            self._summary["semantic_delta_proposals"] += 1
+            self._summary["semantic_delta_commits"] += int(bool(event.get("compile_success", False)))
+            if not event.get("compile_success", False):
+                self._summary["semantic_delta_validation_failures"] += 1
+            self._summary["grounding_validation_failures"] += int(
+                any("grounding" in str(error).lower() for error in event.get("validation_errors", ()))
+            )
         if event.get("role") == "critic" and isinstance(action_payload, dict):
-            if action_payload.get("op") == "verify" and action_payload.get("status") == "need_fix":
+            kernel_status = event.get("kernel_verification_status")
+            status = kernel_status or action_payload.get("status")
+            if status == "need_fix":
                 self._summary["critic_need_fix_count"] += 1
-            if action_payload.get("op") == "verify" and action_payload.get("status") == "verified":
+            if status == "verified":
                 self._summary["critic_verified_count"] += 1
         self._summary["retry_count"] += max(0, int(event.get("attempts", 1)) - 1)
         if not event.get("protocol_valid", False):
             self._summary["invalid_action_events"] += 1
         if not event.get("compile_success", False):
             self._summary["compile_failures"] += 1
+            self._summary["compile_error_records"].append({
+                "role": event.get("role", ""),
+                "mode": event.get("mode", ""),
+                "compile_error": event.get("compile_error", ""),
+                "raw_output": event.get("raw_output", ""),
+            })
+            self._summary["compile_error_records"] = self._summary["compile_error_records"][-10:]
         quality = self._summary["quality"]
         quality["protocol_valid_actions"] += int(bool(event.get("protocol_valid", False)))
         quality["compiled_actions"] += int(bool(event.get("compile_success", False)))
@@ -182,6 +222,8 @@ class WorkflowTelemetry:
             "graph_source_cross_call_reread_tokens",
             "graph_role_aware_source_ref_saved_tokens",
             "graph_role_aware_state_ref_saved_tokens",
+            "retry_input_tokens", "retry_full_replay_equivalent_tokens",
+            "retry_saved_input_tokens",
         ):
             self._summary[key] += int(event.get(key, 0) or 0)
         physical_input = int(event.get("physical_input_tokens", 0) or 0)
@@ -222,13 +264,27 @@ class WorkflowTelemetry:
         event["raw_output_sha256"] = self._digest(raw_output)
         event["raw_output"] = raw_output[: self.max_output_chars]
         self.emit("model_generation_error", event)
+        self._records.append({"event": "model_generation_error", **dict(event)})
+        self._records = self._records[-self._max_records:]
 
         self._summary["generation_errors"] += 1
+        self._summary["generation_error_records"].append({
+            "role": event.get("role", ""),
+            "mode": event.get("mode", ""),
+            "validation_errors": list(event.get("validation_errors", ())),
+            "raw_output": event.get("raw_output", ""),
+        })
+        self._summary["generation_error_records"] = self._summary["generation_error_records"][-10:]
         attempts = int(event.get("attempts", 1) or 1)
         self._summary["retry_count"] += max(0, attempts - 1)
         self._summary["invalid_action_events"] += 1
         self._summary["quality"]["failed_stages"] += 1
         self._summary["logical_input_tokens"] += int(event.get("logical_input_tokens", 0) or 0)
+        self._summary["retry_input_tokens"] += int(event.get("retry_input_tokens", 0) or 0)
+        self._summary["retry_full_replay_equivalent_tokens"] += int(
+            event.get("retry_full_replay_equivalent_tokens", 0) or 0
+        )
+        self._summary["retry_saved_input_tokens"] += int(event.get("retry_saved_input_tokens", 0) or 0)
         self._summary["graph_read_context_tokens"] += int(event.get("graph_read_context_tokens", 0) or 0)
         self._summary["persistent_context_tokens"] += int(event.get("persistent_context_tokens", 0) or 0)
         self._summary["incremental_context_tokens"] += int(event.get("incremental_context_tokens", 0) or 0)
@@ -319,6 +375,11 @@ class WorkflowTelemetry:
             "unique_comm_tokens",
             "repeated_comm_tokens",
             "receiver_seen_hit_count",
+            "model_proposed_fragments",
+            "kernel_rejected_fragments",
+            "closure_added_fragments",
+            "receiver_consumed_fragments",
+            "unused_sent_fragments",
             "state_delta_tokens",
             "full_state_equivalent_tokens",
             "revision_success_count",
@@ -417,7 +478,9 @@ class WorkflowTelemetry:
             self._summary["incorrect_answers"] += 1
 
     def summary(self) -> dict[str, Any]:
-        return self._with_derived_summary(dict(self._summary))
+        summary = self._with_derived_summary(dict(self._summary))
+        summary["records"] = [dict(record) for record in self._records]
+        return summary
 
     def _with_derived_summary(self, summary: dict[str, Any]) -> dict[str, Any]:
         summary["total_model_tokens"] = int(summary.get("physical_input_tokens", 0) or 0) + int(summary.get("output_tokens", 0) or 0)

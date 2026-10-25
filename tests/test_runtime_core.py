@@ -179,17 +179,17 @@ def test_code_generation_final_context_uses_code_boundary() -> None:
     assert verification.node_id in context_slice.visible_node_ids
 
 
-def test_numeric_initial_graph_seeds_facts_without_solving() -> None:
+def test_numeric_initial_graph_keeps_numbers_in_immutable_source_only() -> None:
     store = init_workflow_graph("Janet has 16 eggs. She eats 3 and uses 4.", task_id="gsm", task_type="numeric_solve")
 
     query = store.latest_valid("gsm", "main", "query_spec")
     assert query is not None
     assert query.content["task_type"] == "numeric_solve"
     assert query.provenance["communication_scope"] == "MANDATORY"
-    facts = store.latest_valid("gsm", "main", "facts")
-    assert facts is not None
-    assert [item["id"] for item in facts.content] == ["N1", "N2", "N3"]
-    assert [item["value"] for item in facts.content] == [16, 3, 4]
+    task = store.latest_valid("gsm", "main", "task")
+    assert task is not None and task.type == "task_source"
+    assert "16 eggs" in task.content
+    assert store.latest_valid("gsm", "main", "facts") is None
     assert store.latest_valid("gsm", "main", "calculation") is None
     assert store.latest_valid("gsm", "main", "result") is None
 

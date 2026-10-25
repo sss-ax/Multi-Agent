@@ -440,7 +440,7 @@ def _facts_from_graph(graph_store: Any) -> list[dict[str, Any]]:
     nodes = list(getattr(state, "nodes", {}).values()) if state is not None else []
     facts = []
     for node in sorted(nodes, key=_node_sort_key):
-        if getattr(node, "type", "") != "supporting_fact":
+        if getattr(node, "type", "") not in {"supporting_fact", "sentence_source"}:
             continue
         if hasattr(node, "is_operationally_valid") and not node.is_operationally_valid():
             continue

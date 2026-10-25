@@ -5,6 +5,7 @@ from scripts.evaluate_domain_workflow import (
     action_token_totals,
     add_source_nodes,
     communication_totals,
+    extract_question_entities,
     hotpot_f1,
     hotpot_normalize,
     optional_consumption_totals,
@@ -76,10 +77,31 @@ def test_read_hotpotqa_json_array_and_metrics(tmp_path):
     loaded = read(path, "hotpotqa", 1)
 
     assert loaded[0]["task_type"] == "multihop_qa"
-    assert loaded[0]["entities"] == ["Ada"]
+    assert loaded[0]["question_entities"] == ["Ada"]
+    assert loaded[0]["context_titles"] == ["Ada"]
+    assert "entities" not in loaded[0]
     assert loaded[0]["supporting_facts"][0]["text"] == "Ada was born in London."
     assert hotpot_normalize("The London!") == "london"
     assert hotpot_f1("London", "The London") == 1.0
+
+
+def test_hotpot_question_entities_never_use_context_titles(tmp_path):
+    path = tmp_path / "hotpot_dev.json"
+    row = {
+        "id": "abc",
+        "question": "Who is older, Annie Morton or Terry Richardson?",
+        "answer": "Terry Richardson",
+        "context": [["Madonna (book)", ["Madonna was published in 1992."]], ["Annie Morton", ["Annie Morton was born in 1970."]]],
+        "supporting_facts": [],
+    }
+    path.write_text(json.dumps([row]), encoding="utf-8")
+
+    loaded = read(path, "hotpotqa", 1)[0]
+
+    assert loaded["question_entities"] == ["Annie Morton", "Terry Richardson"]
+    assert loaded["context_titles"] == ["Madonna (book)", "Annie Morton"]
+    assert "Terry Richardson" not in loaded["context_titles"]
+    assert extract_question_entities("What science fantasy series has companion books?") == []
 
 
 def test_action_token_totals_aggregate_action_level_telemetry():
@@ -158,6 +180,34 @@ def test_action_token_totals_aggregate_action_level_telemetry():
     assert totals["simulated_context_reuse_input_tokens"] == 169
     assert totals["context_reuse_saving_ratio"] == 11 / 180
     assert totals["logical_vs_physical_input_gap_tokens"] == 159
+
+
+def test_action_token_totals_include_failed_generation_telemetry_summary():
+    records = [{
+        "runtime_summary": {
+            "records": [],
+            "telemetry_summary": {
+                "physical_input_tokens": 240,
+                "physical_llm_input_tokens": 240,
+                "logical_input_tokens": 260,
+                "output_tokens": 30,
+                "prefill_cost_tokens": 240,
+                "decode_cost_tokens": 30,
+                "forward_calls": 3,
+                "reasoning_round_count": 0,
+                "graph_read_context_tokens": 20,
+                "peak_context_tokens": 20,
+            },
+        },
+    }]
+
+    totals = action_token_totals(records)
+
+    assert totals["forward_calls"] == 3
+    assert totals["total_input_tokens"] == 240
+    assert totals["total_output_tokens"] == 30
+    assert totals["total_model_tokens"] == 270
+    assert totals["graph_read_context_tokens"] == 20
 
 
 def test_communication_totals_aggregate_phase7_metrics():

@@ -6,7 +6,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 from dataclasses import asdict
 from typing import Any
 
@@ -16,79 +15,54 @@ from workflow_runtime.langgraph_workflow import LangGraphWorkflow, NativeLangGra
 from workflow_runtime.model_backend import DirectTransformersModel, TransformersModel
 from workflow_runtime.telemetry import WorkflowTelemetry
 from workflow_runtime.evaluator import TaskEvaluator, parse_reference_answer
+from workflow_runtime.run_metadata import build_run_metadata
+from workflow_runtime.protocol import PROTOCOL_VERSION
 
 
-_NUMBER_PATTERN = re.compile(r"[-+]?\d+(?:,\d{3})*(?:\.\d+)?")
-
-
-def _numeric_value(raw: str) -> int | float:
-    normalized = raw.replace(",", "")
-    return float(normalized) if "." in normalized else int(normalized)
-
-
-def _seed_numeric_facts(graph: GraphStore, task: str, *, task_id: str, task_node_id: str) -> None:
-    facts: list[dict[str, Any]] = []
-    for index, match in enumerate(_NUMBER_PATTERN.finditer(task), start=1):
-        start = max(0, match.start() - 48)
-        end = min(len(task), match.end() + 48)
-        fact = {
-            "id": f"N{index}",
-            "value": _numeric_value(match.group(0)),
-            "text": task[start:end].strip(),
-        }
-        node = graph.add_node(
-            task_id=task_id,
-            branch_id="main",
-            logical_id=f"fact_{fact['id']}",
-            node_type="fact",
-            content=fact,
-            owner="dataset",
-            validation={"schema_valid": True},
-            created_by_role="dataset",
-        )
-        graph.add_edge(source=task_node_id, target=node.node_id, relation="depends_on", created_by_role="dataset")
-        facts.append({"id": fact["id"], "value": fact["value"], "text": fact["text"]})
-    if not facts:
-        return
-    aggregate = graph.add_node(
-        task_id=task_id,
-        branch_id="main",
-        logical_id="facts",
-        node_type="facts",
-        content=facts,
-        owner="dataset",
-        validation={"schema_valid": True},
-        created_by_role="dataset",
-    )
-    for fact in facts:
-        fact_node = graph.latest_valid(task_id, "main", f"fact_{fact['id']}")
-        if fact_node is not None:
-            graph.add_edge(source=fact_node.node_id, target=aggregate.node_id, relation="input_to", created_by_role="dataset")
-
-
-def init_workflow_graph(task: str, *, task_id: str, task_type: str = "numeric_solve") -> GraphStore:
+def init_workflow_graph(
+    task: str,
+    *,
+    task_id: str,
+    task_type: str = "numeric_solve",
+    action_protocol: str = "semantic_delta_v2",
+) -> GraphStore:
+    if action_protocol != "semantic_delta_v2":
+        raise ValueError(f"unsupported action protocol: {action_protocol}")
     graph = GraphStore()
     task_node = graph.add_node(
         task_id=task_id,
         branch_id="main",
         logical_id="task",
-        node_type="task",
+        node_type="task_source",
         content=f"[domain={task_type}]\n{task}",
         owner="user",
         validation={"schema_valid": True},
         created_by_role="user",
-        provenance={"communication_scope": "MANDATORY"},
+        provenance={
+            "communication_scope": "MANDATORY",
+            "origin": "source",
+            "trust": "trusted_input",
+            "visibility_class": "public",
+            "source_dataset": "runtime_input",
+            "sample_id": task_id,
+        },
     )
     query = graph.add_node(
         task_id=task_id,
         branch_id="main",
         logical_id="query_spec",
         node_type="query_spec",
-        content={"question": task, "task_type": task_type},
+        content={"task_type": task_type, "task_ref": task_node.node_id},
         owner="runtime",
         validation={"schema_valid": True},
         created_by_role="runtime",
-        provenance={"communication_scope": "MANDATORY"},
+        provenance={
+            "communication_scope": "MANDATORY",
+            "origin": "runtime",
+            "trust": "runtime_derived",
+            "visibility_class": "public",
+            "sample_id": task_id,
+        },
     )
     graph.add_edge(source=task_node.node_id, target=query.node_id, relation="depends_on", created_by_role="runtime")
     if task_type in {"code_generation", "marble_database"}:
@@ -96,15 +70,19 @@ def init_workflow_graph(task: str, *, task_id: str, task_type: str = "numeric_so
             task_id=task_id,
             branch_id="main",
             logical_id="requirements",
-            node_type="requirements",
-            content={"text": task},
+            node_type="requirements_source",
+            content={"task_ref": task_node.node_id},
             owner="user",
             validation={"schema_valid": True},
             created_by_role="user",
+            provenance={
+                "origin": "source",
+                "trust": "trusted_input",
+                "visibility_class": "public",
+                "sample_id": task_id,
+            },
         )
         graph.add_edge(source=task_node.node_id, target=requirements.node_id, relation="depends_on", created_by_role="user")
-    if task_type in {"numeric_solve", "numeric_comparison"}:
-        _seed_numeric_facts(graph, task, task_id=task_id, task_node_id=task_node.node_id)
     return graph
 
 
@@ -132,6 +110,7 @@ def run_workflow(
     communication_seed: int = 0,
     communication_budget_tokens: int | None = None,
     graph_context_mode: str = "baseline",
+    dataset_revision: str = "",
     task_id: str | None = None,
 ) -> dict[str, Any]:
     if execution_mode not in {"optimized", "native_langgraph"}:
@@ -140,6 +119,18 @@ def run_workflow(
     task_digest = hashlib.sha256(f"{task_type}\n{task}".encode("utf-8")).hexdigest()[:16]
     task_id = task_id or f"task_cli_{task_digest}"
     telemetry = WorkflowTelemetry(log_path)
+    run_metadata = build_run_metadata(
+        protocol_version=PROTOCOL_VERSION,
+        action_protocol="semantic_delta_v2",
+        model_id=model_path,
+        dataset_revision=dataset_revision,
+        sample_ids=(task_id,),
+        seed=communication_seed,
+        max_rounds=max_rounds,
+        max_new_tokens=max_new_tokens,
+        policy=communication_policy,
+        graph_context_mode=graph_context_mode,
+    )
     evaluator = TaskEvaluator(
         task_type,
         reference_answer,
@@ -147,12 +138,22 @@ def run_workflow(
     )
     # The native baseline has no logical graph protocol.  Its only graph is
     # LangGraph's runtime control-flow graph, created by NativeLangGraphWorkflow.
-    graph = init_workflow_graph(task, task_id=task_id, task_type=task_type) if optimized else None
+    graph = (
+        init_workflow_graph(
+            task,
+            task_id=task_id,
+            task_type=task_type,
+        )
+        if optimized else None
+    )
     model = (
         TransformersModel(model_path, max_new_tokens=max_new_tokens)
         if optimized
         else DirectTransformersModel(model_path, max_new_tokens=max_new_tokens)
     )
+    tokenizer = getattr(model, "tokenizer", None)
+    if tokenizer is not None:
+        run_metadata["tokenizer_id"] = str(getattr(tokenizer, "name_or_path", "") or "")
     if optimized:
         workflow = LangGraphWorkflow(
             store=graph,
@@ -214,6 +215,8 @@ def run_workflow(
             verification_status=verification.status if verification is not None else None,
             action_constraints_enabled=bool(enable_action_constraints and optimized),
             execution_mode=execution_mode,
+            action_protocol="semantic_delta_v2" if optimized else "native",
+            run_metadata=run_metadata,
             evaluation=evaluation.as_dict(),
         )
         return {
@@ -235,6 +238,8 @@ def run_workflow(
             branch_id="main",
             action_constraints_enabled=bool(enable_action_constraints and optimized),
             execution_mode=execution_mode,
+            action_protocol="semantic_delta_v2" if optimized else "native",
+            run_metadata=run_metadata,
             evaluation=evaluation.as_dict(),
         )
         raise
@@ -244,10 +249,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the LangGraph multi-agent workflow")
     parser.add_argument("--task", required=True)
     parser.add_argument("--task-type", default="numeric_solve", choices=(
-        "numeric_solve", "numeric_comparison", "table_qa", "multihop_qa", "code_generation",
-        "multiple_choice", "marble_research", "marble_bargaining", "marble_database",
+        "numeric_solve", "numeric_comparison", "multihop_qa", "code_generation", "multiple_choice",
     ))
     parser.add_argument("--model-path", required=True)
+    parser.add_argument("--dataset-revision", default="")
     parser.add_argument("--max-rounds", type=int, default=3)
     parser.add_argument(
         "--log-path",
@@ -280,6 +285,8 @@ def main() -> None:
         "--communication-policy",
         choices=(
             "send_all",
+            "mandatory_only",
+            "model_selected",
             "minimal_no_feedback",
             "minimal_sendall_fallback",
             "minimal_targeted_feedback",
@@ -309,6 +316,7 @@ def main() -> None:
         args.task,
         task_type=args.task_type,
         model_path=args.model_path,
+        dataset_revision=args.dataset_revision,
         max_rounds=args.max_rounds,
         log_path=args.log_path or None,
         reference_answer=parse_reference_answer(args.reference_answer) if args.reference_answer is not None else None,

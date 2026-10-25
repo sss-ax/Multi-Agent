@@ -47,7 +47,7 @@ def test_verifier_guided_candidate_mode_rejects_unsupported_domain():
     try:
         evaluate_verifier_guided_candidates(
             rows=[],
-            domain="hotpotqa",
+            domain="unsupported_domain",
             model=FakeModel(),
             candidate_count=2,
             seed=0,

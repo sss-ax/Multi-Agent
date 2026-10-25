@@ -135,8 +135,13 @@ def _final_solver_result(logs: list[dict[str, Any]]) -> Any:
     value = None
     for log in logs:
         action = log.get("action", {})
-        if log.get("role") == "solver" and isinstance(action, dict) and action.get("op") == "set_result":
-            value = action.get("value")
+        if log.get("role") == "solver" and isinstance(action, dict) and action.get("op") == "answer_with_evidence":
+            value = {
+                "answer": action.get("answer"),
+                "bridge_entity": action.get("bridge_entity"),
+                "cited_fact_ids": action.get("citations", []),
+                "reasoning_chain": action.get("reasoning", []),
+            }
     return value
 
 

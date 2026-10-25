@@ -67,6 +67,7 @@ from workflow_runtime.hotpot_representation import (  # noqa: E402
     render_hotpot_structured_candidate_view,
 )
 from workflow_runtime.hotpot_topology import ReasoningCandidate, ReasoningIR, VerificationResult, clamp_score  # noqa: E402
+from workflow_runtime.hotpot_graph_retriever import QueryGuidedGraphRetriever  # noqa: E402
 from workflow_runtime.mmlu_representation import build_mmlu_option_hypothesis_graph_view  # noqa: E402
 from scripts.evaluate_deployable_candidate_selector import code_features, numeric_features  # noqa: E402
 
@@ -214,6 +215,7 @@ class HotpotQuestionSemantics:
     compatible_topologies: tuple[str, ...] = ()
     entities_in_question: tuple[str, ...] = ()
     requested_relation: str = "unresolved"
+    requested_attribute: str = ""
     answer_mode: str = "short_answer"
     constraint_graph_type: str = ""
     answer_var: str = ""
@@ -222,6 +224,12 @@ class HotpotQuestionSemantics:
     target_relation: str = "unresolved"
     expected_answer_role: str = "ANY_RESOLVED"
     bridge_relation_hint: str = ""
+    # First-hop planning is deliberately separate from topology.  A question
+    # can be compositional while its first hop starts at an explicit subject,
+    # an object/property anchor, or a descriptive variable.
+    first_hop_mode: str = "explicit_entity"
+    first_hop_variable: str = ""
+    first_hop_constraints: tuple[HotpotConstraint, ...] = ()
     entity_a: str = ""
     entity_b: str = ""
     compared_relation: str = "unresolved"
@@ -250,6 +258,10 @@ class SamplingModel:
         )
         self.model.eval()
         self.max_new_tokens = int(max_new_tokens)
+        # Semantic planning is cached per question.  Candidate-pool
+        # experiments ask for several candidates for the same row; planning
+        # must not multiply the model cost by N.
+        self.hotpot_semantic_plan_cache: dict[str, dict[str, Any] | None] = {}
 
     def generate(
         self,
@@ -291,6 +303,959 @@ class SamplingModel:
             "output_tokens": int(new_ids.shape[-1]),
             "latency_sec": elapsed,
         }
+
+
+HOTPOT_SEMANTIC_PLANNER = False
+HOTPOT_REASONING_MODE = "legacy"
+HOTPOT_MODEL_REPAIR_ROUNDS = 1
+HOTPOT_REPAIR_MODE = "local_patch"
+_HOTPOT_PLAN_TOPOLOGIES = {
+    "bridge_entity",
+    "bridge_attribute",
+    "comparison_attribute",
+    "shared_property_yesno",
+    "set_intersection",
+    "multi_constraint_lookup",
+}
+_HOTPOT_PLAN_FIRST_HOP_MODES = {
+    "explicit_entity",
+    "reverse_relation",
+    "attribute_reverse",
+    "descriptive_entity",
+}
+
+
+def hotpot_semantic_planner_prompt(row: dict[str, Any]) -> str:
+    """Prompt for the model-owned semantic interpretation layer.
+
+    The model proposes a plan only.  It never receives permission to select an
+    answer or mutate evidence.  Retrieval, execution, and verification remain
+    deterministic and question-relative.
+    """
+    facts = _hotpot_facts(row) if row.get("supporting_facts") else []
+    context_lines = []
+    for fact in facts[:24]:
+        context_lines.append(
+            f"[{fact.get('fact_id', '')}] {fact.get('title', '')}: {fact.get('text', '')}"
+        )
+    context = "\n".join(context_lines) or "(context facts unavailable)"
+    return (
+        "You are a HotpotQA semantic planner. Interpret the original question and "
+        "propose an executable retrieval plan. Do not answer the question. Do not "
+        "invent evidence. Return only one JSON object matching this schema.\n\n"
+        f"Question:\n{row.get('question', '')}\n\n"
+        f"Context evidence (for entity/relation disambiguation only):\n{context}\n\n"
+        "Schema:\n"
+        "{\n"
+        '  "reasoning_family": "compositional|parallel|constraint",\n'
+        '  "reasoning_type": "bridge_entity|bridge_attribute|comparison_attribute|shared_property_yesno|set_intersection|multi_constraint_lookup",\n'
+        '  "confidence": 0.0,\n'
+        '  "topology_distribution": [{"topology": "...", "probability": 0.0}],\n'
+        '  "first_hop": {"mode": "explicit_entity|reverse_relation|descriptive_entity", '
+        '"known_entity": "", "relation": "", "direction": "forward|reverse", '
+        '"unknown_variable": "X", "expected_type": "", "constraints": []},\n'
+        '  "requested_relation": "",\n'
+        '  "requested_attribute": "",\n'
+        '  "answer_mode": "short_answer|yes_no|comparison|entity_lookup",\n'
+        '  "answer_target_spec": {"value_type": "", "granularity": ""}\n'
+        "}\n\n"
+        "For each first-hop constraint use: {anchor, relation, direction, "
+        "source_var, target_var, target_role}. Use reverse/object-to-subject "
+        "when the question gives the object and asks for the subject. "
+        "Important: first_hop.relation is only the constraint relation. "
+        "requested_relation is the answer-side relation asked by the final "
+        "clause (for example position, fight_song, birthplace), never the "
+        "relation used to identify the unknown entity."
+    )
+
+
+def _hotpot_json_object(text: str) -> dict[str, Any] | None:
+    cleaned = str(text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+    candidates = [cleaned]
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    if match and match.group(0) != cleaned:
+        candidates.append(match.group(0))
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _hotpot_normalize_semantic_plan(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    reasoning_type = str(value.get("reasoning_type", "")).strip()
+    if reasoning_type not in _HOTPOT_PLAN_TOPOLOGIES:
+        reasoning_type = ""
+    family = str(value.get("reasoning_family", "")).strip()
+    if family not in {"compositional", "parallel", "constraint"}:
+        family = ""
+    try:
+        confidence = max(0.0, min(1.0, float(value.get("confidence", 0.0) or 0.0)))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    first = value.get("first_hop", {})
+    if not isinstance(first, dict):
+        first = {}
+    mode = str(first.get("mode", "")).strip().lower()
+    if mode == "reverse_relation":
+        mode = "attribute_reverse"
+    if mode not in _HOTPOT_PLAN_FIRST_HOP_MODES:
+        mode = ""
+    known_entity = str(first.get("known_entity", first.get("anchor", "")) or "").strip()
+    relation = str(first.get("relation", "unresolved") or "unresolved").strip()
+    direction = str(first.get("direction", "forward") or "forward").strip().lower()
+    direction = "target_to_source" if direction in {"reverse", "target_to_source", "object_to_subject"} else "anchor_to_target"
+    variable = str(first.get("unknown_variable", first.get("variable", "X")) or "X").strip()
+    raw_constraints = first.get("constraints", value.get("constraints", []))
+    if not isinstance(raw_constraints, list):
+        raw_constraints = []
+    constraints: list[dict[str, Any]] = []
+    for raw in raw_constraints:
+        if not isinstance(raw, dict):
+            continue
+        anchor = str(raw.get("anchor", raw.get("known_entity", "")) or "").strip()
+        rel = str(raw.get("relation", relation) or relation or "unresolved").strip()
+        if not anchor or not rel:
+            continue
+        raw_direction = str(raw.get("direction", direction) or direction).lower()
+        raw_direction = "target_to_source" if raw_direction in {"reverse", "target_to_source", "object_to_subject"} else "anchor_to_target"
+        constraints.append({
+            "anchor": anchor,
+            "relation": rel,
+            "direction": raw_direction,
+            "source_var": str(raw.get("source_var", variable if raw_direction == "target_to_source" else "") or ""),
+            "target_var": str(raw.get("target_var", variable) or variable),
+            "target_role": str(raw.get("target_role", first.get("expected_type", "ANY_RESOLVED")) or "ANY_RESOLVED"),
+            "resolution_type": "model_plan",
+            "confidence": confidence,
+        })
+    if not constraints and known_entity and relation != "unresolved" and mode in {"attribute_reverse", "descriptive_entity"}:
+        constraints.append({
+            "anchor": known_entity,
+            "relation": relation,
+            "direction": direction,
+            "source_var": variable if direction == "target_to_source" else "",
+            "target_var": variable,
+            "target_role": str(first.get("expected_type", "ANY_RESOLVED") or "ANY_RESOLVED"),
+            "resolution_type": "model_plan",
+            "confidence": confidence,
+        })
+    distribution: list[dict[str, Any]] = []
+    raw_distribution = value.get("topology_distribution", [])
+    if isinstance(raw_distribution, list):
+        for item in raw_distribution:
+            if not isinstance(item, dict) or str(item.get("topology", "")) not in _HOTPOT_PLAN_TOPOLOGIES:
+                continue
+            try:
+                probability = max(0.0, min(1.0, float(item.get("probability", 0.0) or 0.0)))
+            except (TypeError, ValueError):
+                continue
+            distribution.append({"topology": str(item["topology"]), "probability": probability})
+    if reasoning_type and not distribution:
+        distribution = [{"topology": reasoning_type, "probability": confidence}]
+    if not reasoning_type and not constraints and not mode:
+        return None
+    return {
+        "reasoning_family": family,
+        "reasoning_type": reasoning_type,
+        "confidence": confidence,
+        "topology_distribution": distribution,
+        "first_hop_mode": mode or "explicit_entity",
+        "first_hop_variable": variable,
+        "first_hop_known_entity": known_entity,
+        "first_hop_constraints": constraints,
+        "requested_relation": str(value.get("requested_relation", "") or "").strip(),
+        "requested_attribute": str(value.get("requested_attribute", "") or "").strip(),
+        "answer_mode": str(value.get("answer_mode", "") or "").strip(),
+        "answer_target_spec": value.get("answer_target_spec", {}) if isinstance(value.get("answer_target_spec", {}), dict) else {},
+    }
+
+
+def _hotpot_semantic_plan_with_model(
+    model: SamplingModel,
+    row: dict[str, Any],
+    *,
+    seed: int,
+    temperature: float,
+    top_p: float,
+    do_sample: bool,
+) -> tuple[dict[str, Any] | None, dict[str, int | float]]:
+    key = str(row.get("sample_id") or row.get("question") or "")
+    cache = getattr(model, "hotpot_semantic_plan_cache", {})
+    if key in cache:
+        return cache[key], {"input_tokens": 0, "output_tokens": 0, "latency_sec": 0.0, "cached": 1}
+    text, metrics = model.generate(
+        hotpot_semantic_planner_prompt(row),
+        seed=seed,
+        temperature=temperature,
+        top_p=top_p,
+        do_sample=do_sample,
+    )
+    plan = _hotpot_normalize_semantic_plan(_hotpot_json_object(text))
+    cache[key] = plan
+    model.hotpot_semantic_plan_cache = cache
+    return plan, metrics
+
+
+def _hotpot_semantic_plan_compatibility(
+    row: dict[str, Any], plan: dict[str, Any] | None,
+) -> tuple[bool, str]:
+    """Prevent a planner from silently redefining the question.
+
+    The planner may repair topology/endpoint interpretation, but it cannot
+    change the answer-side relation (e.g. ``position`` into ``portrayed_by``).
+    Such a plan would make the verifier self-consistent while no longer being
+    grounded in the original question.
+    """
+    if not isinstance(plan, dict):
+        return False, "empty_or_invalid_plan"
+    base_row = dict(row)
+    base_row.pop("_model_semantic_plan", None)
+    base_relation = _hotpot_question_relation_label(base_row)
+    planned_relation = str(plan.get("requested_relation", "")).strip()
+    if (
+        base_relation != "unresolved"
+        and planned_relation
+        and _hotpot_relation_match_type(planned_relation, base_relation) == "mismatch"
+    ):
+        return False, f"answer_relation_conflict:{planned_relation}!={base_relation}"
+    base_attribute = _hotpot_question_attribute_slot(base_row)
+    planned_attribute = str(plan.get("requested_attribute", "")).strip()
+    if base_attribute and planned_attribute and base_attribute != planned_attribute:
+        return False, f"answer_attribute_conflict:{planned_attribute}!={base_attribute}"
+    return True, "accepted"
+
+
+def hotpot_model_reasoner_prompt(
+    row: dict[str, Any],
+    *,
+    mode: str,
+    previous_candidate: dict[str, Any] | None = None,
+    verifier_feedback: dict[str, Any] | None = None,
+) -> str:
+    """Prompt used by the three progressively model-heavy modes."""
+    facts = _hotpot_facts(row)
+    context = "\n".join(
+        f"[{fact['fact_id']}] {fact['title']}: {fact['text']}"
+        for fact in facts
+    ) or "(no evidence)"
+    repair_block = ""
+    if previous_candidate is not None:
+        repair_block += "\nPrevious candidate:\n" + json.dumps(previous_candidate, ensure_ascii=False) + "\n"
+    if verifier_feedback is not None:
+        repair_block += "\nVerifier feedback:\n" + json.dumps(verifier_feedback, ensure_ascii=False) + "\n"
+    mode_instruction = {
+        "level1_constructor": (
+            "Select a grounded two-hop evidence path. The runtime will run its existing "
+            "endpoint binder and answer generator, so focus on evidence_ids, bridge, and relations."
+        ),
+        "level2_reasoner": (
+            "Perform the complete reasoning yourself: select evidence, bind endpoints, "
+            "infer the answer, and return the answer with its supporting fact IDs."
+        ),
+        "level3_pure_model": (
+            "Perform complete reasoning and provide a candidate that can be checked by a "
+            "separate verifier model. Do not invent fact IDs."
+        ),
+    }.get(mode, "Perform complete reasoning.")
+    return (
+        f"You are a HotpotQA {mode} module. {mode_instruction}\n"
+        "The original question is authoritative. Do not replace the answer-side relation "
+        "with the relation used to identify an entity. Select only IDs present in the evidence.\n\n"
+        f"Question:\n{row.get('question', '')}\n\nEvidence:\n{context}\n"
+        f"{repair_block}\nReturn only JSON with this schema:\n"
+        "{\n"
+        '  "reasoning_type": "bridge_entity|bridge_attribute|comparison_attribute|shared_property_yesno|set_intersection|multi_constraint_lookup",\n'
+        '  "evidence_ids": ["supporting_fact_1", "supporting_fact_2"],\n'
+        '  "bridge_entity": "",\n'
+        '  "relations": [{"fact_id": "", "subject": "", "relation": "", "object": "", "direction": ""}],\n'
+        '  "answer": "",\n'
+        '  "reasoning": "",\n'
+        '  "confidence": 0.0\n'
+        "}"
+    )
+
+
+def hotpot_model_verifier_prompt(
+    row: dict[str, Any], candidate: dict[str, Any], program_alignment: dict[str, Any],
+) -> str:
+    return (
+        "You are a strict HotpotQA evidence verifier. Check the candidate against the "
+        "original question and the cited evidence. Do not repair it and do not invent facts. "
+        "Return only JSON.\n\n"
+        f"Question:\n{row.get('question', '')}\n\n"
+        f"Candidate:\n{json.dumps(candidate, ensure_ascii=False)}\n\n"
+        f"Program alignment diagnostics:\n{json.dumps(program_alignment, ensure_ascii=False)}\n\n"
+        "Schema:\n"
+        '{"valid": false, "question_aligned": false, "answer_grounded": false, '
+        '"failure_type": "", "diagnosis": "", "repair_instruction": ""}'
+    )
+
+
+def _hotpot_program_repair_packet(
+    row: dict[str, Any],
+    candidate: dict[str, Any],
+    view: Any,
+    alignment: dict[str, Any],
+    *,
+    failed_fact_ids: set[str] | None = None,
+    verifier_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the deterministic contract consumed by a local repair action.
+
+    The packet is intentionally derived from the original question and the
+    program verifier.  A model can choose among the allowed actions, but it
+    cannot widen the fields that a repair is allowed to mutate.
+    """
+    failed = {str(item) for item in (failed_fact_ids or set()) if str(item)}
+    failure = str(alignment.get("failure_code") or "not_supported")
+    model_failure = str((verifier_result or {}).get("failure_type", "") or "").strip()
+    if model_failure in {"answer_not_supported", "answer_contradicted"}:
+        failure = model_failure
+    relation = _hotpot_question_relation_label(row)
+    attribute = _hotpot_question_attribute_slot(row)
+    # Only an explicit answer-level verdict authorizes answer mutation.  A
+    # citation, hop, relation, or endpoint repair must preserve the answer.
+    answer_failures = {"answer_not_supported", "answer_contradicted"}
+    preserve_answer = failure not in answer_failures
+    preserve_bridge = failure in {
+        "invalid_citation", "missing_hop", "question_anchor_not_covered",
+        "no_question_anchored_chain", "requested_relation_not_covered",
+    }
+    if failure in {"no_question_anchored_chain", "question_anchor_not_covered"}:
+        preserve_bridge = False
+    if failure == "topology_not_question_consistent":
+        preserve_bridge = False
+    if failure in {"requested_relation_not_covered", "answer_target_not_covered"}:
+        missing_slots = [attribute or relation or "answer_target"]
+    elif failure in {"question_anchor_not_covered", "no_question_anchored_chain"}:
+        missing_slots = ["question_anchor", relation or "first_hop"]
+    else:
+        missing_slots = [relation or attribute or "evidence_hop"]
+    actions = ["STOP", "ADD_EVIDENCE", "REPLACE_EVIDENCE"]
+    if not preserve_bridge:
+        actions.append("PATCH_ENDPOINTS")
+    if not preserve_answer:
+        actions.extend(["PATCH_ANSWER_SLOT", "REVISE_ANSWER"])
+    # Evidence repair is always allowed to replace the evidence, but the
+    # answer remains immutable unless the packet explicitly permits it.
+    current_ids = [str(item) for item in candidate.get("evidence_ids", []) if str(item)]
+    return {
+        "valid": bool(alignment.get("pass")),
+        "error_type": failure,
+        "missing_slots": list(dict.fromkeys(missing_slots)),
+        "required_relation": relation,
+        "required_qualifier": attribute,
+        "preserve_answer": preserve_answer,
+        "preserve_bridge": preserve_bridge,
+        "current_fact_ids": current_ids,
+        "forbidden_fact_ids": sorted(failed),
+        "allowed_actions": list(dict.fromkeys(actions)),
+        "retrieval_query": " ".join(
+            item for item in [str(row.get("question", "")), relation, attribute, *missing_slots]
+            if item
+        ),
+    }
+
+
+def hotpot_repair_action_prompt(
+    row: dict[str, Any],
+    candidate: dict[str, Any],
+    packet: dict[str, Any],
+    repair_facts: list[dict[str, Any]],
+) -> str:
+    evidence = "\n".join(
+        f"[{fact.get('fact_id', '')}] {fact.get('title', '')}: {fact.get('text', '')}"
+        for fact in repair_facts
+    ) or "(no additional evidence available)"
+    return (
+        "You are a local HotpotQA repair policy. Select one bounded patch action; "
+        "do not regenerate a complete answer. The original question and program "
+        "repair packet are authoritative. Return only JSON.\n\n"
+        f"Question:\n{row.get('question', '')}\n\n"
+        f"Current candidate:\n{json.dumps(candidate, ensure_ascii=False)}\n\n"
+        f"Repair packet:\n{json.dumps(packet, ensure_ascii=False)}\n\n"
+        f"Allowed repair evidence:\n{evidence}\n\n"
+        "Schema:\n"
+        '{"action":"STOP|ADD_EVIDENCE|REPLACE_EVIDENCE|PATCH_ENDPOINTS|PATCH_ANSWER_SLOT|REVISE_ANSWER", '
+        '"selected_fact_ids":[], "bridge_entity":"", "answer":"", '
+        '"reason":""}\n'
+        "Use only fact IDs from the allowed repair evidence or current_fact_ids. "
+        "For a non-answer repair preserve the current answer exactly."
+    )
+
+
+def _hotpot_parse_repair_action(text: str, packet: dict[str, Any]) -> dict[str, Any]:
+    parsed = _hotpot_json_object(text) or {}
+    action = str(parsed.get("action", "STOP") or "STOP").strip().upper()
+    allowed = {str(item).upper() for item in packet.get("allowed_actions", [])}
+    if action not in allowed:
+        return {"action": "REJECT", "reason": f"action_not_allowed:{action}", "raw_output": text}
+    raw_ids = parsed.get("selected_fact_ids", parsed.get("evidence_ids", []))
+    if isinstance(raw_ids, str):
+        raw_ids = re.split(r"[,\s]+", raw_ids)
+    if not isinstance(raw_ids, list):
+        raw_ids = []
+    selected = list(dict.fromkeys(str(item).strip() for item in raw_ids if str(item).strip()))
+    current = {str(item) for item in packet.get("current_fact_ids", [])}
+    forbidden = {str(item) for item in packet.get("forbidden_fact_ids", [])}
+    # The actual repair pool is checked by _hotpot_apply_repair_action.  This
+    # early check prevents an action from smuggling an explicitly failed ID.
+    if any(item in forbidden for item in selected):
+        return {"action": "REJECT", "reason": "selected_forbidden_fact", "selected_fact_ids": selected, "raw_output": text}
+    return {
+        "action": action,
+        "selected_fact_ids": selected,
+        "bridge_entity": str(parsed.get("bridge_entity", "") or "").strip(),
+        "answer": extract_hotpot_short_answer(parsed.get("answer", "")),
+        "reason": str(parsed.get("reason", "") or "").strip(),
+        "current_fact_ids": sorted(current),
+        "raw_output": text,
+    }
+
+
+def _hotpot_repair_fact_pool(
+    row: dict[str, Any],
+    facts: list[dict[str, Any]],
+    candidate: dict[str, Any],
+    packet: dict[str, Any],
+    *,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    """Retrieve a bounded, relation-aware pool for the next local patch."""
+    forbidden = {str(item) for item in packet.get("forbidden_fact_ids", [])}
+    current = {str(item) for item in packet.get("current_fact_ids", [])}
+    relation = str(packet.get("required_relation", ""))
+    bridge = str(candidate.get("bridge_entity", ""))
+    index = _hotpot_evidence_index(row, facts)
+    pool: list[dict[str, Any]] = []
+    if bridge and relation:
+        pool.extend(_hotpot_retrieve_by_anchor_relation(
+            index, anchor=bridge, relation=relation, query_type="repair", topk=max(limit * 2, 8)
+        ))
+    if bridge:
+        pool.extend(_hotpot_retrieve_by_anchor(index, anchor=bridge, query_type="repair", topk=max(limit * 2, 8), relation_hint=relation))
+    query = str(packet.get("retrieval_query", ""))
+    pool.extend(_rank_hotpot_facts_for_terms(facts, query, limit=max(limit * 3, 12)))
+    merged: dict[str, dict[str, Any]] = {}
+    for item in pool:
+        fact_id = str(item.get("fact_id", ""))
+        if not fact_id or fact_id in forbidden:
+            continue
+        value = dict(item)
+        value.setdefault("repair_candidate", True)
+        value["repair_current"] = fact_id in current
+        merged.setdefault(fact_id, value)
+    ranked = list(merged.values())
+    ranked.sort(key=lambda item: (
+        not bool(item.get("repair_current")),
+        -float(item.get("retrieval_score", item.get("hop_score", 0.0)) or 0.0),
+        str(item.get("fact_id", "")),
+    ))
+    return ranked[:limit]
+
+
+def _hotpot_apply_repair_action(
+    candidate: dict[str, Any],
+    action: dict[str, Any],
+    packet: dict[str, Any],
+    repair_facts: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Apply a local patch while enforcing field-level invariants."""
+    name = str(action.get("action", "REJECT")).upper()
+    if name in {"STOP", "REJECT"}:
+        return None, {"accepted": False, "reason": "stop_or_rejected", "action": name}
+    pool_ids = {str(fact.get("fact_id", "")) for fact in repair_facts}
+    current_ids = [str(item) for item in candidate.get("evidence_ids", []) if str(item)]
+    selected = [str(item) for item in action.get("selected_fact_ids", []) if str(item)]
+    if any(item not in pool_ids and item not in current_ids for item in selected):
+        return None, {"accepted": False, "reason": "fact_id_outside_repair_pool", "action": name, "selected_fact_ids": selected}
+    if any(item in {str(x) for x in packet.get("forbidden_fact_ids", [])} for item in selected):
+        return None, {"accepted": False, "reason": "forbidden_fact_id", "action": name, "selected_fact_ids": selected}
+    updated = dict(candidate)
+    before = {
+        "evidence_ids": list(current_ids),
+        "bridge_entity": str(candidate.get("bridge_entity", "")),
+        "answer": str(candidate.get("answer", "")),
+    }
+    if name == "ADD_EVIDENCE":
+        ids = list(dict.fromkeys([*current_ids, *selected]))
+        if len(ids) < 2:
+            return None, {"accepted": False, "reason": "add_evidence_requires_two_ids", "action": name}
+        updated["evidence_ids"] = ids[:4]
+    elif name == "REPLACE_EVIDENCE":
+        if len(selected) < 2:
+            return None, {"accepted": False, "reason": "replace_evidence_requires_two_ids", "action": name}
+        updated["evidence_ids"] = list(dict.fromkeys(selected))[:4]
+    elif name == "PATCH_ENDPOINTS":
+        if packet.get("preserve_bridge"):
+            return None, {"accepted": False, "reason": "bridge_is_preserved", "action": name}
+        if selected:
+            if len(selected) < 2:
+                return None, {"accepted": False, "reason": "patch_endpoints_requires_two_ids", "action": name}
+            updated["evidence_ids"] = list(dict.fromkeys(selected))[:4]
+        bridge = str(action.get("bridge_entity", "")).strip()
+        if not bridge:
+            return None, {"accepted": False, "reason": "missing_bridge_patch", "action": name}
+        updated["bridge_entity"] = bridge
+    elif name in {"PATCH_ANSWER_SLOT", "REVISE_ANSWER"}:
+        if packet.get("preserve_answer"):
+            return None, {"accepted": False, "reason": "answer_is_preserved", "action": name}
+        answer = extract_hotpot_short_answer(action.get("answer", ""))
+        if not answer:
+            return None, {"accepted": False, "reason": "missing_answer_patch", "action": name}
+        updated["answer"] = answer
+        if selected:
+            if len(selected) < 2:
+                return None, {"accepted": False, "reason": "answer_patch_requires_two_ids", "action": name}
+            updated["evidence_ids"] = list(dict.fromkeys(selected))[:4]
+    else:
+        return None, {"accepted": False, "reason": "unknown_action", "action": name}
+    if packet.get("preserve_answer") and str(updated.get("answer", "")) != before["answer"]:
+        return None, {"accepted": False, "reason": "preserve_answer_violation", "action": name}
+    if packet.get("preserve_bridge") and str(updated.get("bridge_entity", "")) != before["bridge_entity"]:
+        return None, {"accepted": False, "reason": "preserve_bridge_violation", "action": name}
+    changed = [field for field in before if before[field] != updated.get(field)]
+    if not changed:
+        return None, {"accepted": False, "reason": "empty_patch", "action": name}
+    return updated, {
+        "accepted": True,
+        "action": name,
+        "changed_fields": changed,
+        "before": before,
+        "after": {key: updated.get(key) for key in before},
+    }
+
+
+def _hotpot_repair_score(alignment: dict[str, Any]) -> float:
+    if not isinstance(alignment, dict):
+        return 0.0
+    weights = {
+        "question_anchor_covered": 4.0,
+        "requested_relation_covered": 3.0,
+        "answer_target_covered": 2.0,
+        "topology_consistent_with_question": 2.0,
+    }
+    return sum(weight for key, weight in weights.items() if bool(alignment.get(key))) + (10.0 if alignment.get("pass") else 0.0)
+
+
+def _hotpot_repair_candidate_score(
+    row: dict[str, Any], candidate: dict[str, Any], view: Any,
+    alignment: dict[str, Any], facts: list[dict[str, Any]],
+) -> float:
+    """Score both question alignment and answer grounding for patch acceptance."""
+    score = _hotpot_repair_score(alignment)
+    answer = normalize_bridge(str(candidate.get("answer", "")))
+    by_id = {str(fact.get("fact_id", "")): fact for fact in facts}
+    cited = [by_id.get(str(item)) for item in getattr(view, "cited_fact_ids", [])]
+    cited = [fact for fact in cited if fact]
+    if answer:
+        answer_present = any(answer in normalize_bridge(f"{fact.get('title', '')} {fact.get('text', '')}") for fact in cited)
+        score += 2.0 if answer_present else 0.0
+    # A slot-specific extraction gives an additional deterministic signal for
+    # seated_capacity/year/location repairs without consulting gold answers.
+    if _hotpot_question_attribute_slot(row):
+        expected = _hotpot_derive_answer_hint(str(row.get("question", "")), *(cited[:2] + [{}] * 2)[:2]) if cited else ""
+        if expected and normalize_bridge(expected) == answer:
+            score += 1.0
+    return score
+
+
+def _hotpot_apply_model_local_repairs(
+    model: SamplingModel,
+    row: dict[str, Any],
+    facts: list[dict[str, Any]],
+    candidate: dict[str, Any],
+    view: Any,
+    reasoning_type: str,
+    *,
+    attempt: int,
+    seed: int,
+    temperature: float,
+    top_p: float,
+    repair_rounds: int,
+    total_input: int = 0,
+    total_output: int = 0,
+    total_latency: float = 0.0,
+) -> tuple[dict[str, Any], Any, str, dict[str, Any] | None, list[dict[str, Any]], int, int, float]:
+    """Run bounded verifier/action patches for Level 1/2 as well as Level 3."""
+    verifier_result: dict[str, Any] | None = None
+    trace: list[dict[str, Any]] = []
+    failed: set[str] = set()
+    for round_id in range(max(0, int(repair_rounds)) + 1):
+        alignment = _hotpot_question_alignment_for_view(row=row, view=view, facts=facts, reasoning_type=reasoning_type)
+        try:
+            verifier_text, metrics = model.generate(
+                hotpot_model_verifier_prompt(row, candidate, alignment),
+                seed=seed + round_id * 100003 + 17,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=False,
+            )
+        except (IndexError, StopIteration):
+            # Small deterministic test doubles may expose only the initial
+            # generation; lack of a verifier response is a clean STOP.
+            break
+        total_input += int(metrics.get("input_tokens", 0))
+        total_output += int(metrics.get("output_tokens", 0))
+        total_latency += float(metrics.get("latency_sec", 0.0))
+        parsed = _parse_json_payload(verifier_text)
+        verifier_result = parsed if isinstance(parsed, dict) else {"valid": False, "diagnosis": verifier_text}
+        packet = _hotpot_program_repair_packet(
+            row, candidate, view, alignment,
+            failed_fact_ids=failed,
+            verifier_result=verifier_result,
+        )
+        item: dict[str, Any] = {
+            "round": round_id,
+            "before_fact_ids": list(candidate.get("evidence_ids", [])),
+            "before_alignment": dict(alignment),
+            "program_score_before": _hotpot_repair_candidate_score(row, candidate, view, alignment, facts),
+            "program_valid_before": bool(alignment.get("pass")),
+            "packet": packet,
+            "model_verifier": verifier_result,
+        }
+        if bool(alignment.get("pass")) or round_id >= int(repair_rounds):
+            item.update({"action": "STOP", "accepted": False, "reason": "program_valid_or_budget_exhausted"})
+            trace.append(item)
+            break
+        repair_facts = _hotpot_repair_fact_pool(row, facts, candidate, packet, limit=8)
+        try:
+            action_text, metrics = model.generate(
+                hotpot_repair_action_prompt(row, candidate, packet, repair_facts),
+                seed=seed + round_id * 100003 + 53,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=False,
+            )
+        except (IndexError, StopIteration):
+            item.update({"action": "STOP", "accepted": False, "reason": "no_action_response"})
+            trace.append(item)
+            break
+        total_input += int(metrics.get("input_tokens", 0))
+        total_output += int(metrics.get("output_tokens", 0))
+        total_latency += float(metrics.get("latency_sec", 0.0))
+        action = _hotpot_parse_repair_action(action_text, packet)
+        item["repair_pool"] = [_hotpot_scored_fact_as_dict(fact) for fact in repair_facts]
+        item["action"] = action
+        patched, patch_result = _hotpot_apply_repair_action(candidate, action, packet, repair_facts)
+        item["patch_result"] = patch_result
+        if patched is None:
+            item.update({"accepted": False, "reason": patch_result.get("reason", "patch_rejected")})
+            trace.append(item)
+            break
+        patched_view = _hotpot_view_from_model_candidate(row, facts, patched, candidate_id=f"model_{attempt}_repair_{round_id}")
+        patched_type = str(patched.get("reasoning_type") or reasoning_type)
+        patched_alignment = _hotpot_question_alignment_for_view(row=row, view=patched_view, facts=facts, reasoning_type=patched_type)
+        before_score = _hotpot_repair_candidate_score(row, candidate, view, alignment, facts)
+        after_score = _hotpot_repair_candidate_score(row, patched, patched_view, patched_alignment, facts)
+        item.update({
+            "after_fact_ids": list(patched.get("evidence_ids", [])),
+            "after_alignment": dict(patched_alignment),
+            "program_score_after": after_score,
+            "program_valid_after": bool(patched_alignment.get("pass")),
+        })
+        if after_score <= before_score:
+            failed.update(str(fact_id) for fact_id in patched.get("evidence_ids", []) if fact_id not in candidate.get("evidence_ids", []))
+            item.update({"accepted": False, "reason": "program_score_not_improved"})
+            trace.append(item)
+            break
+        candidate, view, reasoning_type = patched, patched_view, patched_type
+        verifier_result = None
+        item["accepted"] = True
+        trace.append(item)
+    return candidate, view, reasoning_type, verifier_result, trace, total_input, total_output, total_latency
+
+
+def _hotpot_model_candidate_from_text(text: str, facts: list[dict[str, Any]]) -> dict[str, Any]:
+    parsed = _parse_json_payload(text)
+    if isinstance(parsed, list):
+        parsed = parsed[0] if parsed and isinstance(parsed[0], dict) else {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+    raw_ids = parsed.get("evidence_ids", parsed.get("cited_fact_ids", parsed.get("fact_ids", [])))
+    if isinstance(raw_ids, str):
+        raw_ids = re.split(r"[,\s]+", raw_ids)
+    if not isinstance(raw_ids, list):
+        raw_ids = []
+    valid_ids = {str(fact.get("fact_id", "")) for fact in facts}
+    evidence_ids = list(dict.fromkeys(str(item).strip() for item in raw_ids if str(item).strip() in valid_ids))
+    raw_relations = parsed.get("relations", [])
+    if not isinstance(raw_relations, list):
+        raw_relations = []
+    relations = [dict(item) for item in raw_relations if isinstance(item, dict)]
+    reasoning_type = str(parsed.get("reasoning_type", "") or "").strip()
+    if reasoning_type not in _HOTPOT_PLAN_TOPOLOGIES:
+        reasoning_type = ""
+    try:
+        confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.0) or 0.0)))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return {
+        "reasoning_type": reasoning_type,
+        "evidence_ids": evidence_ids,
+        "bridge_entity": str(parsed.get("bridge_entity", "") or "").strip(),
+        "relations": relations,
+        "answer": extract_hotpot_short_answer(parsed.get("answer", "")) or extract_hotpot_short_answer(text),
+        "reasoning": str(parsed.get("reasoning", "") or "").strip(),
+        "confidence": confidence,
+        "raw_output": text,
+    }
+
+
+def _hotpot_view_from_model_candidate(
+    row: dict[str, Any], facts: list[dict[str, Any]], candidate: dict[str, Any], *, candidate_id: str,
+) -> Any:
+    fact_ids = list(candidate.get("evidence_ids", []))
+    hop1_ids = fact_ids[:1]
+    hop2_ids = fact_ids[1:2]
+    return build_hotpot_chain_view_from_facts(
+        candidate_id=candidate_id,
+        bridge_entity=str(candidate.get("bridge_entity", "")),
+        question=str(row.get("question", "")),
+        facts=facts,
+        hop1_fact_ids=hop1_ids,
+        hop2_fact_ids=hop2_ids,
+        derived_answer=str(candidate.get("answer", "")),
+    )
+
+
+def _hotpot_model_candidate_payload(
+    *,
+    row: dict[str, Any],
+    facts: list[dict[str, Any]],
+    candidate: dict[str, Any],
+    view: Any,
+    reasoning_type: str,
+    mode: str,
+    program_alignment: dict[str, Any],
+    model_verifier: dict[str, Any] | None,
+    repair_trace: list[dict[str, Any]] | None = None,
+) -> str:
+    answer = str(candidate.get("answer") or getattr(view, "derived_answer", "") or "").strip()
+    return json.dumps({
+        "generation_mode": mode,
+        "answer": answer,
+        "bridge_entity": getattr(view, "bridge_entity", ""),
+        "cited_fact_ids": list(getattr(view, "cited_fact_ids", [])),
+        "hop1": {"fact_ids": list(getattr(view, "hop1_fact_ids", [])), "evidence": getattr(view, "hop1_key_sentence", "")},
+        "hop2": {"fact_ids": list(getattr(view, "hop2_fact_ids", [])), "evidence": getattr(view, "hop2_key_sentence", "")},
+        "reasoning_type": reasoning_type,
+        "model_candidate": candidate,
+        "question_alignment": program_alignment,
+        "model_verifier": model_verifier or {},
+        "repair_trace": list(repair_trace or []),
+        "repair_rounds": len(repair_trace or []),
+    }, ensure_ascii=False)
+
+
+def generate_hotpot_model_mode_candidate(
+    model: SamplingModel,
+    row: dict[str, Any],
+    *,
+    attempt: int,
+    previous_candidates: list[Candidate],
+    seed: int,
+    temperature: float,
+    top_p: float,
+    do_sample: bool,
+    mode: str,
+) -> Candidate:
+    facts = _hotpot_facts(row)
+    total_input = total_output = 0
+    total_latency = 0.0
+    verifier_result: dict[str, Any] | None = None
+    repair_trace: list[dict[str, Any]] = []
+    failed_fact_ids: set[str] = set()
+    prompt = hotpot_model_reasoner_prompt(row, mode=mode)
+    text, metrics = model.generate(prompt, seed=seed, temperature=temperature, top_p=top_p, do_sample=do_sample)
+    total_input += int(metrics.get("input_tokens", 0))
+    total_output += int(metrics.get("output_tokens", 0))
+    total_latency += float(metrics.get("latency_sec", 0.0))
+    candidate = _hotpot_model_candidate_from_text(text, facts)
+    view = _hotpot_view_from_model_candidate(row, facts, candidate, candidate_id=f"model_{attempt}")
+    reasoning_type = str(candidate.get("reasoning_type") or _hotpot_reasoning_type(row))
+
+    # Level 3 keeps the verifier call, but repair is now a bounded local patch
+    # loop.  The model never receives permission to regenerate a full result.
+    if mode == "level3_pure_model":
+        for round_id in range(max(0, int(HOTPOT_MODEL_REPAIR_ROUNDS)) + 1):
+            alignment = _hotpot_question_alignment_for_view(
+                row=row, view=view, facts=facts, reasoning_type=reasoning_type
+            )
+            try:
+                verifier_text, verifier_metrics = model.generate(
+                    hotpot_model_verifier_prompt(row, candidate, alignment),
+                    seed=seed + round_id * 100003 + 17,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=False,
+                )
+            except (IndexError, StopIteration):
+                repair_trace.append({
+                    "round": round_id,
+                    "action": "STOP",
+                    "accepted": False,
+                    "reason": "no_verifier_response",
+                })
+                break
+            total_input += int(verifier_metrics.get("input_tokens", 0))
+            total_output += int(verifier_metrics.get("output_tokens", 0))
+            total_latency += float(verifier_metrics.get("latency_sec", 0.0))
+            parsed_verifier = _parse_json_payload(verifier_text)
+            verifier_result = parsed_verifier if isinstance(parsed_verifier, dict) else {"valid": False, "diagnosis": verifier_text}
+            packet = _hotpot_program_repair_packet(
+                row, candidate, view, alignment,
+                failed_fact_ids=failed_fact_ids,
+                verifier_result=verifier_result,
+            )
+            trace: dict[str, Any] = {
+                "round": round_id,
+                "before_fact_ids": list(candidate.get("evidence_ids", [])),
+                "before_alignment": dict(alignment),
+                "program_score_before": _hotpot_repair_candidate_score(row, candidate, view, alignment, facts),
+                "program_valid_before": bool(alignment.get("pass")),
+                "packet": packet,
+                "model_verifier": verifier_result,
+            }
+            # Preserve the established STOP behavior for a verifier that has
+            # explicitly certified the candidate.  Otherwise the program
+            # packet, not the verifier's prose, controls repair eligibility.
+            if bool(alignment.get("pass")) or round_id >= int(HOTPOT_MODEL_REPAIR_ROUNDS):
+                trace.update({"action": "STOP", "accepted": False, "reason": "program_valid_or_budget_exhausted"})
+                repair_trace.append(trace)
+                break
+            repair_facts = _hotpot_repair_fact_pool(row, facts, candidate, packet, limit=8)
+            action_text, action_metrics = model.generate(
+                hotpot_repair_action_prompt(row, candidate, packet, repair_facts),
+                seed=seed + round_id * 100003 + 53,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=False,
+            )
+            total_input += int(action_metrics.get("input_tokens", 0))
+            total_output += int(action_metrics.get("output_tokens", 0))
+            total_latency += float(action_metrics.get("latency_sec", 0.0))
+            action = _hotpot_parse_repair_action(action_text, packet)
+            trace["repair_pool"] = [_hotpot_scored_fact_as_dict(fact) for fact in repair_facts]
+            trace["action"] = action
+            patched, patch_result = _hotpot_apply_repair_action(candidate, action, packet, repair_facts)
+            trace["patch_result"] = patch_result
+            if patched is None:
+                trace.update({"accepted": False, "reason": patch_result.get("reason", "patch_rejected")})
+                repair_trace.append(trace)
+                break
+            patched_view = _hotpot_view_from_model_candidate(row, facts, patched, candidate_id=f"model_{attempt}_repair_{round_id}")
+            patched_reasoning_type = str(patched.get("reasoning_type") or reasoning_type)
+            patched_alignment = _hotpot_question_alignment_for_view(
+                row=row, view=patched_view, facts=facts, reasoning_type=patched_reasoning_type
+            )
+            before_score = _hotpot_repair_candidate_score(row, candidate, view, alignment, facts)
+            after_score = _hotpot_repair_candidate_score(row, patched, patched_view, patched_alignment, facts)
+            trace["after_fact_ids"] = list(patched.get("evidence_ids", []))
+            trace["after_alignment"] = dict(patched_alignment)
+            trace["program_score_after"] = after_score
+            trace["program_valid_after"] = bool(patched_alignment.get("pass"))
+            if after_score <= before_score:
+                for fact_id in patched.get("evidence_ids", []):
+                    if fact_id not in candidate.get("evidence_ids", []):
+                        failed_fact_ids.add(str(fact_id))
+                trace.update({"accepted": False, "reason": "program_score_not_improved"})
+                repair_trace.append(trace)
+                break
+            candidate = patched
+            view = patched_view
+            reasoning_type = patched_reasoning_type
+            verifier_result = None
+            trace["accepted"] = True
+            repair_trace.append(trace)
+            # Continue with the patched state.  The next iteration re-verifies
+            # it and can still stop without making another action call.
+
+    if mode == "level1_constructor" and view.hop1_fact_ids and view.hop2_fact_ids:
+        endpoint_binding, endpoint_metrics = _hotpot_bind_endpoints_with_model(
+            model=model,
+            row=row,
+            view=view,
+            facts=facts,
+            reasoning_type=reasoning_type,
+            seed=seed + 271828,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=do_sample,
+        )
+        total_input += int(endpoint_metrics.get("input_tokens", 0))
+        total_output += int(endpoint_metrics.get("output_tokens", 0))
+        total_latency += float(endpoint_metrics.get("latency_sec", 0.0))
+        answer_text, answer_metrics = model.generate(
+            hotpot_preserve_first_answer_prompt(row, view),
+            seed=seed + 314159,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=do_sample,
+        )
+        total_input += int(answer_metrics.get("input_tokens", 0))
+        total_output += int(answer_metrics.get("output_tokens", 0))
+        total_latency += float(answer_metrics.get("latency_sec", 0.0))
+        generated_answer = extract_hotpot_short_answer(answer_text)
+        candidate["answer"] = generated_answer or str(endpoint_binding.derived_answer or candidate.get("answer", ""))
+        view = _hotpot_view_from_model_candidate(row, facts, candidate, candidate_id=f"model_{attempt}")
+    if mode in {"level1_constructor", "level2_reasoner"} and HOTPOT_MODEL_REPAIR_ROUNDS > 0:
+        (
+            candidate,
+            view,
+            reasoning_type,
+            verifier_result,
+            extra_trace,
+            repair_input,
+            repair_output,
+            repair_latency,
+        ) = _hotpot_apply_model_local_repairs(
+            model,
+            row,
+            facts,
+            candidate,
+            view,
+            reasoning_type,
+            attempt=attempt,
+            seed=seed + 900001,
+            temperature=temperature,
+            top_p=top_p,
+            repair_rounds=HOTPOT_MODEL_REPAIR_ROUNDS,
+            total_input=total_input,
+            total_output=total_output,
+            total_latency=total_latency,
+        )
+        total_input, total_output, total_latency = repair_input, repair_output, repair_latency
+        repair_trace.extend(extra_trace)
+    alignment = _hotpot_question_alignment_for_view(row=row, view=view, facts=facts, reasoning_type=reasoning_type)
+    payload = _hotpot_model_candidate_payload(
+        row=row,
+        facts=facts,
+        candidate=candidate,
+        view=view,
+        reasoning_type=reasoning_type,
+        mode=mode,
+        program_alignment=alignment,
+        model_verifier=verifier_result,
+        repair_trace=repair_trace,
+    )
+    return Candidate(
+        text=payload,
+        score=score_candidate(row, "hotpotqa", payload),
+        input_tokens=total_input,
+        output_tokens=total_output,
+        latency_sec=total_latency,
+        seed=seed,
+        generation_role=mode,
+    )
 
 
 def task_prompt(row: dict[str, Any], domain: str) -> str:
@@ -442,13 +1407,15 @@ def extract_mmlu_option_hypotheses(value: Any) -> list[dict[str, Any]]:
         items = parsed.get(key)
         if isinstance(items, list):
             return [item for item in items if isinstance(item, dict)]
-    analysis = parsed.get("option_analysis")
-    if isinstance(analysis, dict):
-        result = []
-        for option_id, payload in analysis.items():
-            if isinstance(payload, dict):
-                result.append({"option_id": option_id, **payload})
-        return result
+    slots = parsed.get("slot_analysis")
+    if isinstance(slots, list):
+        return [
+            {"slot": item.get("slot"), "selected_term": item.get("selected_term"), "reason": item.get("reason")}
+            for item in slots if isinstance(item, dict)
+        ]
+    eliminated = parsed.get("eliminated_options")
+    if isinstance(eliminated, dict):
+        return [{"option_id": option_id, "reason": reason} for option_id, reason in eliminated.items()]
     return []
 
 
@@ -456,7 +1423,7 @@ def extract_mmlu_final_choice(value: Any) -> str:
     text = str(value or "").strip()
     parsed = _parse_json_payload(text)
     if isinstance(parsed, dict):
-        for key in ("answer", "final_answer", "choice", "selected_option", "solver_choice", "independent_choice"):
+        for key in ("answer", "final_answer", "choice", "selected_option", "solver_choice"):
             if key in parsed:
                 choice = extract_mmlu_final_choice(parsed[key])
                 if choice:
@@ -575,6 +1542,16 @@ def extract_hotpot_short_answer(value: Any) -> str:
         extracted = extract_hotpot_short_answer(parsed)
         if extracted:
             return extracted
+    # Causal models sometimes continue after the first JSON answer and emit
+    # several adjacent objects. Keep the first answer object instead of
+    # treating the whole continuation as the answer string.
+    first_answer = re.search(
+        r'''\{\s*["']answer["']\s*:\s*["']([^"']*)["']''',
+        text,
+        flags=re.IGNORECASE,
+    )
+    if first_answer:
+        return first_answer.group(1).strip()
     labelled = re.findall(
         r"(?:final\s+answer|answer|short\s+answer)\s*[:：]\s*(.+)",
         text,
@@ -770,6 +1747,23 @@ def generate_attempt_candidate(
             do_sample=do_sample,
         )
         return mark_candidate_redundancy(candidate, previous_candidates, domain=domain)
+    if domain == "hotpotqa" and HOTPOT_REASONING_MODE in {
+        "level1_constructor",
+        "level2_reasoner",
+        "level3_pure_model",
+    }:
+        candidate = generate_hotpot_model_mode_candidate(
+            model,
+            row,
+            attempt=attempt,
+            previous_candidates=previous_candidates,
+            seed=seed,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=do_sample,
+            mode=HOTPOT_REASONING_MODE,
+        )
+        return mark_candidate_redundancy(candidate, previous_candidates, domain=domain)
     if domain == "hotpotqa" and HOTPOT_CANDIDATE_MODE == "preserve_first":
         candidate = generate_hotpot_preserve_first_candidate(
             model,
@@ -922,34 +1916,71 @@ def generate_hotpot_preserve_first_candidate(
     top_p: float,
     do_sample: bool,
 ) -> Candidate:
-    facts = _hotpot_facts(row)
-    bridge_records = _hotpot_ranked_bridge_pool(row, facts=facts, previous_candidates=previous_candidates, limit=8)
+    planning_row = row
+    semantic_plan = None
+    semantic_plan_status: dict[str, Any] = {"enabled": bool(HOTPOT_SEMANTIC_PLANNER), "accepted": False, "reason": "disabled"}
+    planner_metrics: dict[str, int | float] = {"input_tokens": 0, "output_tokens": 0, "latency_sec": 0.0, "cached": 0}
+    if HOTPOT_SEMANTIC_PLANNER:
+        semantic_plan, planner_metrics = _hotpot_semantic_plan_with_model(
+            model,
+            row,
+            seed=seed + 424242,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=False,
+        )
+        compatible, compatibility_reason = _hotpot_semantic_plan_compatibility(row, semantic_plan)
+        semantic_plan_status = {
+            "enabled": True,
+            "accepted": bool(compatible),
+            "reason": compatibility_reason,
+        }
+        if semantic_plan and compatible:
+            planning_row = dict(row)
+            planning_row["_model_semantic_plan"] = semantic_plan
+    facts = _hotpot_facts(planning_row)
+    bridge_records = _hotpot_ranked_bridge_pool(planning_row, facts=facts, previous_candidates=previous_candidates, limit=8)
     previous_signatures = {_hotpot_chain_signature(candidate.text) for candidate in previous_candidates}
     chain_options = _hotpot_hierarchical_chain_options(
-        row=row,
+        row=planning_row,
         facts=facts,
         bridge_records=bridge_records,
         previous_signatures=previous_signatures,
     )
-    option = chain_options[attempt % len(chain_options)] if chain_options else {}
+    # Every constructor already removes ``previous_signatures``.  Applying the
+    # attempt offset again skipped every other high-ranked option and inflated
+    # diversity at the expense of coverage.  Always take the best remaining
+    # option after deduplication.
+    option = _hotpot_select_best_remaining_option(chain_options)
     bridge = str(option.get("bridge", ""))
     view = option.get("view")
     binding = option.get("binding", {}) if isinstance(option.get("binding"), dict) else {}
+    reasoning_type = str(option.get("candidate_topology") or _hotpot_reasoning_type(planning_row))
     if view is None:
-        view, binding = _hotpot_preserve_first_chain_binding(
-            row=row,
+        # No topology constructor produced a question-anchored chain.  Keep
+        # the candidate explicitly empty rather than silently rebuilding from
+        # context titles or evidence entities.
+        view = build_hotpot_chain_view_from_facts(
             candidate_id=f"c{attempt}",
-            bridge=bridge,
+            bridge_entity="",
+            question=str(row.get("question", "")),
             facts=facts,
-            pair_offset=attempt,
-            previous_signatures=previous_signatures,
+            hop1_fact_ids=[],
+            hop2_fact_ids=[],
         )
-    endpoint_binding, endpoint_metrics = _hotpot_bind_endpoints_with_model(
-        model=model,
-        row=row,
+        binding = {"hop1_pool": [], "hop2_pool": [], "chain_pair_pool": [], "constructor_family": "no_question_anchor"}
+    question_alignment = _hotpot_question_alignment_for_view(
+        row=planning_row,
         view=view,
         facts=facts,
-        reasoning_type=str(option.get("candidate_topology") or _hotpot_reasoning_type(row)),
+        reasoning_type=reasoning_type,
+    )
+    endpoint_binding, endpoint_metrics = _hotpot_bind_endpoints_with_model(
+        model=model,
+        row=planning_row,
+        view=view,
+        facts=facts,
+        reasoning_type=reasoning_type,
         seed=seed + 271828,
         temperature=temperature,
         top_p=top_p,
@@ -957,17 +1988,27 @@ def generate_hotpot_preserve_first_candidate(
     )
     endpoint_payload = endpoint_binding.as_dict()
     endpoint_bridge = str(endpoint_binding.inferred_bridge or "").strip()
-    if endpoint_bridge:
-        bridge = endpoint_bridge
-        view = build_hotpot_chain_view_from_facts(
-            candidate_id=f"c{attempt}",
-            bridge_entity=endpoint_bridge,
-            question=str(row.get("question", "")),
+    if (
+        endpoint_bridge
+        and reasoning_type in {"bridge_entity", "bridge_attribute"}
+        and not _hotpot_entities_equivalent(endpoint_bridge, bridge)
+    ):
+        rebound = _hotpot_retrieve_hop2_after_endpoint_binding(
+            row=planning_row,
             facts=facts,
-            hop1_fact_ids=view.hop1_fact_ids,
-            hop2_fact_ids=view.hop2_fact_ids,
-            derived_answer=endpoint_binding.derived_answer or view.derived_answer,
+            view=view,
+            inferred_bridge=endpoint_bridge,
+            reasoning_type=reasoning_type,
         )
+        if rebound is not None:
+            view, rebound_binding = rebound
+            bridge = endpoint_bridge
+            binding = {**binding, **rebound_binding}
+            # The endpoint model call is deliberately not repeated: the
+            # retrieved hop2 patch changes evidence, not the already parsed
+            # endpoint state. This keeps retry cost bounded and avoids making
+            # an uncertain parser decision cascade into extra generations.
+            endpoint_payload = endpoint_binding.as_dict()
     prompt = hotpot_preserve_first_answer_prompt(row, view)
     text, metrics = model.generate(
         prompt,
@@ -977,7 +2018,15 @@ def generate_hotpot_preserve_first_candidate(
         do_sample=do_sample,
     )
     answer = extract_hotpot_short_answer(text)
-    if not answer:
+    deterministic_answer = _hotpot_deterministic_topology_answer(
+        row=planning_row,
+        facts=facts,
+        view=view,
+        reasoning_type=reasoning_type,
+    )
+    if deterministic_answer:
+        answer = deterministic_answer
+    elif not answer:
         answer = str(endpoint_binding.derived_answer or "").strip()
     if answer:
         view = build_hotpot_chain_view_from_facts(
@@ -989,7 +2038,6 @@ def generate_hotpot_preserve_first_candidate(
             hop2_fact_ids=view.hop2_fact_ids,
             derived_answer=answer,
         )
-    reasoning_type = str(option.get("candidate_topology") or _hotpot_reasoning_type(row))
     topology_classifier = option.get("topology_classifier", {}) if isinstance(option.get("topology_classifier"), dict) else {}
     reasoning_family = str(option.get("reasoning_family") or _hotpot_reasoning_family_for_type(reasoning_type))
     candidate_object = build_hotpot_reasoning_candidate_object(
@@ -1023,6 +2071,7 @@ def generate_hotpot_preserve_first_candidate(
         "chain_pair_pool": binding.get("chain_pair_pool", []),
         "endpoint_binding": endpoint_payload,
         "answer_alignment": view.answer_alignment,
+        "question_alignment": question_alignment,
         "contradiction_signal": view.contradiction_signal,
         "chain_signature": _hotpot_view_signature(view),
         "bridge_candidate_rank": option.get("bridge_rank", attempt),
@@ -1032,17 +2081,33 @@ def generate_hotpot_preserve_first_candidate(
         "reasoning_type": reasoning_type,
         "reasoning_family": reasoning_family,
         "topology_classifier": topology_classifier,
+        "semantic_plan": semantic_plan,
+        "semantic_plan_status": semantic_plan_status,
+        "semantic_planner_metrics": planner_metrics,
         "allocation_policy": option.get("allocation_policy", ""),
         "constructor_family": option.get("constructor_family", ""),
         "bridge_entity_telemetry": option.get("bridge_entity_telemetry", {}),
         "bridge_attribute_telemetry": option.get("bridge_attribute_telemetry", {}),
         "multi_constraint_telemetry": option.get("multi_constraint_telemetry", {}),
         "parallel_retrieval_telemetry": option.get("parallel_retrieval_telemetry", {}),
+        "graph_retrieval": option.get("graph_retrieval", {}),
+        "path_packets": [
+            {
+                "path_id": path.get("path_id", ""),
+                "evidence_ids": list(path.get("evidence_ids", [])),
+                "entities": list(path.get("entities", [])),
+                "relations": list(path.get("relations", [])),
+                "confidence": max(0.0, min(1.0, 1.0 - float(path.get("uncertainty", 1.0) or 1.0))),
+                "uncertainty": float(path.get("uncertainty", 1.0) or 1.0),
+            }
+            for path in option.get("graph_retrieval", {}).get("paths", [])
+            if isinstance(path, dict)
+        ],
         "global_chain_score": option.get("global_chain_score"),
         "retrieval_score": option.get("retrieval_score"),
         "semantic_chain_score": option.get("semantic_chain_score"),
         "bridge_candidate_pool": [record.as_dict() for record in bridge_records],
-        "raw_bridge_pool_size": len(_hotpot_raw_bridge_pool(row, facts=facts)),
+        "raw_bridge_pool_size": len(_hotpot_raw_bridge_pool(planning_row, facts=facts)),
         "structured_candidate_view": json.loads(render_hotpot_structured_candidate_view(view)),
         "hotpot_reasoning_candidate": candidate_object.as_dict(),
         "raw_answer_output": text,
@@ -1051,12 +2116,17 @@ def generate_hotpot_preserve_first_candidate(
     return Candidate(
         text=candidate_text,
         score=score_candidate(row, "hotpotqa", candidate_text),
-        input_tokens=int(metrics["input_tokens"]) + int(endpoint_metrics["input_tokens"]),
-        output_tokens=int(metrics["output_tokens"]) + int(endpoint_metrics["output_tokens"]),
-        latency_sec=float(metrics["latency_sec"]) + float(endpoint_metrics["latency_sec"]),
+        input_tokens=int(metrics["input_tokens"]) + int(endpoint_metrics["input_tokens"]) + int(planner_metrics.get("input_tokens", 0)),
+        output_tokens=int(metrics["output_tokens"]) + int(endpoint_metrics["output_tokens"]) + int(planner_metrics.get("output_tokens", 0)),
+        latency_sec=float(metrics["latency_sec"]) + float(endpoint_metrics["latency_sec"]) + float(planner_metrics.get("latency_sec", 0.0)),
         seed=seed,
         generation_role="preserve_first_evidence_chain_binding",
     )
+
+
+def _hotpot_select_best_remaining_option(chain_options: list[dict[str, Any]]) -> dict[str, Any]:
+    """Select after signature deduplication without applying a second offset."""
+    return chain_options[0] if chain_options else {}
 
 
 def _hotpot_hierarchical_chain_options(
@@ -1071,10 +2141,24 @@ def _hotpot_hierarchical_chain_options(
     reasoning_family = str(classification["reasoning_family"])
     topology_confidence = float(classification["confidence"])
     compatible_topologies = list(classification["compatible_topologies"])
+    distribution = list(classification.get("topology_distribution", []))
+    selected_topologies = [str(item["topology"]) for item in distribution[:2] if item.get("topology")]
+    if not selected_topologies:
+        selected_topologies = compatible_topologies[:2]
+    if float(classification.get("confidence", 0.0)) < 0.70 or float(distribution[0].get("probability", 1.0) if distribution else 1.0) < 0.70:
+        selected_topologies.append("generic_pair")
     evidence_index = _hotpot_evidence_index(row, facts)
+    graph_retrieval = QueryGuidedGraphRetriever(alpha=0.35, beam_size=16).retrieve(
+        str(row.get("question", "")), facts, limit=16
+    )
     topology_options: list[dict[str, Any]] = []
-    for candidate_topology in compatible_topologies:
-        if candidate_topology == "bridge_entity":
+    for candidate_topology in selected_topologies:
+        if candidate_topology == "generic_pair":
+            options = _hotpot_topology_chain_options(
+                row=row, facts=facts, evidence_index=evidence_index,
+                reasoning_type=reasoning_type, previous_signatures=previous_signatures,
+            )
+        elif candidate_topology == "bridge_entity":
             options = _hotpot_bridge_entity_chain_options(
                 row=row,
                 facts=facts,
@@ -1106,7 +2190,11 @@ def _hotpot_hierarchical_chain_options(
                 previous_signatures=previous_signatures,
             )
         for option in options[:16]:
-            option["candidate_topology"] = candidate_topology
+            # Generic construction uses the primary executor semantics while
+            # retaining an explicit provenance label for analysis.
+            option["candidate_topology"] = reasoning_type if candidate_topology == "generic_pair" else candidate_topology
+            option["constructed_topology"] = candidate_topology
+            option["graph_retrieval"] = graph_retrieval
             option["reasoning_family"] = _hotpot_reasoning_family_for_type(candidate_topology)
             option["topology_classifier"] = {
                 "reasoning_family": reasoning_family,
@@ -1115,18 +2203,32 @@ def _hotpot_hierarchical_chain_options(
                 "compatible_topologies": list(compatible_topologies),
                 "entities_in_question": list(classification["entities_in_question"]),
                 "requested_relation": classification["requested_relation"],
+                "requested_attribute": classification.get("requested_attribute", ""),
                 "answer_mode": classification["answer_mode"],
+                "first_hop_mode": classification.get("first_hop_mode", "explicit_entity"),
+                "first_hop_variable": classification.get("first_hop_variable", ""),
+                "first_hop_anchor": classification.get("first_hop_anchor", ""),
+                "first_hop_anchor_role": classification.get("first_hop_anchor_role", "subject_anchor"),
+                "first_hop_constraints": list(classification.get("first_hop_constraints", [])),
+                "topology_distribution": list(distribution),
             }
+            probability = next((float(item.get("probability", 0.0)) for item in distribution if item.get("topology") == candidate_topology), 0.0)
+            option["topology_probability"] = probability
+            option["topology_rank"] = selected_topologies.index(candidate_topology) + 1
             if candidate_topology == reasoning_type:
-                option["topology_prior"] = 1.0
+                option["topology_prior"] = max(1.0, probability)
             elif candidate_topology in compatible_topologies and _hotpot_reasoning_family_for_type(candidate_topology) == reasoning_family:
                 option["topology_prior"] = 0.7
+            elif candidate_topology == "generic_pair":
+                option["topology_prior"] = 0.25
             else:
                 option["topology_prior"] = 0.25
             topology_options.append(option)
     if topology_options:
         topology_options.sort(key=lambda item: (
+            int(item.get("compatibility_tier", 2)),
             -float(item.get("topology_prior", 0.0)),
+            -float(item.get("soft_compatibility_score", 0.0)),
             -float(item.get("semantic_chain_score", item.get("global_chain_score", 0.0)) or 0.0),
             -float(item.get("retrieval_score", 0.0) or 0.0),
             int(item.get("hierarchical_chain_rank", item.get("pair_rank", 999))),
@@ -1136,7 +2238,16 @@ def _hotpot_hierarchical_chain_options(
             item["delayed_topology_commitment"] = True
         return topology_options[:64]
     # Fallback for sparse/odd inputs: keep the old bridge-diverse path as a
-    # backup, but only after topology-native construction has failed.
+    # backup, but only after topology-native construction has failed.  It is
+    # still restricted to bridge topologies: comparison and constraint
+    # candidates must never be synthesized from the generic context-title
+    # bridge pool.
+    if reasoning_type not in {"bridge_entity", "bridge_attribute"}:
+        return []
+    question_anchor = _hotpot_question_semantics(row).source_entity
+    if not question_anchor:
+        return []
+    fact_by_id = {str(fact.get("fact_id", "")): fact for fact in facts}
     first_pass: list[dict[str, Any]] = []
     second_pass: list[dict[str, Any]] = []
     for bridge_rank, bridge_record in enumerate(bridge_records, start=1):
@@ -1154,6 +2265,9 @@ def _hotpot_hierarchical_chain_options(
                 continue
             hop1_id = str(pair.get("hop1_fact_id", ""))
             hop2_id = str(pair.get("hop2_fact_id", ""))
+            hop1_fact = fact_by_id.get(hop1_id, {})
+            if not _hotpot_fact_endpoint_matches_entity(row, hop1_fact, question_anchor):
+                continue
             pair_view = build_hotpot_chain_view_from_facts(
                 candidate_id=f"candidate_bridge_{bridge_rank}_pair_{pair_rank}",
                 bridge_entity=bridge_record.name,
@@ -1235,7 +2349,8 @@ def _hotpot_bridge_entity_chain_options(
     source_pool = _hotpot_merge_fact_pool([
         *_hotpot_rank_bridge_entity_source_facts(row, facts, source_entity=source_entity, limit=20),
         *_hotpot_retrieve_by_anchor(evidence_index, anchor=source_entity, query_type="bridge_discovery", topk=40),
-    ])[:20]
+    ])
+    source_pool = [item for item in source_pool if _hotpot_fact_endpoint_matches_entity(row, item, source_entity)][:20]
     options: list[dict[str, Any]] = []
     seen_pairs: set[tuple[str, str]] = set()
     for source_rank, hop1 in enumerate(source_pool, start=1):
@@ -1253,7 +2368,14 @@ def _hotpot_bridge_entity_chain_options(
                     topk=40,
                 ),
             ])[:10]
-            pair_pool = _hotpot_rank_chain_pairs(row, inferred_bridge, [hop1], hop2_pool)
+            pair_pool = _hotpot_rank_chain_pairs(
+                row,
+                inferred_bridge,
+                [hop1],
+                hop2_pool,
+                hard_gate=True,
+                reasoning_type="bridge_entity",
+            )
             binding = {
                 "hop1_pool": [_hotpot_scored_fact_as_dict(item) for item in source_pool],
                 "hop2_pool": [_hotpot_scored_fact_as_dict(item) for item in hop2_pool],
@@ -1325,7 +2447,8 @@ def _hotpot_bridge_family_chain_options(
     source_pool = _hotpot_merge_fact_pool([
         *_hotpot_rank_source_side_facts(row, facts, limit=20),
         *_hotpot_retrieve_by_anchor(evidence_index, anchor=source_entity, query_type="bridge_discovery", topk=40),
-    ])[:16]
+    ])
+    source_pool = [item for item in source_pool if _hotpot_fact_endpoint_matches_entity(row, item, source_entity)][:16]
     options: list[dict[str, Any]] = []
     seen_pairs: set[tuple[str, str]] = set()
     for source_rank, hop1 in enumerate(source_pool, start=1):
@@ -1343,7 +2466,14 @@ def _hotpot_bridge_family_chain_options(
                     topk=40,
                 ),
             ])[:10]
-            pair_pool = _hotpot_rank_chain_pairs(row, inferred_bridge, [hop1], hop2_pool)
+            pair_pool = _hotpot_rank_chain_pairs(
+                row,
+                inferred_bridge,
+                [hop1],
+                hop2_pool,
+                hard_gate=True,
+                reasoning_type=reasoning_type,
+            )
             binding = {
                 "hop1_pool": [_hotpot_scored_fact_as_dict(item) for item in source_pool],
                 "hop2_pool": [_hotpot_scored_fact_as_dict(item) for item in hop2_pool],
@@ -1433,6 +2563,11 @@ def _hotpot_constraint_chain_options(
             previous_signatures=previous_signatures,
         )
     targets_1 = _hotpot_retrieve_relation_targets(row, constraints[0], facts, role="constraint_1", limit=20, evidence_index=evidence_index)
+    # Do not let a context-title retrieval result become a constraint binding
+    # unless its observed endpoint matches the anchor defined by question
+    # semantics.  Relation uncertainty may be retained, but anchor mismatch
+    # is never a construction candidate.
+    targets_1 = [item for item in targets_1 if bool(item.get("anchor_match"))]
     if qsem.constraint_graph_type == "serial":
         targets_2: list[dict[str, Any]] = []
         shared_target_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -1454,6 +2589,7 @@ def _hotpot_constraint_chain_options(
                 limit=10,
                 evidence_index=evidence_index,
             )
+            right_targets = [item for item in right_targets if bool(item.get("anchor_match"))]
             targets_2.extend(right_targets)
             for right in right_targets:
                 if bool(right.get("satisfied")) and str(left.get("fact_id", "")) != str(right.get("fact_id", "")):
@@ -1465,6 +2601,7 @@ def _hotpot_constraint_chain_options(
         ))
     else:
         targets_2 = _hotpot_retrieve_relation_targets(row, constraints[1], facts, role="constraint_2", limit=20, evidence_index=evidence_index)
+        targets_2 = [item for item in targets_2 if bool(item.get("anchor_match"))]
         shared_target_pairs = _hotpot_intersect_constraint_targets(targets_1, targets_2)
     hop1_pool = [_hotpot_constraint_target_as_fact(item, role="constraint_1") for item in targets_1[:5]]
     hop2_pool = [_hotpot_constraint_target_as_fact(item, role="constraint_2") for item in targets_2[:5]]
@@ -1473,13 +2610,25 @@ def _hotpot_constraint_chain_options(
             _hotpot_constraint_target_pair_as_chain_pair(row, left, right)
             for left, right in shared_target_pairs
         ]
+        fallback_used = False
     else:
-        pair_pool = _hotpot_rank_chain_pairs(row, "", hop1_pool, hop2_pool)
+        # Bounded semantic fallback: retain recall when the native serial /
+        # convergent binder is uncertain, without opening an unbounded product.
+        fallback_used = True
+        fallback_pairs = _hotpot_rank_chain_pairs(
+            row,
+            "",
+            hop1_pool[:4],
+            hop2_pool[:4],
+            hard_gate=False,
+            reasoning_type=reasoning_type,
+        )
+        pair_pool = [pair for pair in fallback_pairs[:16] if _hotpot_constraint_pair_relevant(pair)]
     binding = {
         "hop1_pool": [_hotpot_scored_fact_as_dict(item) for item in hop1_pool],
         "hop2_pool": [_hotpot_scored_fact_as_dict(item) for item in hop2_pool],
         "chain_pair_pool": [_hotpot_pair_as_dict(item) for item in pair_pool],
-        "constructor_family": "constraint_target_intersection",
+        "constructor_family": "bounded_constraint_fallback" if fallback_used else "constraint_target_intersection",
         "constraints": constraints,
             "constraint_graph_type": qsem.constraint_graph_type,
             "answer_var": qsem.answer_var,
@@ -1517,6 +2666,9 @@ def _hotpot_constraint_chain_options(
             continue
         telemetry = {
             "constraints": constraints,
+            "first_hop_mode": qsem.first_hop_mode,
+            "first_hop_variable": qsem.first_hop_variable,
+            "first_hop_anchor_role": "object_anchor" if qsem.first_hop_mode == "attribute_reverse" else ("descriptive_constraint" if qsem.first_hop_mode == "descriptive_entity" else "subject_anchor"),
             "target_set_sizes": [len(targets_1), len(targets_2)],
             "shared_target_count": len(shared_target_pairs),
             "shared_targets": [
@@ -1527,7 +2679,7 @@ def _hotpot_constraint_chain_options(
             "answer_var": qsem.answer_var,
             "constraint_1_targets": [_hotpot_constraint_target_as_dict(item) for item in targets_1],
             "constraint_2_targets": [_hotpot_constraint_target_as_dict(item) for item in targets_2],
-            "constructor_family": "serial_constraint_binding" if qsem.constraint_graph_type == "serial" else "constraint_target_intersection",
+            "constructor_family": "bounded_constraint_fallback" if fallback_used else ("serial_constraint_binding" if qsem.constraint_graph_type == "serial" else "constraint_target_intersection"),
         }
         options.append({
             "bridge": pair_view.bridge_entity,
@@ -1539,13 +2691,24 @@ def _hotpot_constraint_chain_options(
             "retrieval_score": float(pair.get("retrieval_score", 0.0) or 0.0),
             "semantic_chain_score": float(pair.get("semantic_chain_score", pair.get("chain_score", 0.0)) or 0.0),
             "allocation_policy": f"topology_native_{reasoning_type}",
-            "constructor_family": "serial_constraint_binding" if qsem.constraint_graph_type == "serial" else "constraint_target_intersection",
+            "constructor_family": "bounded_constraint_fallback" if fallback_used else ("serial_constraint_binding" if qsem.constraint_graph_type == "serial" else "constraint_target_intersection"),
             "multi_constraint_telemetry": telemetry,
         })
     options.sort(key=lambda item: (-float(item["semantic_chain_score"]), -float(item["retrieval_score"]), int(item["pair_rank"])))
     for index, item in enumerate(options, start=1):
         item["hierarchical_chain_rank"] = index
     return options
+
+
+def _hotpot_constraint_pair_relevant(pair: dict[str, Any]) -> bool:
+    """Keep a bounded fallback pair when it shares an entity/subject signal."""
+    hop1 = pair.get("hop1", {}) or {}
+    hop2 = pair.get("hop2", {}) or {}
+    left = _hotpot_terms(f"{hop1.get('title', '')} {hop1.get('text', '')}")
+    right = _hotpot_terms(f"{hop2.get('title', '')} {hop2.get('text', '')}")
+    if left & right:
+        return True
+    return float(pair.get("retrieval_score", 0.0) or 0.0) >= 0.75
 
 
 def _hotpot_topology_chain_options(
@@ -1558,7 +2721,14 @@ def _hotpot_topology_chain_options(
 ) -> list[dict[str, Any]]:
     evidence_index = evidence_index or _hotpot_evidence_index(row, facts)
     hop1_pool, hop2_pool = _hotpot_topology_fact_pools(row, facts=facts, bridge="", reasoning_type=reasoning_type, evidence_index=evidence_index)
-    pair_pool = _hotpot_rank_chain_pairs(row, "", hop1_pool, hop2_pool)
+    pair_pool = _hotpot_rank_chain_pairs(
+        row,
+        "",
+        hop1_pool,
+        hop2_pool,
+        hard_gate=True,
+        reasoning_type=reasoning_type,
+    )
     options = []
     binding = {
         "hop1_pool": [_hotpot_scored_fact_as_dict(item) for item in hop1_pool],
@@ -1615,7 +2785,7 @@ def _hotpot_facts(row: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _hotpot_raw_bridge_pool(row: dict[str, Any], *, facts: list[dict[str, Any]]) -> list[BridgeCandidate]:
     records: list[BridgeCandidate] = []
-    for index, entity in enumerate(row.get("entities", []), start=1):
+    for index, entity in enumerate(row.get("question_entities", []), start=1):
         records.append(_hotpot_bridge_record(str(entity), "question_entity", f"entity_{index}", row, facts))
     for index, fact in enumerate(facts, start=1):
         title = str(fact.get("title", "")).strip()
@@ -1984,7 +3154,7 @@ RELATION_ALIASES = {
     "directed_by": {"directed_by", "directed by", "director", "director of", "directed"},
     "located_in": {"located_in", "located in", "situated in", "based_in", "based in", "location"},
     "born_in": {"born_in", "born in", "birthplace"},
-    "nationality": {"nationality", "country", "citizen"},
+    "nationality": {"nationality", "country", "citizen", "citizenship", "country_of_origin", "from", "of_origin"},
     "home_venue": {"home_venue", "home venue", "home games at", "played at", "arena"},
     "capacity": {"capacity", "seat", "seats", "seated", "can seat"},
     "position": {"position", "government position", "office", "served as", "chief of protocol"},
@@ -2043,6 +3213,9 @@ def _hotpot_relation_match_type(fact_relation: str, requested_relation: str) -> 
 
 
 def _hotpot_question_relation_label(row: dict[str, Any]) -> str:
+    model_plan = row.get("_model_semantic_plan")
+    if isinstance(model_plan, dict) and str(model_plan.get("requested_relation", "")).strip():
+        return str(model_plan["requested_relation"]).strip()
     q = str(row.get("question", "")).lower()
     # Prefer the answer-side relation.  Bridge questions often mention the
     # source-side relation ("director of X", "album created by Y") before the
@@ -2070,7 +3243,33 @@ def _hotpot_question_relation_label(row: dict[str, Any]) -> str:
     return "unresolved"
 
 
+def _hotpot_question_attribute_slot(row: dict[str, Any]) -> str:
+    """Return the requested attribute slot, keeping capacity variants distinct."""
+    model_plan = row.get("_model_semantic_plan")
+    if isinstance(model_plan, dict) and str(model_plan.get("requested_attribute", "")).strip():
+        return str(model_plan["requested_attribute"]).strip()
+    q = str(row.get("question", "")).lower()
+    if re.search(r"\b(seated|can\s+seat|seats?)\b", q):
+        return "seated_capacity"
+    if re.search(r"\b(total|overall|maximum|max)\s+capacity\b", q):
+        return "total_capacity"
+    if re.search(r"\bcapacity\b", q):
+        return "capacity"
+    return ""
+
+
 def _hotpot_expected_answer_role(row: dict[str, Any]) -> str:
+    model_plan = row.get("_model_semantic_plan")
+    if isinstance(model_plan, dict):
+        spec = model_plan.get("answer_target_spec", {})
+        if isinstance(spec, dict):
+            value_type = str(spec.get("value_type", "")).strip().lower()
+            if value_type in {"number", "numeric", "literal", "year"}:
+                return "LITERAL"
+            if value_type in {"location", "city", "country", "locality"}:
+                return "LOCATION"
+            if value_type in {"person", "organization", "entity", "named_entity"}:
+                return "NAMED_ENTITY"
     q = str(row.get("question", "")).lower()
     relation = _hotpot_question_relation_label(row)
     if relation == "capacity" or "how many" in q:
@@ -2099,6 +3298,12 @@ def _hotpot_target_role_matches(object_role: str, expected_role: str) -> bool:
         return role in {"ORGANIZATION", "NAMED_ENTITY", "PERSON"}
     if expected == "NAMED_ENTITY":
         return role in {"NAMED_ENTITY", "PERSON", "ORGANIZATION", "ATTRIBUTE_VALUE"}
+    if expected == "LOCATION":
+        # The lightweight ontology intentionally does not run a full NER
+        # model; capitalized cities/countries commonly arrive as NAMED_ENTITY.
+        return role in {"LOCATION", "NAMED_ENTITY", "ATTRIBUTE_VALUE"}
+    if expected == "ATTRIBUTE_VALUE":
+        return role in {"ATTRIBUTE_VALUE", "NAMED_ENTITY", "LOCATION", "LITERAL"}
     if expected == "LITERAL":
         return role in {"LITERAL", "NUMBER"}
     return role == expected
@@ -2155,10 +3360,47 @@ def _hotpot_topology_fact_pools(
     reasoning_type: str,
     evidence_index: HotpotEvidenceIndex | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    # Graph diffusion is a recall layer.  Existing topology-specific ranking
+    # remains in place, while path-retrieved facts are prepended as additional
+    # hypotheses and still pass through the strict semantic verifier later.
+    graph_result = QueryGuidedGraphRetriever(alpha=0.35, beam_size=16).retrieve(
+        f"{row.get('question', '')} {bridge}", facts, limit=16
+    )
+    graph_fact_scores: dict[str, float] = {}
+    for path in graph_result.get("paths", []):
+        for fact_id in path.get("evidence_ids", []):
+            graph_fact_scores[str(fact_id)] = max(graph_fact_scores.get(str(fact_id), 0.0), float(path.get("retrieval_score", 0.0) or 0.0))
+    graph_facts = [
+        {**fact, "graph_path_score": graph_fact_scores.get(str(fact.get("fact_id", "")), 0.0), "retrieval_score": graph_fact_scores.get(str(fact.get("fact_id", "")), 0.0), "hop_score": graph_fact_scores.get(str(fact.get("fact_id", "")), 0.0)}
+        for fact in facts if str(fact.get("fact_id", "")) in graph_fact_scores
+    ]
+    graph_facts.sort(key=lambda item: (-float(item.get("graph_path_score", 0.0)), str(item.get("fact_id", ""))))
+
+    def augment(pool: list[dict[str, Any]], *, limit: int, anchor: str = "") -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        # Preserve the topology-specific ranking first.  Diffusion is a recall
+        # expansion layer and must not displace an already strong native fact
+        # merely because its path score uses a different scale.
+        for item in pool:
+            if anchor and not _hotpot_fact_endpoint_matches_entity(row, item, anchor):
+                continue
+            fact_id = str(item.get("fact_id", ""))
+            if not fact_id:
+                continue
+            merged.setdefault(fact_id, item)
+        for item in graph_facts:
+            if anchor and not _hotpot_fact_endpoint_matches_entity(row, item, anchor):
+                continue
+            fact_id = str(item.get("fact_id", ""))
+            if fact_id and fact_id not in merged:
+                merged[fact_id] = item
+        return list(merged.values())[:limit]
+
     if reasoning_type in {"bridge_entity", "bridge_attribute"}:
+        source_anchor = _hotpot_question_semantics(row).source_entity
         return (
-            _hotpot_rank_hop1_candidates(row, bridge, facts, limit=3),
-            _hotpot_rank_hop2_candidates(row, bridge, facts, limit=3),
+            augment(_hotpot_rank_hop1_candidates(row, bridge, facts, limit=6), limit=6, anchor=source_anchor),
+            augment(_hotpot_rank_hop2_candidates(row, bridge, facts, limit=6), limit=6),
         )
     if reasoning_type in {"comparison_attribute", "shared_property_yesno", "set_intersection"}:
         qsem = _hotpot_question_semantics(row)
@@ -2166,25 +3408,47 @@ def _hotpot_topology_fact_pools(
         relation = qsem.compared_relation
         if evidence_index is not None:
             return (
-                _hotpot_merge_fact_pool([
+                augment(_hotpot_merge_fact_pool([
                     *_hotpot_rank_parallel_fact_candidates(row, entity_a, facts, role="hop1", limit=20),
                     *_hotpot_retrieve_by_anchor_relation(evidence_index, anchor=entity_a, relation=relation, query_type="entity_a_lookup", topk=20),
                     *_hotpot_retrieve_by_anchor(evidence_index, anchor=entity_a, query_type="entity_a_lookup", relation_hint=relation, topk=20),
-                ])[:6],
-                _hotpot_merge_fact_pool([
+                ])[:6], limit=8, anchor=entity_a),
+                augment(_hotpot_merge_fact_pool([
                     *_hotpot_rank_parallel_fact_candidates(row, entity_b, facts, role="hop2", limit=20),
                     *_hotpot_retrieve_by_anchor_relation(evidence_index, anchor=entity_b, relation=relation, query_type="entity_b_lookup", topk=20),
                     *_hotpot_retrieve_by_anchor(evidence_index, anchor=entity_b, query_type="entity_b_lookup", relation_hint=relation, topk=20),
-                ])[:6],
+                ])[:6], limit=8, anchor=entity_b),
             )
         return (
-            _hotpot_rank_parallel_fact_candidates(row, entity_a, facts, role="hop1", limit=3),
-            _hotpot_rank_parallel_fact_candidates(row, entity_b, facts, role="hop2", limit=3),
+            augment(_hotpot_rank_parallel_fact_candidates(row, entity_a, facts, role="hop1", limit=6), limit=6, anchor=entity_a),
+            augment(_hotpot_rank_parallel_fact_candidates(row, entity_b, facts, role="hop2", limit=6), limit=6, anchor=entity_b),
         )
+    constraints = list(_hotpot_question_semantics(row).constraints)
+    first_anchor = str(constraints[0].anchor) if constraints else ""
+    second_anchor = str(constraints[1].anchor) if len(constraints) > 1 else ""
+    # A serial second hop is anchored by the first-hop variable.  The generic
+    # pair constructor cannot bind that variable safely, so it must not use a
+    # context-title fallback.
+    if second_anchor.upper() in {"X", "Y", "Z"}:
+        return [], []
     return (
-        _hotpot_rank_constraint_fact_candidates(row, facts, role="hop1", limit=3),
-        _hotpot_rank_constraint_fact_candidates(row, facts, role="hop2", limit=3, reverse=True),
+        augment(_hotpot_rank_constraint_fact_candidates(row, facts, role="hop1", limit=6), limit=6, anchor=first_anchor),
+        augment(_hotpot_rank_constraint_fact_candidates(row, facts, role="hop2", limit=6, reverse=True), limit=6, anchor=second_anchor),
     )
+
+
+def _hotpot_fact_endpoint_matches_entity(row: dict[str, Any], fact: dict[str, Any], entity: str) -> bool:
+    """Return whether a fact endpoint (not merely its context title) is an anchor."""
+    anchor = str(entity or "").strip()
+    if not anchor:
+        return False
+    relation = _hotpot_fact_relation_view(row, "", fact, role="anchor_check")
+    endpoints = (
+        str(relation.get("source_entity", "")),
+        str(relation.get("target_entity", "")),
+        str(relation.get("title_entity", "")),
+    )
+    return any(_hotpot_entities_equivalent(endpoint, anchor) for endpoint in endpoints if endpoint)
 
 
 def _hotpot_rank_parallel_fact_candidates(row: dict[str, Any], entity: str, facts: list[dict[str, Any]], *, role: str, limit: int) -> list[dict[str, Any]]:
@@ -2195,7 +3459,9 @@ def _hotpot_rank_parallel_fact_candidates(row: dict[str, Any], entity: str, fact
         semantics = _hotpot_fact_semantics(row, fact)
         fact_terms = _hotpot_terms(f"{fact.get('title', '')} {fact.get('text', '')}")
         extracted_value = _hotpot_parallel_attribute_value(row, fact, entity)
-        entity_match = _hotpot_fact_supports_entity(fact, entity) or _hotpot_entities_equivalent(semantics.get("subject", ""), entity)
+        entity_match = _hotpot_fact_endpoint_matches_entity(row, fact, entity)
+        if not entity_match:
+            continue
         lexical_relation_match = len(relation_terms & fact_terms) / max(1, len(relation_terms)) if relation_terms else 0.0
         relation_match_type = _hotpot_relation_match_type(str(semantics.get("relation", "")), requested_relation)
         relation_compatible = relation_match_type in {"exact", "compatible"} or lexical_relation_match > 0.0 or bool(extracted_value)
@@ -2290,12 +3556,16 @@ def _hotpot_rank_constraint_fact_candidates(
 
 
 def _hotpot_rank_source_side_facts(row: dict[str, Any], facts: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
-    question_entities = [str(item) for item in row.get("entities", []) if str(item).strip()]
+    question_entities = [str(item) for item in row.get("question_entities", []) if str(item).strip()]
     question_terms = _hotpot_terms(str(row.get("question", "")))
     scored = []
     for fact in facts:
         relation = _hotpot_fact_relation_view(row, "", fact, role="source")
-        source_match = any(_hotpot_fact_supports_entity(fact, entity) for entity in question_entities)
+        # A source fact is eligible only when an endpoint is anchored on the
+        # question, never because its context title happened to score highly.
+        source_match = any(_hotpot_fact_endpoint_matches_entity(row, fact, entity) for entity in question_entities)
+        if not source_match:
+            continue
         target = str(relation.get("target_entity", ""))
         target_valid = bool(target and target != "unresolved" and _hotpot_bridge_role_admissible(_hotpot_ontology_role(target)))
         text_terms = _hotpot_terms(f"{fact.get('title', '')} {fact.get('text', '')}")
@@ -2317,10 +3587,9 @@ def _hotpot_rank_bridge_entity_source_facts(
     scored = []
     for fact in facts:
         relation = _hotpot_fact_relation_view(row, "", fact, role="bridge_discovery")
-        anchor_match = _hotpot_fact_supports_entity(fact, source_entity) or _hotpot_entities_equivalent(
-            relation.get("source_entity", ""),
-            source_entity,
-        )
+        anchor_match = _hotpot_fact_endpoint_matches_entity(row, fact, source_entity)
+        if not anchor_match:
+            continue
         inferred_bridge = _hotpot_inferred_intermediate_from_fact(row, fact)
         bridge_role = _hotpot_ontology_role(inferred_bridge)
         bridge_valid = bool(inferred_bridge and _hotpot_bridge_role_admissible(bridge_role))
@@ -2697,7 +3966,7 @@ def _hotpot_rank_hop1_candidates(row: dict[str, Any], bridge: str, facts: list[d
         text_terms = _hotpot_terms(f"{fact.get('title', '')} {fact.get('text', '')}")
         entity_overlap = len(question_terms & text_terms) / max(1, len(question_terms))
         bridge_mention = 1.0 if bridge_key and (bridge_key == title_key or bridge_key in text_key) else 0.0
-        title_endpoint = 1.0 if title_key and title_key in {normalize_bridge(item) for item in row.get("entities", [])} else 0.0
+        title_endpoint = 1.0 if title_key and title_key in {normalize_bridge(item) for item in row.get("question_entities", [])} else 0.0
         retrieval_score = 1.5 * bridge_mention + 1.0 * entity_overlap + 0.5 * title_endpoint
         scored.append({**fact, "hop_role": "hop1", "retrieval_score": retrieval_score, "hop_score": retrieval_score})
     scored.sort(key=lambda item: (-float(item["retrieval_score"]), str(item.get("fact_id", ""))))
@@ -2729,6 +3998,9 @@ def _hotpot_rank_chain_pairs(
     bridge: str,
     hop1_pool: list[dict[str, Any]],
     hop2_pool: list[dict[str, Any]],
+    *,
+    hard_gate: bool = False,
+    reasoning_type: str | None = None,
 ) -> list[dict[str, Any]]:
     pairs = []
     for hop1 in hop1_pool:
@@ -2737,25 +4009,118 @@ def _hotpot_rank_chain_pairs(
             hop2_id = str(hop2.get("fact_id") or "").strip()
             if not hop1_id or not hop2_id or hop1_id == hop2_id:
                 continue
-            semantic_verification = _hotpot_verify_semantic_chain(row, bridge, hop1, hop2)
+            semantic_verification = _hotpot_verify_semantic_chain(
+                row,
+                bridge,
+                hop1,
+                hop2,
+                reasoning_type_override=reasoning_type,
+            )
+            gate_pass = bool(semantic_verification.get("programmatic_gates", {}).get("pass"))
             semantic_score = _hotpot_semantic_chain_score(semantic_verification)
             retrieval_score = _hotpot_pair_retrieval_score(row, bridge, hop1, hop2)
+            features = _hotpot_pair_compatibility_features(
+                semantic_verification, retrieval_score=retrieval_score,
+                reasoning_type=reasoning_type,
+            )
             pairs.append({
                 "hop1": hop1,
                 "hop2": hop2,
                 "retrieval_score": retrieval_score,
                 "semantic_chain_verification": semantic_verification,
                 "semantic_chain_score": semantic_score,
-                "compatibility_score": semantic_score,
+                "compatibility_score": features["soft_compatibility_score"],
                 "chain_score": semantic_score,
+                "hard_gate_pass": gate_pass,
+                "soft_compatibility_score": features["soft_compatibility_score"],
+                "compatibility_features": features,
+                "compatibility_tier": features["tier"],
+                "relation_state": features["relation_state"],
+                "endpoint_state": features["endpoint_state"],
+                "topology_state": features["topology_state"],
             })
     pairs.sort(key=lambda item: (
+        int(item.get("compatibility_tier", 3)),
+        -float(item.get("soft_compatibility_score", 0.0)),
         -float(item["semantic_chain_score"]),
         -float(item["retrieval_score"]),
         str(item["hop1"].get("fact_id")),
         str(item["hop2"].get("fact_id")),
     ))
     return pairs
+
+
+def _hotpot_pair_compatibility_features(
+    verification: dict[str, Any], *, retrieval_score: float, reasoning_type: str | None,
+) -> dict[str, Any]:
+    """Return soft evidence/topology features; uncertainty is never a rejection."""
+    details = verification.get("type_specific_details", {}) or {}
+    gates = verification.get("programmatic_gates", {}).get("gates", {}) or {}
+    endpoints = verification.get("relation_endpoints", {}) or {}
+    hop2 = endpoints.get("hop2", {}) if isinstance(endpoints, dict) else {}
+    relation = str(hop2.get("relation", ""))
+    relation_match = str(details.get("relation_match_type", ""))
+    if not relation_match:
+        relation_match = str(gates.get("relation_compatibility", {}).get("relation_match_type", ""))
+    unresolved = not relation or relation.lower() in {"unresolved", "unknown", "none"}
+    if unresolved or relation_match in {"", "unknown", "unresolved"}:
+        relation_state, relation_score = "uncertain", 0.2
+    elif relation_match in {"exact", "compatible"}:
+        relation_state, relation_score = "compatible", 1.0
+    else:
+        relation_state, relation_score = "incompatible", 0.0
+
+    if reasoning_type in {"comparison_attribute", "shared_property_yesno", "set_intersection"}:
+        supported = [bool(details.get("entity_a_supported")), bool(details.get("entity_b_supported"))]
+        if all(supported):
+            endpoint_state, entity_score = "compatible", 1.0
+        elif any(supported):
+            endpoint_state, entity_score = "uncertain", 0.5
+        else:
+            endpoint_state, entity_score = "uncertain", 0.2
+    else:
+        aligned = bool(verification.get("bridge_entity_aligned")) or bool(details.get("bridge_alignment"))
+        inferred = str(verification.get("inferred_bridge", "")).strip()
+        if aligned:
+            endpoint_state, entity_score = "compatible", 1.0
+        elif not inferred:
+            endpoint_state, entity_score = "uncertain", 0.2
+        else:
+            endpoint_state, entity_score = "uncertain", 0.4
+
+    topology_pass = bool(gates.get("topology_consistency", {}).get("pass"))
+    explicit_conflict = relation_state == "incompatible" and not unresolved
+    if topology_pass:
+        topology_state, topology_score = "compatible", 1.0
+    elif explicit_conflict:
+        topology_state, topology_score = "incompatible", 0.0
+    else:
+        topology_state, topology_score = "uncertain", 0.2
+    endpoint_confidence = sum(
+        float(item.get("confidence", 0.0) or 0.0)
+        for item in endpoints.values() if isinstance(item, dict)
+    ) / max(1, sum(1 for item in endpoints.values() if isinstance(item, dict)))
+    endpoint_confidence = max(0.0, min(1.0, endpoint_confidence))
+    retrieval_feature = max(0.0, min(1.0, float(retrieval_score or 0.0) / 6.0))
+    score = (
+        0.30 * retrieval_feature + 0.20 * entity_score + 0.20 * relation_score
+        + 0.15 * topology_score + 0.15 * endpoint_confidence
+    )
+    tier = 1 if topology_state == "compatible" and relation_state != "incompatible" else 2
+    if topology_state == "incompatible" and relation_state == "incompatible":
+        tier = 3
+    return {
+        "retrieval_score": retrieval_feature,
+        "entity_alignment": entity_score,
+        "relation_compatibility": relation_score,
+        "topology_compatibility": topology_score,
+        "endpoint_confidence": endpoint_confidence,
+        "soft_compatibility_score": score,
+        "relation_state": relation_state,
+        "endpoint_state": endpoint_state,
+        "topology_state": topology_state,
+        "tier": tier,
+    }
 
 
 def _hotpot_pair_retrieval_score(row: dict[str, Any], bridge: str, hop1: dict[str, Any], hop2: dict[str, Any]) -> float:
@@ -2807,6 +4172,7 @@ def _hotpot_reasoning_ir(
         question={
             "entities": list(qsem.entities_in_question),
             "requested_relation": qsem.requested_relation or qsem.target_relation or qsem.compared_relation,
+            "requested_attribute": qsem.requested_attribute,
             "comparison_operator": qsem.comparison_operator,
             "answer_type": qsem.expected_answer_role,
             "answer_mode": qsem.answer_mode,
@@ -2833,7 +4199,174 @@ def _hotpot_reasoning_ir(
     )
 
 
-def _hotpot_programmatic_gates(ir: ReasoningIR, *, hop1: dict[str, Any], hop2: dict[str, Any], type_details: dict[str, Any]) -> dict[str, Any]:
+def _hotpot_question_alignment_gate(
+    row: dict[str, Any],
+    *,
+    reasoning_type: str,
+    hop1: dict[str, Any],
+    hop2: dict[str, Any],
+    hop1_relation: dict[str, Any],
+    hop2_relation: dict[str, Any],
+    type_details: dict[str, Any],
+) -> dict[str, Any]:
+    """Verify that a self-consistent chain is actually about this question.
+
+    The older gates only inspected the candidate's internal endpoints and
+    relations.  That lets a coherent distractor chain (for example, a fact
+    about Shinee formed by S.M. Entertainment) pass for a question anchored
+    on a different album.  Keep this check explicitly question-relative and
+    expose each sub-check for diagnostics.
+    """
+    qsem = _hotpot_question_semantics(row)
+    question_entities = [str(item) for item in qsem.entities_in_question if str(item).strip()]
+    facts = (hop1, hop2)
+    fact_terms = {
+        "hop1": _hotpot_terms(f"{hop1.get('title', '')} {hop1.get('text', '')}"),
+        "hop2": _hotpot_terms(f"{hop2.get('title', '')} {hop2.get('text', '')}"),
+    }
+
+    def fact_covers(entity: str) -> bool:
+        return bool(entity) and any(_hotpot_fact_supports_entity(fact, entity) for fact in facts)
+
+    anchor_checks: dict[str, bool] = {}
+    if reasoning_type in {"bridge_entity", "bridge_attribute"}:
+        anchor = str(qsem.source_entity or (question_entities[0] if question_entities else ""))
+        anchor_checks[anchor or "<missing_source_entity>"] = fact_covers(anchor)
+    elif reasoning_type in {"comparison_attribute", "shared_property_yesno", "set_intersection"}:
+        entity_a = str(qsem.entity_a or (question_entities[0] if question_entities else ""))
+        entity_b = str(qsem.entity_b or (question_entities[1] if len(question_entities) > 1 else ""))
+        anchor_checks[entity_a or "<missing_entity_a>"] = fact_covers(entity_a)
+        anchor_checks[entity_b or "<missing_entity_b>"] = fact_covers(entity_b)
+    elif reasoning_type == "multi_constraint_lookup":
+        bindings = type_details.get("constraint_bindings", [])
+        explicit_constraints = [constraint for constraint in qsem.constraints if constraint.anchor]
+        # For serial graphs, later constraints can intentionally use the
+        # variable produced by the first hop; their concrete anchor is checked
+        # by the binding itself rather than by lexical question entities.
+        if explicit_constraints and isinstance(bindings, list):
+            for index, constraint in enumerate(explicit_constraints):
+                binding = bindings[index] if index < len(bindings) and isinstance(bindings[index], dict) else {}
+                anchor_checks[str(constraint.anchor)] = bool(binding.get("anchor_match"))
+        else:
+            for entity in question_entities:
+                anchor_checks[entity] = fact_covers(entity)
+    else:
+        for entity in question_entities:
+            anchor_checks[entity] = fact_covers(entity)
+    question_anchor_covered = bool(anchor_checks) and all(anchor_checks.values())
+    if reasoning_type in {"bridge_entity", "bridge_attribute"}:
+        first_hop_anchor_names = [str(qsem.source_entity or (question_entities[0] if question_entities else ""))]
+    elif reasoning_type in {"comparison_attribute", "shared_property_yesno", "set_intersection"}:
+        first_hop_anchor_names = [str(qsem.entity_a), str(qsem.entity_b)]
+    elif reasoning_type == "multi_constraint_lookup":
+        first_hop_anchor_names = [str(qsem.constraints[0].anchor)] if qsem.constraints else []
+    else:
+        first_hop_anchor_names = question_entities
+    valid_first_hop_anchors = sorted({
+        normalize_bridge(anchor)
+        for anchor in first_hop_anchor_names
+        if anchor and anchor_checks.get(anchor, False)
+    })
+
+    requested_relation = str(qsem.requested_relation or qsem.target_relation or qsem.compared_relation or "unresolved")
+    observed_relations = [str(hop1_relation.get("relation", "")), str(hop2_relation.get("relation", ""))]
+    relation_matches: list[str] = []
+    if reasoning_type in {"bridge_entity", "bridge_attribute"}:
+        relation_matches = [_hotpot_relation_match_type(observed_relations[1], requested_relation)]
+    elif reasoning_type in {"comparison_attribute", "shared_property_yesno", "set_intersection"}:
+        relation_matches = [_hotpot_relation_match_type(value, requested_relation) for value in observed_relations]
+    elif reasoning_type == "multi_constraint_lookup":
+        bindings = type_details.get("constraint_bindings", [])
+        relation_matches = [
+            "exact" if bool(item.get("relation_match")) else str(item.get("relation_match_type", "mismatch"))
+            for item in bindings if isinstance(item, dict)
+        ]
+    if requested_relation == "unresolved":
+        requested_relation_covered = any(value not in {"", "unresolved"} for value in observed_relations) or bool(
+            type_details.get("attribute_a") and type_details.get("attribute_b")
+        )
+    elif reasoning_type == "multi_constraint_lookup":
+        requested_relation_covered = bool(relation_matches) and all(value in {"exact", "compatible"} for value in relation_matches)
+    else:
+        requested_relation_covered = any(value in {"exact", "compatible"} for value in relation_matches)
+        # Some questions are direct one-hop lookups even when the caller's
+        # topology hint says bridge_attribute.  If the first fact is anchored
+        # on the question subject and already expresses the requested answer
+        # relation, accept that direct path rather than forcing a spurious
+        # second hop.
+        direct_source = str(hop1_relation.get("source_entity") or hop1_relation.get("subject") or "")
+        direct_match = _hotpot_relation_match_type(observed_relations[0], requested_relation)
+        if (
+            not requested_relation_covered
+            and direct_match in {"exact", "compatible"}
+            and qsem.source_entity
+            and _hotpot_entities_equivalent(direct_source, qsem.source_entity)
+        ):
+            requested_relation_covered = True
+
+    if reasoning_type in {"bridge_entity", "bridge_attribute"}:
+        answer_target = str(hop2_relation.get("target_entity") or hop2_relation.get("object") or "")
+        answer_target_covered = bool(answer_target) and _hotpot_target_role_matches(
+            str(hop2_relation.get("object_role", "")), qsem.expected_answer_role
+        )
+        # A parser may leave the role unresolved while the type-specific
+        # verifier has already established a valid answer-side target.
+        answer_target_covered = answer_target_covered or bool(
+            type_details.get("hop2_target_type_matches") and answer_target
+        )
+    elif reasoning_type in {"comparison_attribute", "shared_property_yesno", "set_intersection"}:
+        answer_target_covered = bool(type_details.get("attribute_a")) and bool(type_details.get("attribute_b"))
+        if not answer_target_covered:
+            target_terms = _hotpot_relation_target_terms(row)
+            answer_target_covered = bool(target_terms & (fact_terms["hop1"] | fact_terms["hop2"]))
+    else:
+        answer_target_covered = bool(type_details.get("answer_var") and type_details.get("variable_bindings", {}).get(type_details.get("answer_var")))
+        answer_target_covered = answer_target_covered or bool(type_details.get("constraint_targets"))
+
+    compatible_topologies = set(qsem.compatible_topologies)
+    topology_consistent = reasoning_type in compatible_topologies if compatible_topologies else False
+    checks = {
+        "question_anchor_covered": question_anchor_covered,
+        "requested_relation_covered": requested_relation_covered,
+        "answer_target_covered": answer_target_covered,
+        "topology_consistent_with_question": topology_consistent,
+    }
+    failure_code = ""
+    for name, passed in checks.items():
+        if not passed:
+            failure_code = {
+                "question_anchor_covered": "question_anchor_not_covered",
+                "requested_relation_covered": "requested_relation_not_covered",
+                "answer_target_covered": "answer_target_not_covered",
+                "topology_consistent_with_question": "topology_not_question_consistent",
+            }[name]
+            break
+    return {
+        "pass": all(checks.values()),
+        "failure_code": failure_code,
+        "checks": checks,
+        "question_anchor_covered": question_anchor_covered,
+        "requested_relation_covered": requested_relation_covered,
+        "answer_target_covered": answer_target_covered,
+        "topology_consistent_with_question": topology_consistent,
+        "question_entities": question_entities,
+        "requested_relation": requested_relation,
+        "observed_relations": observed_relations,
+        "relation_match_types": relation_matches,
+        "anchor_checks": anchor_checks,
+        "valid_first_hop_anchors": valid_first_hop_anchors,
+        "compatible_topologies": sorted(compatible_topologies),
+    }
+
+
+def _hotpot_programmatic_gates(
+    ir: ReasoningIR,
+    *,
+    hop1: dict[str, Any],
+    hop2: dict[str, Any],
+    type_details: dict[str, Any],
+    question_alignment: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     payload = ir.as_dict()
     reasoning_type = str(payload["topology"].get("type", ""))
     gate_a = _hotpot_gate_endpoint_grounding(payload, hop1=hop1, hop2=hop2)
@@ -2846,6 +4379,11 @@ def _hotpot_programmatic_gates(ir: ReasoningIR, *, hop1: dict[str, Any], hop2: d
         "topology_consistency": gate_c,
         "answer_grounding": gate_d,
     }
+    if question_alignment is not None:
+        # Keep the legacy gates first so existing diagnostics retain their
+        # specific failure code, while still requiring question alignment for
+        # the aggregate validity decision.
+        gates["question_alignment"] = question_alignment
     failure_code = ""
     for name, result in gates.items():
         if not bool(result.get("pass")):
@@ -2957,7 +4495,7 @@ def _hotpot_value_grounded(value: Any, fact: dict[str, Any]) -> bool:
         return True
     haystacks = [
         normalize_bridge(fact.get("title", "")),
-        normalize_bridge(fact.get("text", "")),
+        re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", str(fact.get("text", "")).lower())).strip(),
     ]
     aliases = _hotpot_entity_aliases(text)
     for haystack in haystacks:
@@ -2968,11 +4506,18 @@ def _hotpot_value_grounded(value: Any, fact: dict[str, Any]) -> bool:
     return False
 
 
-def _hotpot_verify_semantic_chain(row: dict[str, Any], bridge: str, hop1: dict[str, Any], hop2: dict[str, Any]) -> dict[str, Any]:
+def _hotpot_verify_semantic_chain(
+    row: dict[str, Any],
+    bridge: str,
+    hop1: dict[str, Any],
+    hop2: dict[str, Any],
+    *,
+    reasoning_type_override: str | None = None,
+) -> dict[str, Any]:
     question = str(row.get("question", ""))
     hop1_terms = _hotpot_terms(f"{hop1.get('title', '')} {hop1.get('text', '')}")
     hop2_terms = _hotpot_terms(f"{hop2.get('title', '')} {hop2.get('text', '')}")
-    reasoning_type = _hotpot_reasoning_type(row)
+    reasoning_type = str(reasoning_type_override or _hotpot_reasoning_type(row))
     hop1_bridge_match = _hotpot_fact_bridge_match(bridge, hop1)
     hop2_bridge_match = _hotpot_fact_bridge_match(bridge, hop2)
     hop1_relation = _hotpot_fact_relation_view(row, bridge, hop1, role="hop1")
@@ -3007,11 +4552,21 @@ def _hotpot_verify_semantic_chain(row: dict[str, Any], bridge: str, hop1: dict[s
         hop2_relation=hop2_relation,
         type_details=type_details,
     )
+    question_alignment = _hotpot_question_alignment_gate(
+        row,
+        reasoning_type=reasoning_type,
+        hop1=hop1,
+        hop2=hop2,
+        hop1_relation=hop1_relation,
+        hop2_relation=hop2_relation,
+        type_details=type_details,
+    )
     programmatic_gates = _hotpot_programmatic_gates(
         reasoning_ir,
         hop1=hop1,
         hop2=hop2,
         type_details=type_details,
+        question_alignment=question_alignment,
     )
     reasoning_candidate = _hotpot_construct_reasoning_candidate(
         row=row,
@@ -3072,6 +4627,7 @@ def _hotpot_verify_semantic_chain(row: dict[str, Any], bridge: str, hop1: dict[s
             "bridge_hypothesis_match": bridge_hypothesis_match,
             "bridge_match_type": bridge_match_type,
             "type_specific_details": type_details,
+            "question_alignment": question_alignment,
             "reasoning_ir": reasoning_ir.as_dict(),
             "programmatic_gates": programmatic_gates,
         },
@@ -3089,6 +4645,7 @@ def _hotpot_verify_semantic_chain(row: dict[str, Any], bridge: str, hop1: dict[s
         "failure_reason": failure_code,
         "failure_code": failure_code,
         "type_specific_details": type_details,
+        "question_alignment": question_alignment,
         "reasoning_ir": reasoning_ir.as_dict(),
         "programmatic_gates": programmatic_gates,
         "gate_results": programmatic_gates.get("gates", {}),
@@ -3238,9 +4795,68 @@ def _hotpot_comparison_decision(details: dict[str, Any]) -> str:
     op = str(details.get("comparison_operator", "compare"))
     a = str(details.get("attribute_a", ""))
     b = str(details.get("attribute_b", ""))
+    entity_a = str(details.get("entity_a", ""))
+    entity_b = str(details.get("entity_b", ""))
     if op == "same":
         return "yes" if a and b and (_hotpot_terms(a) & _hotpot_terms(b) or normalize_bridge(a) == normalize_bridge(b)) else "no"
+    number_a = _hotpot_first_numeric_value(a)
+    number_b = _hotpot_first_numeric_value(b)
+    if number_a is not None and number_b is not None and entity_a and entity_b:
+        if op in {"greater_than", "younger"}:
+            return entity_a if number_a > number_b else entity_b
+        if op in {"less_than", "older"}:
+            return entity_a if number_a < number_b else entity_b
     return "supported" if bool(details.get("answer_supported")) else "unsupported"
+
+
+def _hotpot_first_numeric_value(value: str) -> float | None:
+    match = re.search(r"[-+]?\d[\d,]*(?:\.\d+)?", str(value or ""))
+    if not match:
+        return None
+    try:
+        return float(match.group(0).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _hotpot_deterministic_topology_answer(
+    *,
+    row: dict[str, Any],
+    facts: list[dict[str, Any]],
+    view: Any,
+    reasoning_type: str,
+) -> str:
+    fact_by_id = {str(fact.get("fact_id") or ""): fact for fact in facts}
+    hop1 = fact_by_id.get(str((view.hop1_fact_ids or [""])[0]))
+    hop2 = fact_by_id.get(str((view.hop2_fact_ids or [""])[0]))
+    if not hop1 or not hop2:
+        return ""
+    verdict = _hotpot_verify_semantic_chain(
+        row,
+        str(view.bridge_entity or ""),
+        hop1,
+        hop2,
+        reasoning_type_override=reasoning_type,
+    )
+    if not bool(verdict.get("programmatic_gates", {}).get("pass")):
+        return ""
+    details = verdict.get("type_specific_details", {})
+    if not isinstance(details, dict):
+        return ""
+    if reasoning_type in {"bridge_entity", "bridge_attribute"}:
+        relation_endpoints = verdict.get("relation_endpoints", {})
+        hop2_relation = relation_endpoints.get("hop2", {}) if isinstance(relation_endpoints, dict) else {}
+        return str(hop2_relation.get("target_entity") or hop2_relation.get("object") or "").strip()
+    if reasoning_type == "comparison_attribute":
+        answer = _hotpot_comparison_decision(details)
+        return "" if answer in {"supported", "unsupported"} else answer
+    if reasoning_type == "shared_property_yesno":
+        return "yes" if bool(details.get("answer_supported")) else "no"
+    intersection = sorted(
+        _hotpot_terms(str(details.get("attribute_a", "")))
+        & _hotpot_terms(str(details.get("attribute_b", "")))
+    )
+    return " ".join(intersection)
 
 
 def _hotpot_verification_score(
@@ -3372,14 +4988,168 @@ def _hotpot_answer_mode(row: dict[str, Any], reasoning_type: str) -> str:
     return "short_answer"
 
 
+def _hotpot_first_hop_plan(row: dict[str, Any]) -> dict[str, Any]:
+    """Classify how the first hop should be grounded.
+
+    ``question_entities`` are not all subject anchors.  In particular,
+    questions such as ``the university whose main campus is in Lawrence``
+    expose an *object* anchor while ``the woman who portrayed Corliss Archer``
+    describes an unknown variable.  Keeping this plan explicit prevents the
+    constructor from treating every extracted phrase as ``subject_anchor``.
+    """
+    model_plan = row.get("_model_semantic_plan")
+    if isinstance(model_plan, dict):
+        model_mode = str(model_plan.get("first_hop_mode", "")).strip()
+        model_constraints = [
+            dict(item) for item in model_plan.get("first_hop_constraints", [])
+            if isinstance(item, dict) and str(item.get("anchor", "")).strip()
+        ]
+        known_entity = str(model_plan.get("first_hop_known_entity", "")).strip()
+        if model_mode in _HOTPOT_PLAN_FIRST_HOP_MODES and (model_constraints or known_entity or model_mode == "explicit_entity"):
+            return {
+                "mode": model_mode,
+                "variable": str(model_plan.get("first_hop_variable", "X") or "X"),
+                "anchor_role": "object_anchor" if model_mode in {"attribute_reverse", "descriptive_entity"} else "subject_anchor",
+                "anchor": known_entity,
+                "constraints": model_constraints,
+            }
+    question = str(row.get("question", ""))
+    q = question.lower()
+    entities = [str(item).strip() for item in row.get("question_entities", []) if str(item).strip()]
+
+    # Descriptive entity queries introduce a variable before they name the
+    # entity that constrains it.  The variable is the first-hop subject.
+    descriptive = bool(re.search(
+        r"\b(?:the\s+)?(?:woman|man|person|actor|actress|screenwriter|writer|singer|game|song|film|pilot|driver)\s+"
+        r"(?:who|that|which)\b|\bwith\s+credits\s+for\b|\bwriter\s+of\b|\bdesigned\s+by\b|\binspired\s+by\b|\b(?:pilot|driver)\s+.*\bfly\b",
+        q,
+    ))
+    portrayed = re.search(
+        r"\b(?:woman|man|person|actor|actress)\s+who\s+(?:portrayed|played|starred(?:\s+as)?)\s+([^,?]+)",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if portrayed:
+        anchor = _hotpot_clean_extracted_value(portrayed.group(1))
+        return {
+            "mode": "descriptive_entity",
+            "variable": "X",
+            "anchor_role": "object_anchor",
+            "constraints": [{
+                "anchor": anchor,
+                "relation": "acted_in",
+                "direction": "target_to_source",
+                "source_var": "X",
+                "target_var": "X",
+                "target_role": "PERSON",
+                "resolution_type": "descriptive_constraint",
+                "confidence": 0.9,
+            }],
+        }
+
+    if descriptive:
+        quoted = re.findall(r"[\"']([^\"']{2,120})[\"']", question)
+        anchor = quoted[0].strip() if quoted else ""
+        relation = "unresolved"
+        if re.search(r"\binspired\s+by\b", q):
+            relation = "inspired_by"
+        elif re.search(r"\bcredits?\s+for\b", q):
+            relation = "credited_for"
+        elif re.search(r"\b(?:writer|written|wrote)\b", q):
+            relation = "written_by"
+        elif re.search(r"\bdesigned\s+by\b", q):
+            relation = "designed_by"
+        elif re.search(r"\bfly\b", q):
+            relation = "flown_by"
+        if not anchor:
+            box_set = re.search(r"\bbox\s+set\s+([A-Z][^?]+)", question)
+            if box_set:
+                anchor = _hotpot_clean_extracted_value(box_set.group(1))
+        if not anchor and entities:
+            # Entity extraction may split apostrophized titles; prefer the
+            # longest question-side span rather than a context title.
+            anchor = max(entities, key=len)
+        if not anchor:
+            # Use a compact descriptive object when no quoted title exists.
+            match = re.search(r"\b(?:for|on|in)\s+([^,?]+)", question, flags=re.IGNORECASE)
+            anchor = _hotpot_clean_extracted_value(match.group(1)) if match else ""
+        if anchor and relation != "unresolved":
+            return {
+                "mode": "descriptive_entity",
+                "variable": "X",
+                "anchor_role": "object_anchor",
+                "constraints": [{
+                    "anchor": anchor,
+                    "relation": relation,
+                    "direction": "target_to_source",
+                    "source_var": "X",
+                    "target_var": "X",
+                    "target_role": "PERSON",
+                    "resolution_type": "descriptive_constraint",
+                    "confidence": 0.72,
+                }],
+            }
+
+    # Attribute reverse lookup: the sought entity is the subject of a fact,
+    # while the question gives one or more object/property anchors.  This is
+    # the Kansas Song pattern (University -> campus location -> Lawrence/KC).
+    if re.search(r"\bwhose\b", q) and re.search(r"\b(?:is|are|was|were)\s+in\b", q):
+        anchors: list[str] = []
+        main = re.search(r"\bmain\s+campus\s+is\s+in\s+([^,?]+)", question, flags=re.IGNORECASE)
+        branch = re.search(r"\bbranch\s+campuses\s+are\s+in\s+(?:the\s+)?([^?]+?)(?:\s+metropolitan\s+area|\s+area|[,?])", question, flags=re.IGNORECASE)
+        if main:
+            anchors.append(_hotpot_clean_extracted_value(main.group(1)))
+        if branch:
+            anchors.append(_hotpot_clean_extracted_value(branch.group(1)))
+        if not anchors:
+            # Preserve only likely location phrases; do not treat a bare
+            # state name as the first-hop entity when a city is present.
+            anchors = [item for item in entities if len(item.split()) > 1 or "city" in item.lower()]
+        anchors = list(dict.fromkeys(item for item in anchors if item))
+        if anchors:
+            return {
+                "mode": "attribute_reverse",
+                "variable": "X",
+                "anchor_role": "object_anchor",
+                "constraints": [
+                    {
+                        "anchor": anchor,
+                        "relation": "located_in",
+                        "direction": "target_to_source",
+                        "source_var": "X",
+                        "target_var": "X",
+                        "target_role": "ENTITY",
+                        "resolution_type": "object_anchor",
+                        "confidence": 0.82,
+                    }
+                    for anchor in anchors[:2]
+                ],
+            }
+
+    # Explicit entity questions start from a named subject.  This remains the
+    # default for ordinary bridge/comparison questions.
+    return {
+        "mode": "explicit_entity",
+        "variable": "",
+        "anchor_role": "subject_anchor",
+        "constraints": [],
+    }
+
+
 def _hotpot_topology_classification(row: dict[str, Any]) -> dict[str, Any]:
     q = str(row.get("question", "")).lower()
     entity_a, entity_b = _hotpot_question_entities(row)
     entities = tuple(entity for entity in (entity_a, entity_b) if entity)
+    first_hop = _hotpot_first_hop_plan(row)
+    model_plan = row.get("_model_semantic_plan")
     family = "compositional"
     reasoning_type = "bridge_entity"
     confidence = 0.72
-    if re.search(r"^(are|were|was|is|do|does|did)\b", q) and re.search(r"\bboth\b|\band\b|\bsame\b", q):
+    if isinstance(model_plan, dict) and str(model_plan.get("reasoning_type", "")) in _HOTPOT_PLAN_TOPOLOGIES:
+        family = str(model_plan.get("reasoning_family") or _hotpot_reasoning_family_for_type(str(model_plan["reasoning_type"])))
+        reasoning_type = str(model_plan["reasoning_type"])
+        confidence = float(model_plan.get("confidence", 0.0) or 0.0)
+    elif re.search(r"^(are|were|was|is|do|does|did)\b", q) and re.search(r"\bboth\b|\band\b|\bsame\b", q):
         family = "parallel"
         if re.search(r"\bboth\b", q):
             reasoning_type = "shared_property_yesno"
@@ -3412,15 +5182,64 @@ def _hotpot_topology_classification(row: dict[str, Any]) -> dict[str, Any]:
         reasoning_type = "bridge_attribute"
         confidence = 0.74
     compatible = tuple(_hotpot_candidate_topologies_for_family(family, primary=reasoning_type, confidence=confidence))
+    model_distribution = model_plan.get("topology_distribution", []) if isinstance(model_plan, dict) else []
+    distribution = [dict(item) for item in model_distribution if isinstance(item, dict)]
+    if not distribution:
+        distribution = _hotpot_topology_distribution(row, primary=reasoning_type, family=family, confidence=confidence)
+    model_relation = str(model_plan.get("requested_relation", "")).strip() if isinstance(model_plan, dict) else ""
+    model_attribute = str(model_plan.get("requested_attribute", "")).strip() if isinstance(model_plan, dict) else ""
+    model_answer_mode = str(model_plan.get("answer_mode", "")).strip() if isinstance(model_plan, dict) else ""
     return {
         "reasoning_family": family,
         "reasoning_type": reasoning_type,
         "confidence": confidence,
         "compatible_topologies": compatible,
         "entities_in_question": entities,
-        "requested_relation": _hotpot_question_relation_label(row),
-        "answer_mode": _hotpot_answer_mode(row, reasoning_type),
+        "requested_relation": model_relation or _hotpot_question_relation_label(row),
+        "requested_attribute": model_attribute or _hotpot_question_attribute_slot(row),
+        "answer_mode": model_answer_mode or _hotpot_answer_mode(row, reasoning_type),
+        "first_hop_mode": str(first_hop.get("mode", "explicit_entity")),
+        "first_hop_variable": str(first_hop.get("variable", "")),
+        "first_hop_anchor": str(first_hop.get("anchor", "")),
+        "first_hop_anchor_role": str(first_hop.get("anchor_role", "subject_anchor")),
+        "first_hop_constraints": list(first_hop.get("constraints", [])),
+        "topology_distribution": distribution,
+        "topology_probabilities": {item["topology"]: item["probability"] for item in distribution},
     }
+
+
+def _hotpot_topology_distribution(
+    row: dict[str, Any], *, primary: str, family: str, confidence: float,
+) -> list[dict[str, Any]]:
+    """A small calibrated hypothesis distribution, rather than a fatal label."""
+    q = str(row.get("question", "")).lower()
+    topologies = ["bridge_entity", "bridge_attribute", "comparison_attribute", "shared_property_yesno", "set_intersection", "multi_constraint_lookup"]
+    scores = {item: 0.05 for item in topologies}
+    scores[primary] = max(scores[primary], confidence)
+    if family == "parallel":
+        scores["comparison_attribute"] += 0.18
+        scores["shared_property_yesno"] += 0.16
+        scores["set_intersection"] += 0.10
+    elif family == "constraint":
+        scores["multi_constraint_lookup"] += 0.18
+        scores["bridge_attribute"] += 0.12
+    else:
+        scores["bridge_attribute"] += 0.16
+        scores["bridge_entity"] += 0.12
+        scores["multi_constraint_lookup"] += 0.08
+    if re.search(r"\b(which|who|what)\b.*\bor\b", q) or re.search(r"\b(older|younger|larger|smaller|higher|lower|more|less)\b", q):
+        scores["comparison_attribute"] += 0.22
+        scores["bridge_entity"] += 0.06
+    if re.search(r"\b(both|same|shared|common|intersection)\b", q):
+        scores["shared_property_yesno"] += 0.16
+        scores["set_intersection"] += 0.10
+    if q.count(" and ") >= 1 and re.search(r"\b(which|what|who)\b", q):
+        scores["multi_constraint_lookup"] += 0.16
+    total = sum(scores.values()) or 1.0
+    return [
+        {"topology": topology, "probability": round(score / total, 6)}
+        for topology, score in sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    ]
 
 
 def _hotpot_question_semantics(row: dict[str, Any]) -> HotpotQuestionSemantics:
@@ -3431,8 +5250,32 @@ def _hotpot_question_semantics(row: dict[str, Any]) -> HotpotQuestionSemantics:
     compatible_topologies = tuple(str(item) for item in classification["compatible_topologies"])
     entities_in_question = tuple(str(item) for item in classification["entities_in_question"])
     requested_relation = str(classification["requested_relation"])
+    requested_attribute = str(classification.get("requested_attribute", ""))
     answer_mode = str(classification["answer_mode"])
+    first_hop_mode = str(classification.get("first_hop_mode", "explicit_entity"))
+    first_hop_variable = str(classification.get("first_hop_variable", ""))
+    first_hop_constraints = tuple(
+        HotpotConstraint(
+            anchor=str(item.get("anchor", "")),
+            relation=str(item.get("relation", "unresolved")),
+            direction=str(item.get("direction", "anchor_to_target")),
+            target_role=str(item.get("target_role", "ANY_RESOLVED")),
+            source_var=str(item.get("source_var", "")),
+            target_var=str(item.get("target_var", "X")),
+            depends_on=str(item.get("depends_on", "")),
+            context_title=str(item.get("context_title", "")),
+            resolution_type=str(item.get("resolution_type", "unresolved")),
+            confidence=float(item.get("confidence", 0.0) or 0.0),
+        )
+        for item in classification.get("first_hop_constraints", [])
+        if isinstance(item, dict)
+    )
     entity_a, entity_b = _hotpot_question_entities(row)
+    if not entity_a and first_hop_mode == "explicit_entity":
+        model_anchor = str(classification.get("first_hop_anchor", ""))
+        if not model_anchor and classification.get("first_hop_constraints"):
+            model_anchor = str(classification.get("first_hop_constraints", [{}])[0].get("anchor", ""))
+        entity_a = model_anchor
     target_relation = requested_relation
     expected_role = _hotpot_expected_answer_role(row)
     common = {
@@ -3442,7 +5285,11 @@ def _hotpot_question_semantics(row: dict[str, Any]) -> HotpotQuestionSemantics:
         "compatible_topologies": compatible_topologies,
         "entities_in_question": entities_in_question,
         "requested_relation": requested_relation,
+        "requested_attribute": requested_attribute,
         "answer_mode": answer_mode,
+        "first_hop_mode": first_hop_mode,
+        "first_hop_variable": first_hop_variable,
+        "first_hop_constraints": first_hop_constraints,
     }
     if reasoning_type == "bridge_entity":
         qs = HotpotQuestionSemantics(
@@ -3940,16 +5787,15 @@ def _hotpot_bridge_hypothesis_match_type(
 
 
 def _hotpot_question_entities(row: dict[str, Any]) -> tuple[str, str]:
-    entities = [str(item).strip() for item in row.get("entities", []) if str(item).strip()]
+    # Question-side entities are a distinct input field.  Never use context
+    # titles as an implicit fallback: HotpotQA deliberately contains distractor
+    # titles, and doing so changes the question being solved.
+    raw_entities = row.get("question_entities", [])
+    entities = [str(item).strip() for item in raw_entities if str(item).strip()]
     if len(entities) >= 2:
         return entities[0], entities[1]
     if len(entities) == 1:
         return entities[0], ""
-    extracted = _hotpot_entities_in_text(str(row.get("question", "")))
-    if len(extracted) >= 2:
-        return extracted[0], extracted[1]
-    if len(extracted) == 1:
-        return extracted[0], ""
     return "", ""
 
 
@@ -3963,6 +5809,18 @@ def _hotpot_fact_supports_entity(fact: dict[str, Any], entity: str) -> bool:
 def _hotpot_parallel_attribute_value(row: dict[str, Any], fact: dict[str, Any], entity: str) -> str:
     text = str(fact.get("text", ""))
     q = str(row.get("question", "")).lower()
+    if _hotpot_question_attribute_slot(row) in {"seated_capacity", "total_capacity", "capacity"}:
+        capacity_value = _hotpot_extract_capacity_value(row, text)
+        if capacity_value:
+            return capacity_value
+    if any(term in q for term in ("older", "younger", "born", "year")):
+        match = re.search(r"\b(1[5-9]\d{2}|20\d{2})\b", text)
+        if match:
+            return match.group(1)
+    if any(term in q for term in ("larger", "smaller", "higher", "lower", "more", "less", "capacity")):
+        match = re.search(r"\b\d[\d,]*(?:\.\d+)?\b", text)
+        if match:
+            return match.group(0)
     if "genus" in q and "genus" in text.lower():
         return "genus"
     if "nationality" in q:
@@ -3970,9 +5828,9 @@ def _hotpot_parallel_attribute_value(row: dict[str, Any], fact: dict[str, Any], 
         if match:
             return match.group(1)
     if "neighborhood" in q or "located" in q or "where" in q:
-        match = re.search(r"\bin\s+([A-Z][A-Za-z'’.-]+(?:\s+[A-Z][A-Za-z'’.-]+){0,3})", text)
+        match = re.search(r"\bin\s+([^.;]+)", text)
         if match:
-            return match.group(1).strip()
+            return _hotpot_clean_extracted_value(match.group(1))
     if "formed by" in q or "founded by" in q:
         match = re.search(r"\b(?:formed|founded|created)\s+(?:in\s+\d{4}\s+)?by\s+([A-Z][A-Za-z0-9&'’.-]+(?:\s+[A-Z][A-Za-z0-9&'’.-]+){0,4})", text)
         if match:
@@ -4041,7 +5899,57 @@ def _hotpot_multi_constraint_graph(row: dict[str, Any]) -> dict[str, Any]:
 
 def _hotpot_parse_multi_constraints(row: dict[str, Any]) -> list[dict[str, str]]:
     question = str(row.get("question", ""))
-    entities = [str(item).strip() for item in row.get("entities", []) if str(item).strip()]
+    entities = [str(item).strip() for item in row.get("question_entities", []) if str(item).strip()]
+    first_hop = _hotpot_first_hop_plan(row)
+    planned = [dict(item) for item in first_hop.get("constraints", []) if isinstance(item, dict)]
+    if planned and str(first_hop.get("mode")) in {"attribute_reverse", "descriptive_entity"}:
+        # A first-hop plan is already a question-derived constraint graph.  A
+        # second constraint (when present) is convergent; serial descriptive
+        # questions append their answer relation below.
+        if str(first_hop.get("mode")) == "descriptive_entity" and planned[0].get("relation") == "acted_in":
+            answer_relation = "position" if re.search(r"\b(position|office|served as|held)\b", question, flags=re.IGNORECASE) else "unresolved"
+            if answer_relation != "unresolved":
+                planned.append({
+                    "anchor": "X",
+                    "relation": answer_relation,
+                    "direction": "anchor_to_target",
+                    "source_var": "X",
+                    "target_var": "Y",
+                    "depends_on": "X",
+                    "target_role": _hotpot_expected_answer_role(row),
+                    "resolution_type": "variable_bound",
+                    "confidence": 0.8,
+                })
+                for item in planned:
+                    item["constraint_graph_type"] = "serial"
+                    item["answer_var"] = "Y"
+                return planned
+        if len(planned) >= 2:
+            for item in planned:
+                item["constraint_graph_type"] = "convergent_shared_target"
+                item["answer_var"] = "X"
+            return planned[:2]
+        # A model may provide only the reverse first hop and put the requested
+        # answer relation in ``requested_relation``.  Turn that into an
+        # executable serial edge instead of treating the plan as incomplete.
+        requested_relation = str(row.get("_model_semantic_plan", {}).get("requested_relation", "")).strip()
+        if len(planned) == 1 and requested_relation and requested_relation != "unresolved":
+            bound_var = str(planned[0].get("target_var", "X") or "X")
+            planned.append({
+                "anchor": bound_var,
+                "relation": requested_relation,
+                "direction": "anchor_to_target",
+                "source_var": bound_var,
+                "target_var": "Y",
+                "depends_on": bound_var,
+                "target_role": _hotpot_expected_answer_role(row),
+                "resolution_type": "model_plan_target_relation",
+                "confidence": float(planned[0].get("confidence", 0.0) or 0.0),
+            })
+            for item in planned:
+                item["constraint_graph_type"] = "serial"
+                item["answer_var"] = "Y"
+            return planned
     serial = _hotpot_parse_serial_multi_constraints(row, question, entities)
     if serial:
         return serial
@@ -4130,8 +6038,30 @@ def _hotpot_resolve_anchor(row: dict[str, Any], surface: str) -> ResolvedAnchor:
     surface_text = str(surface or "").strip()
     surface_key = normalize_bridge(surface_text)
     titles = _hotpot_context_titles(row)
+    question_entities = [str(item).strip() for item in row.get("question_entities", []) if str(item).strip()]
+    # Resolution may use a context title only as provenance for an anchor that
+    # is already present in the question.  A distractor title must never turn
+    # into a new question-side anchor.
+    question_entity_match = next(
+        (entity for entity in question_entities if normalize_bridge(entity) == surface_key),
+        "",
+    )
+    if not question_entity_match:
+        for entity in question_entities:
+            entity_key = normalize_bridge(entity)
+            if entity_key and (entity_key in surface_key or surface_key in entity_key):
+                question_entity_match = entity
+                break
+    if not question_entity_match:
+        return ResolvedAnchor(
+            surface=surface_text,
+            canonical=surface_text,
+            aliases=(surface_text,),
+            resolution_type="unresolved",
+            confidence=0.0,
+        )
     for title in titles:
-        if normalize_bridge(title) == surface_key:
+        if normalize_bridge(title) == normalize_bridge(question_entity_match):
             return ResolvedAnchor(
                 surface=surface_text,
                 canonical=title,
@@ -4143,7 +6073,7 @@ def _hotpot_resolve_anchor(row: dict[str, Any], surface: str) -> ResolvedAnchor:
             )
     for title in titles:
         title_key = normalize_bridge(title)
-        if title_key and (title_key in surface_key or surface_key in title_key):
+        if title_key and (title_key in normalize_bridge(question_entity_match) or normalize_bridge(question_entity_match) in title_key):
             return ResolvedAnchor(
                 surface=surface_text,
                 canonical=title,
@@ -4153,9 +6083,9 @@ def _hotpot_resolve_anchor(row: dict[str, Any], surface: str) -> ResolvedAnchor:
                 resolution_type="normalized_title",
                 confidence=0.9,
             )
-    for index, entity in enumerate(row.get("entities", []), start=1):
+    for index, entity in enumerate(question_entities, start=1):
         entity_text = str(entity).strip()
-        if normalize_bridge(entity_text) == surface_key:
+        if normalize_bridge(entity_text) == normalize_bridge(question_entity_match):
             return ResolvedAnchor(
                 surface=surface_text,
                 canonical=entity_text,
@@ -4225,10 +6155,18 @@ def _hotpot_best_constraint_binding(
         source_entity = str(relation.get("source_entity", ""))
         target_entity = str(relation.get("target_entity", ""))
         anchor = str(constraint.get("anchor", ""))
-        anchor_match = _hotpot_entities_equivalent(source_entity, anchor)
+        direction = str(constraint.get("direction", "anchor_to_target"))
+        reverse_anchor = direction in {"target_to_source", "object_anchor", "reverse"}
+        anchor_match = (
+            _hotpot_entities_equivalent(target_entity, anchor)
+            if reverse_anchor
+            else _hotpot_entities_equivalent(source_entity, anchor)
+        )
         relation_match_type = _hotpot_relation_match_type(str(relation.get("relation", "")), str(constraint.get("relation", "")))
         relation_match = relation_match_type in {"exact", "compatible"}
-        target = target_entity
+        # For an object-anchored constraint the variable is the fact subject;
+        # for an explicit subject anchor it is the fact object.
+        target = source_entity if reverse_anchor else target_entity
         if (
             not anchor_match
             and _hotpot_canonical_relation(observed_relation) in {"acted_in"}
@@ -4251,6 +6189,7 @@ def _hotpot_best_constraint_binding(
         candidates.append({
             "fact_id": fact_id,
             "anchor_match": anchor_match,
+            "anchor_direction": "object_to_subject" if reverse_anchor else "subject_to_object",
             "relation_match": relation_match,
             "relation_match_type": relation_match_type,
             "observed_anchor": source_entity,
@@ -4264,6 +6203,7 @@ def _hotpot_best_constraint_binding(
     return candidates[0] if candidates else {
         "fact_id": "",
         "anchor_match": False,
+        "anchor_direction": "subject_to_object",
         "relation_match": False,
         "relation_match_type": "mismatch",
         "observed_anchor": "",
@@ -4277,7 +6217,7 @@ def _hotpot_best_constraint_binding(
 
 def _hotpot_relation_target_terms(row: dict[str, Any]) -> set[str]:
     terms = set(_hotpot_target_terms(str(row.get("question", ""))))
-    for entity in row.get("entities", []):
+    for entity in row.get("question_entities", []):
         terms -= _hotpot_terms(str(entity))
     return terms
 
@@ -4360,11 +6300,52 @@ def _hotpot_fact_semantics(row: dict[str, Any], fact: dict[str, Any]) -> dict[st
     }
 
 
+def _hotpot_extract_capacity_value(row: dict[str, Any], text: str) -> str:
+    """Extract the number matching the question's capacity attribute slot."""
+    slot = _hotpot_question_attribute_slot(row)
+    value = str(text or "")
+    if slot == "seated_capacity":
+        # Prefer an explicitly seated value, including the common
+        # ``4,000 capacity (3,677 seated)`` form.
+        match = re.search(r"(\d[\d,]*(?:\.\d+)?)\s*(?:people\s+)?seated\b", value, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+        match = re.search(r"\b(?:can\s+seat|seats?|seated)\s*[:=]?\s*(\d[\d,]*(?:\.\d+)?)", value, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    if slot == "total_capacity":
+        match = re.search(r"\b(?:total|overall|max(?:imum)?)\s+capacity\s*(?:of|is|:)?\s*(\d[\d,]*(?:\.\d+)?)", value, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+        match = re.search(r"\bcapacity\s*(?:of|is|:)?\s*(\d[\d,]*(?:\.\d+)?)", value, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    # Generic capacity questions retain the existing relation-local behavior,
+    # but still prefer a number adjacent to the capacity predicate.
+    match = re.search(r"\b(?:can\s+seat|seats?|seated|capacity(?:\s+of)?)\s*[:=]?\s*(\d[\d,]*(?:\.\d+)?)", value, flags=re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.search(r"\b(\d[\d,]*(?:\.\d+)?)\s*(?:seats?|capacity)\b", value, flags=re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
 def _hotpot_extract_relation_semantics(row: dict[str, Any], fact: dict[str, Any]) -> RelationSemantics:
     title = str(fact.get("title", "")).strip()
     text = str(fact.get("text", ""))
     relation = _hotpot_relation_label(str(row.get("question", "")), text)
     subject = _hotpot_extract_subject(title, text)
+
+    if relation == "capacity":
+        capacity_value = _hotpot_extract_capacity_value(row, text)
+        if capacity_value:
+            return RelationSemantics(
+                predicate="capacity",
+                subject=subject,
+                object=capacity_value,
+                direction="anchor_to_target",
+                object_role="LITERAL",
+                confidence=0.95,
+            )
 
     active = re.search(r"^([^.;,]+?)\s+(wrote|authored|created|directed)\s+([^.;,]+)", text, flags=re.IGNORECASE)
     if active:
@@ -4396,10 +6377,12 @@ def _hotpot_extract_relation_semantics(row: dict[str, Any], fact: dict[str, Any]
         ("directed_by", rf"\b{re.escape(title)}\b.*?\b(?:was\s+)?directed\s+by\s+([^.;,]+)", title, 1),
         ("formed_by", rf"\b{re.escape(title)}\b.*?\b(?:was\s+)?(?:formed|founded|established)\s+(?:in\s+\d{{4}}\s+)?by\s+([^.;,]+)", title, 1),
         ("created_by", rf"\b{re.escape(title)}\b.*?\b(?:was\s+)?created\s+by\s+([^.;,]+)", title, 1),
-        ("home_venue", rf"\b{re.escape(title)}\b.*?\b(?:played|plays|play)\s+(?:their\s+)?home\s+games\s+at\s+([^.;,]+)", title, 1),
-        ("home_venue", rf"\b{re.escape(title)}\b.*?\bhome\s+(?:arena|venue|stadium)\s+(?:is|was)\s+([^.;,]+)", title, 1),
-        ("located_in", rf"\b{re.escape(title)}\b.*?\bbased\s+in\s+([^.;,]+)", title, 1),
-        ("born_in", rf"\b{re.escape(title)}\b.*?\bborn\s+in\s+([^.;,]+)", title, 1),
+        ("home_venue", rf"\b{re.escape(title)}\b.*?\b(?:played|plays|play)\s+(?:their\s+)?home\s+games\s+at\s+([^.;]+)", title, 1),
+        ("home_venue", rf"\b{re.escape(title)}\b.*?\bhome\s+(?:arena|venue|stadium)\s+(?:is|was)\s+([^.;]+)", title, 1),
+        ("located_in", rf"\b{re.escape(title)}\b.*?\bbased\s+in\s+([^.;]+)", title, 1),
+        ("located_in", rf"\b{re.escape(title)}\b.*?\b(?:campus|headquartered|located)\b[^.;]*?\bin\s+([^.;]+)", title, 1),
+        ("located_in", rf"\b{re.escape(title)}\b.*?\bis\s+in\s+([^.;]+)", title, 1),
+        ("born_in", rf"\b{re.escape(title)}\b.*?\bborn\s+in\s+([^.;]+)", title, 1),
         ("capacity", rf"\b{re.escape(title)}\b.*?\b(?:can\s+seat|seats|capacity(?:\s+of)?)\s+(\d[\d,]*)", title, 1),
     ]
     for predicate, pattern, fixed_subject, object_group in patterns:
@@ -4456,6 +6439,12 @@ def _hotpot_extract_subject(title: str, text: str) -> str:
     entities = _hotpot_entities_in_text(text)
     if title and any(_hotpot_entities_equivalent(title, entity) for entity in entities):
         return title
+    # Hotpot sentences are frequently title-bound and use pronouns or a
+    # shortened noun phrase instead of repeating the article title.  Preserve
+    # the title as the subject before falling back to an arbitrary capitalized
+    # token such as ``Mount`` or ``There``.
+    if title:
+        return title
     return entities[0] if entities else "unresolved"
 
 
@@ -4471,10 +6460,16 @@ def _hotpot_extract_object_value(row: dict[str, Any], fact: dict[str, Any], *, s
     if relation == "unresolved":
         return "unresolved", "unresolved"
     if relation in {"located_in", "location", "born_in"}:
-        match = re.search(r"\b(?:located|born|based)\s+(?:at|in|on)\s+([A-Z][A-Za-z'’.-]+(?:\s+[A-Z][A-Za-z'’.-]+){0,3})", text)
+        match = re.search(r"\b(?:main|branch|regional|city|state)?\s*campus(?:es)?\s+(?:is|are)?\s*in\s+(?:the\s+)?([A-Z][A-Za-z .'-]+?)(?=,|\s+metropolitan\s+area|\s+area|\.|$)", text)
         if match:
             return _hotpot_clean_extracted_value(match.group(1)), "entity"
-        match = re.search(r"\bin\s+([A-Z][A-Za-z'’.-]+(?:\s+[A-Z][A-Za-z'’.-]+){0,3})", text)
+        match = re.search(r"\b(?:headquartered|located|based)\s+in\s+(?:the\s+)?([A-Z][A-Za-z .'-]+?)(?=,|\.|$)", text)
+        if match:
+            return _hotpot_clean_extracted_value(match.group(1)), "entity"
+        match = re.search(r"\b(?:located|born|based)\s+(?:at|in|on)\s+([^.;]+)", text, flags=re.IGNORECASE)
+        if match:
+            return _hotpot_clean_extracted_value(match.group(1)), "entity"
+        match = re.search(r"\bin\s+([^.;]+)", text, flags=re.IGNORECASE)
         if match:
             return _hotpot_clean_extracted_value(match.group(1)), "entity"
     if relation in {"formed_by", "founded_by", "created_by", "written_by"} or "formed by" in q or "founded by" in q:
@@ -4497,9 +6492,9 @@ def _hotpot_extract_object_value(row: dict[str, Any], fact: dict[str, Any], *, s
         if match:
             return _hotpot_clean_extracted_value(match.group(1)), "entity"
     if relation == "capacity":
-        match = re.search(r"\b(?:can\s+seat|seats|capacity(?:\s+of)?)\s+(\d[\d,]*)", text, flags=re.IGNORECASE)
-        if match:
-            return match.group(1), "LITERAL"
+        capacity_value = _hotpot_extract_capacity_value(row, text)
+        if capacity_value:
+            return capacity_value, "LITERAL"
     if relation == "position":
         match = re.search(r"\b(?:served\s+as|held\s+the\s+position\s+of|position\s+of)\s+([^.;,]+)", text, flags=re.IGNORECASE)
         if match:
@@ -4519,7 +6514,7 @@ def _hotpot_clean_extracted_value(value: str) -> str:
 
 def _hotpot_question_side_entity(row: dict[str, Any], fact: dict[str, Any]) -> str:
     title = str(fact.get("title", "")).strip()
-    entities = [str(item) for item in row.get("entities", []) if str(item).strip()]
+    entities = [str(item) for item in row.get("question_entities", []) if str(item).strip()]
     for entity in entities:
         if _hotpot_entities_equivalent(entity, title):
             return title
@@ -4552,6 +6547,13 @@ def _hotpot_answer_side_entity(row: dict[str, Any], fact: dict[str, Any]) -> str
 
 def _hotpot_relation_label(question: str, text: str) -> str:
     value = str(text).lower()
+    question_value = str(question).lower()
+    nationality_question = "nationality" in question_value or re.search(r"\b(?:same|different)\s+(?:nationality|country|citizenship)\b", question_value)
+    # Copular nationality/attribute statements must be recognized before
+    # source-side verbs such as "director".  Otherwise
+    # "X is an American director" is incorrectly tagged directed_by.
+    if nationality_question and re.search(r"\b(?:is|was|were|are)\s+(?:an?\s+)?(?:american|british|canadian|french|german|italian|dutch|greek|south korean|korean|turkish|ottoman)\b", value):
+        return "nationality"
     if "home games" in value or "home venue" in value or re.search(r"\bplayed\b.*\bat\b", value):
         return "home_venue"
     if "capacity" in value or re.search(r"\b(can seat|seats|seated)\b", value):
@@ -4572,9 +6574,9 @@ def _hotpot_relation_label(question: str, text: str) -> str:
         return "directed_by"
     if "born" in value:
         return "born_in"
-    if "nationality" in value or "american" in value or "british" in value:
+    if nationality_question and ("nationality" in value or re.search(r"\b(?:american|british|canadian|french|german|italian|dutch|greek|korean|turkish|ottoman)\b", value)):
         return "nationality"
-    if "located" in value or "city" in value or "country" in value:
+    if "located" in value or "city" in value or "country" in value or re.search(r"\b(?:campus|headquartered|based)\b.*\bin\b", value) or re.search(r"\bis\s+in\s+[A-Z]", str(text)):
         return "located_in"
     if "starring" in value or "starred" in value or "actor" in value:
         return "acted_in"
@@ -4584,7 +6586,7 @@ def _hotpot_relation_label(question: str, text: str) -> str:
 def _hotpot_endpoint_matches_question_side(row: dict[str, Any], entity: str) -> bool:
     if not str(entity).strip():
         return False
-    row_entities = [str(item) for item in row.get("entities", []) if str(item).strip()]
+    row_entities = [str(item) for item in row.get("question_entities", []) if str(item).strip()]
     return any(_hotpot_entities_equivalent(entity, candidate) for candidate in row_entities) or bool(
         _hotpot_terms(entity) & _hotpot_terms(str(row.get("question", "")))
     )
@@ -4652,6 +6654,9 @@ def _hotpot_entity_aliases(value: Any) -> set[str]:
 def _hotpot_derive_answer_hint(question: str, hop1: dict[str, Any], hop2: dict[str, Any]) -> str:
     text = str(hop2.get("text", "") or hop1.get("text", ""))
     if "how many" in question.lower():
+        value = _hotpot_extract_capacity_value({"question": question}, text)
+        if value:
+            return value
         match = re.search(r"\b\d[\d,]*\b", text)
         return match.group(0) if match else ""
     if "when" in question.lower() or "what year" in question.lower():
@@ -4682,11 +6687,47 @@ def _hotpot_pair_as_dict(pair: dict[str, Any]) -> dict[str, Any]:
         "hop1_fact_id": str(pair.get("hop1", {}).get("fact_id", "")),
         "hop2_fact_id": str(pair.get("hop2", {}).get("fact_id", "")),
         "compatibility_score": float(pair.get("compatibility_score", 0.0) or 0.0),
+        "soft_compatibility_score": float(pair.get("soft_compatibility_score", pair.get("compatibility_score", 0.0)) or 0.0),
+        "compatibility_tier": int(pair.get("compatibility_tier", 3) or 3),
+        "compatibility_features": pair.get("compatibility_features", {}),
         "retrieval_score": float(pair.get("retrieval_score", 0.0) or 0.0),
         "semantic_chain_verification": pair.get("semantic_chain_verification", {}),
         "semantic_chain_score": float(pair.get("semantic_chain_score", pair.get("chain_score", 0.0)) or 0.0),
         "chain_score": float(pair.get("chain_score", 0.0) or 0.0),
     }
+
+
+def _hotpot_question_alignment_for_view(
+    *,
+    row: dict[str, Any],
+    view: Any,
+    facts: list[dict[str, Any]],
+    reasoning_type: str,
+) -> dict[str, Any]:
+    """Attach question-relative validity telemetry to every generated candidate."""
+    by_id = {str(fact.get("fact_id", "")): fact for fact in facts}
+    hop1_id = str(getattr(view, "hop1_fact_ids", [""])[0] if getattr(view, "hop1_fact_ids", []) else "")
+    hop2_id = str(getattr(view, "hop2_fact_ids", [""])[0] if getattr(view, "hop2_fact_ids", []) else "")
+    hop1 = by_id.get(hop1_id)
+    hop2 = by_id.get(hop2_id)
+    if not hop1 or not hop2:
+        return {
+            "pass": False,
+            "failure_code": "no_question_anchored_chain",
+            "question_anchor_covered": False,
+            "requested_relation_covered": False,
+            "answer_target_covered": False,
+            "topology_consistent_with_question": False,
+            "anchor_checks": {},
+        }
+    verdict = _hotpot_verify_semantic_chain(
+        row,
+        str(getattr(view, "bridge_entity", "")),
+        hop1,
+        hop2,
+        reasoning_type_override=reasoning_type,
+    )
+    return dict(verdict.get("question_alignment", {}))
 
 
 def _rank_hotpot_facts_for_terms(facts: list[dict[str, Any]], query: str, *, limit: int) -> list[dict[str, Any]]:
@@ -4707,6 +6748,7 @@ def hotpot_endpoint_binder_prompt(row: dict[str, Any], view: Any, fact1: dict[st
         "Return only JSON matching the schema.\n\n"
         f"Question:\n{row.get('question', '')}\n\n"
         f"Reasoning type hint:\n{reasoning_type}\n\n"
+        f"Requested attribute slot:\n{_hotpot_question_attribute_slot(row) or 'none'}\n\n"
         f"Candidate bridge hypothesis, for comparison only:\n{view.bridge_entity}\n\n"
         f"Fact 1 id: {fact1.get('fact_id', '')}\n"
         f"Fact 1 title: {fact1.get('title', '')}\n"
@@ -4755,6 +6797,84 @@ def _hotpot_bind_endpoints_with_model(
         do_sample=do_sample,
     )
     return parse_hotpot_endpoint_binding(text, reasoning_type=reasoning_type), metrics
+
+
+def _hotpot_retrieve_hop2_after_endpoint_binding(
+    *,
+    row: dict[str, Any],
+    facts: list[dict[str, Any]],
+    view: Any,
+    inferred_bridge: str,
+    reasoning_type: str,
+) -> tuple[Any, dict[str, Any]] | None:
+    """Re-run hop2 retrieval when endpoint binding changes the bridge.
+
+    The endpoint model used to relabel a candidate while retaining the old
+    evidence IDs.  This closes that gap: the inferred endpoint becomes the
+    anchor for relation-conditioned retrieval and only a hard-gated pair may
+    replace the original chain.
+    """
+    fact_by_id = {str(fact.get("fact_id") or ""): fact for fact in facts}
+    hop1_id = str((view.hop1_fact_ids or [""])[0])
+    hop1 = fact_by_id.get(hop1_id)
+    if not hop1:
+        return None
+    qsem = _hotpot_question_semantics(row)
+    evidence_index = _hotpot_evidence_index(row, facts)
+    hop2_pool = _hotpot_merge_fact_pool([
+        *_hotpot_rank_relation_specific_hop2(
+            row,
+            inferred_bridge,
+            facts,
+            reasoning_type=reasoning_type,
+            limit=30,
+        ),
+        *_hotpot_retrieve_by_anchor_relation(
+            evidence_index,
+            anchor=inferred_bridge,
+            relation=qsem.requested_relation or qsem.target_relation,
+            query_type="endpoint_rebound_answer_lookup",
+            topk=40,
+        ),
+    ])[:10]
+    pair_pool = _hotpot_rank_chain_pairs(
+        row,
+        inferred_bridge,
+        [hop1],
+        hop2_pool,
+        hard_gate=True,
+        reasoning_type=reasoning_type,
+    )
+    if not pair_pool:
+        return None
+    pair = pair_pool[0]
+    hop2_id = str(pair.get("hop2", {}).get("fact_id", ""))
+    if not hop2_id:
+        return None
+    rebound_view = build_hotpot_chain_view_from_facts(
+        candidate_id=str(view.candidate_id),
+        bridge_entity=inferred_bridge,
+        question=str(row.get("question", "")),
+        facts=facts,
+        hop1_fact_ids=[hop1_id],
+        hop2_fact_ids=[hop2_id],
+        derived_answer=str(pair.get("semantic_chain_verification", {}).get("derived_answer", "")),
+    )
+    return rebound_view, {
+        "hop2_pool": [_hotpot_scored_fact_as_dict(item) for item in hop2_pool],
+        "chain_pair_pool": [_hotpot_pair_as_dict(item) for item in pair_pool],
+        "endpoint_rebound": True,
+        "endpoint_rebound_bridge": inferred_bridge,
+        "endpoint_rebound_hop2_fact_id": hop2_id,
+    }
+
+
+def _sum_generation_metrics(*metrics: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "input_tokens": sum(int(item.get("input_tokens", 0) or 0) for item in metrics),
+        "output_tokens": sum(int(item.get("output_tokens", 0) or 0) for item in metrics),
+        "latency_sec": sum(float(item.get("latency_sec", 0.0) or 0.0) for item in metrics),
+    }
 
 
 def parse_hotpot_endpoint_binding(text: str, *, reasoning_type: str = "") -> HotpotEndpointBinding:
@@ -5089,6 +7209,45 @@ def _text_jaccard_similarity(left: Any, right: Any) -> float:
     return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
 
 
+def _hotpot_candidate_diversity(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    """Measure exploration after removing chains unrelated to the question."""
+    aligned_candidates = []
+    question_anchor_coverage_count = 0
+    valid_first_hop_anchors: set[str] = set()
+    aligned_chain_signatures: set[str] = set()
+    for candidate in candidates:
+        alignment = candidate.get("question_alignment", {})
+        if not isinstance(alignment, dict):
+            continue
+        if bool(alignment.get("question_anchor_covered")):
+            question_anchor_coverage_count += 1
+        first_hop_anchors = alignment.get("valid_first_hop_anchors")
+        if isinstance(first_hop_anchors, list):
+            valid_first_hop_anchors.update(
+                normalize_bridge(anchor) for anchor in first_hop_anchors if str(anchor).strip()
+            )
+        else:
+            for anchor, covered in (alignment.get("anchor_checks", {}) or {}).items():
+                if covered and str(anchor).strip():
+                    valid_first_hop_anchors.add(normalize_bridge(anchor))
+        if bool(alignment.get("pass")):
+            aligned_candidates.append(candidate)
+            signature = str(candidate.get("hotpot_chain_signature") or "").strip()
+            if signature:
+                aligned_chain_signatures.add(signature)
+    candidate_count = len(candidates)
+    effective = len(aligned_chain_signatures)
+    return {
+        "question_anchor_coverage_count": question_anchor_coverage_count,
+        "question_anchor_coverage_rate": question_anchor_coverage_count / candidate_count if candidate_count else 0.0,
+        "unique_question_aligned_chains": effective,
+        "unique_valid_first_hop_anchors": len({item for item in valid_first_hop_anchors if item}),
+        "effective_candidate_diversity": effective,
+        "effective_candidate_diversity_ratio": effective / candidate_count if candidate_count else 0.0,
+        "question_aligned_candidate_count": len(aligned_candidates),
+    }
+
+
 def _rationale_tokens(value: Any) -> list[str]:
     text = str(value or "").lower()
     text = re.sub(r"final\s+answer\s*[:：]?\s*[a-j]\b", " ", text, flags=re.IGNORECASE)
@@ -5127,7 +7286,7 @@ def run_best_of_n(
         correct_count = sum(int(bool(c.score.get("correct"))) for c in candidates)
         candidate_records = [candidate_record(c, domain=domain, candidate_id=f"c{attempt}") for attempt, c in enumerate(candidates)]
         coverage = coverage_at_k(candidate_records, (1, 2, 3, 4, 8, 16))
-        records.append({
+        record = {
             "sample_id": row.get("sample_id"),
             "correct": correct_any,
             "correct_count": correct_count,
@@ -5135,6 +7294,7 @@ def run_best_of_n(
             "best_of_n": n,
             **coverage,
             "candidates": candidate_records,
+            **(_hotpot_candidate_diversity(candidate_records) if domain == "hotpotqa" else {}),
             "candidate_graph": record_candidate_graph(
                 row,
                 domain=domain,
@@ -5144,7 +7304,8 @@ def run_best_of_n(
                 selected_candidate_id=None,
                 metadata={"experiment": "best_of_n", "n": n},
             ),
-        })
+        }
+        records.append(record)
         print(f"{index}/{len(rows)} {row.get('sample_id')} best_of_{n} correct={correct_any} correct_count={correct_count}", flush=True)
     return summarize(records, domain=domain, experiment="best_of_n", n=n)
 
@@ -5722,12 +7883,20 @@ def candidate_record(candidate: Candidate, *, domain: str | None = None, candida
         if isinstance(parsed, dict) and parsed.get("generation_mode") in {
             "preserve_first_evidence_chain_binding",
             "bridge_conditioned_evidence_chain",
+            "level1_constructor",
+            "level2_reasoner",
+            "level3_pure_model",
         }:
             extra["bridge_entity"] = parsed.get("bridge_entity", "")
             extra["cited_fact_ids"] = parsed.get("cited_fact_ids", [])
             extra["hotpot_chain_signature"] = parsed.get("chain_signature", _hotpot_chain_signature(candidate.text))
             extra["structured_candidate_view"] = parsed.get("structured_candidate_view", {})
             extra["answer_alignment"] = parsed.get("answer_alignment")
+            extra["question_alignment"] = parsed.get("question_alignment", {})
+            alignment = extra["question_alignment"] if isinstance(extra["question_alignment"], dict) else {}
+            extra["question_anchor_covered"] = bool(alignment.get("question_anchor_covered", False))
+            extra["question_aligned"] = bool(alignment.get("pass", False))
+            extra["valid_first_hop_anchors"] = list(alignment.get("valid_first_hop_anchors", []))
             extra["contradiction_signal"] = bool(parsed.get("contradiction_signal", False))
             extra["reasoning_type"] = parsed.get("reasoning_type", "")
             extra["allocation_policy"] = parsed.get("allocation_policy", "")
@@ -5736,6 +7905,16 @@ def candidate_record(candidate: Candidate, *, domain: str | None = None, candida
             extra["bridge_attribute_telemetry"] = parsed.get("bridge_attribute_telemetry", {})
             extra["multi_constraint_telemetry"] = parsed.get("multi_constraint_telemetry", {})
             extra["parallel_retrieval_telemetry"] = parsed.get("parallel_retrieval_telemetry", {})
+            # Keep planner output visible in reports; it is otherwise lost
+            # because raw_tail is intentionally truncated for large evidence
+            # candidates.
+            extra["semantic_plan"] = parsed.get("semantic_plan")
+            extra["semantic_plan_status"] = parsed.get("semantic_plan_status", {})
+            extra["semantic_planner_metrics"] = parsed.get("semantic_planner_metrics", {})
+            extra["model_candidate"] = parsed.get("model_candidate", {})
+            extra["model_verifier"] = parsed.get("model_verifier", {})
+            extra["repair_trace"] = parsed.get("repair_trace", [])
+            extra["repair_rounds"] = int(parsed.get("repair_rounds", 0) or 0)
             extra["bridge_candidate_pool"] = parsed.get("bridge_candidate_pool", [])
             extra["raw_bridge_pool_size"] = int(parsed.get("raw_bridge_pool_size", 0) or 0)
             extra["hop1_pool"] = parsed.get("hop1_pool", [])
@@ -6345,6 +8524,27 @@ def summarize(records: list[dict[str, Any]], **metadata: Any) -> dict[str, Any]:
 
 def _phase2_candidate_summary(records: list[dict[str, Any]], candidates: list[dict[str, Any]]) -> dict[str, Any]:
     extra: dict[str, Any] = {}
+    repair_traces = [
+        trace
+        for candidate in candidates
+        for trace in (candidate.get("repair_trace") or [])
+        if isinstance(trace, dict)
+    ]
+    if repair_traces:
+        extra.update({
+            "repair_trace_count": len(repair_traces),
+            "repair_accepted_count": sum(int(bool(item.get("accepted"))) for item in repair_traces),
+            "repair_rejected_count": sum(int(not bool(item.get("accepted"))) for item in repair_traces),
+            "repair_program_valid_before_count": sum(int(bool(item.get("program_valid_before"))) for item in repair_traces),
+            "repair_program_valid_after_count": sum(int(bool(item.get("program_valid_after"))) for item in repair_traces),
+            "repair_program_stop_count": sum(int(item.get("reason") == "program_valid_or_budget_exhausted") for item in repair_traces),
+            "repair_program_score_improvement": sum(
+                float(item.get("program_score_after", item.get("program_score_before", 0.0)) or 0.0)
+                - float(item.get("program_score_before", 0.0) or 0.0)
+                for item in repair_traces
+                if "program_score_after" in item
+            ),
+        })
     candidate_counts = [
         int(record.get("candidate_count", 0) or len(record.get("candidates", []) or record.get("attempts", []) or []))
         for record in records
@@ -6353,6 +8553,30 @@ def _phase2_candidate_summary(records: list[dict[str, Any]], candidates: list[di
         extra["candidate_count_mean"] = sum(candidate_counts) / len(candidate_counts)
         extra["candidate_count_min"] = min(candidate_counts)
         extra["candidate_count_max"] = max(candidate_counts)
+    hotpot_diversity = [
+        _hotpot_candidate_diversity(list(record.get("candidates") or record.get("attempts") or []))
+        for record in records
+        if any(isinstance(candidate.get("question_alignment"), dict) for candidate in (record.get("candidates") or record.get("attempts") or []))
+    ]
+    if hotpot_diversity:
+        for key in (
+            "question_anchor_coverage_count",
+            "unique_question_aligned_chains",
+            "unique_valid_first_hop_anchors",
+            "effective_candidate_diversity",
+            "question_aligned_candidate_count",
+        ):
+            extra[f"avg_{key}"] = sum(float(item.get(key, 0.0) or 0.0) for item in hotpot_diversity) / len(hotpot_diversity)
+        extra["avg_question_anchor_coverage_rate"] = sum(
+            float(item.get("question_anchor_coverage_rate", 0.0) or 0.0) for item in hotpot_diversity
+        ) / len(hotpot_diversity)
+        extra["avg_effective_candidate_diversity_ratio"] = sum(
+            float(item.get("effective_candidate_diversity_ratio", 0.0) or 0.0) for item in hotpot_diversity
+        ) / len(hotpot_diversity)
+        extra["effective_candidate_diversity_zero_count"] = sum(
+            int(float(item.get("effective_candidate_diversity", 0.0) or 0.0) == 0.0)
+            for item in hotpot_diversity
+        )
     if any(candidate.get("option_hypotheses") for candidate in candidates):
         parseable = sum(int(bool(candidate.get("option_hypotheses"))) for candidate in candidates)
         modes: dict[str, int] = {}
@@ -6479,21 +8703,36 @@ def _hotpot_fixed_k_gate(report: dict[str, Any], *, n: int) -> dict[str, Any]:
     candidate_count_mean = float(report.get("candidate_count_mean", 0.0) or 0.0)
     avg_unique_bridges = float(report.get("avg_unique_bridges", 0.0) or 0.0)
     avg_unique_chains = float(report.get("avg_unique_evidence_chains", 0.0) or 0.0)
+    avg_anchor_coverage = float(report.get("avg_question_anchor_coverage_count", 0.0) or 0.0)
+    avg_aligned_chains = float(report.get("avg_unique_question_aligned_chains", 0.0) or 0.0)
+    avg_valid_first_hop_anchors = float(report.get("avg_unique_valid_first_hop_anchors", 0.0) or 0.0)
+    avg_effective_diversity = float(report.get("avg_effective_candidate_diversity", 0.0) or 0.0)
     return {
         "fixed_k": n,
         "candidate_count_target": float(n),
         "actual_candidate_count_mean": candidate_count_mean,
         "avg_unique_bridges": avg_unique_bridges,
         "avg_unique_evidence_chains": avg_unique_chains,
+        "avg_question_anchor_coverage_count": avg_anchor_coverage,
+        "avg_unique_question_aligned_chains": avg_aligned_chains,
+        "avg_unique_valid_first_hop_anchors": avg_valid_first_hop_anchors,
+        "avg_effective_candidate_diversity": avg_effective_diversity,
         "coverage@4": coverage_at_4,
         "candidate_count_pass": candidate_count_mean >= float(n) - 1e-9,
         "unique_bridge_pass": avg_unique_bridges > 2.0,
         "unique_chain_pass": avg_unique_chains > 2.0,
+        "question_anchor_coverage_pass": avg_anchor_coverage > 0.0,
+        "question_aligned_chain_pass": avg_aligned_chains > 2.0,
+        "effective_candidate_diversity_pass": avg_effective_diversity > 2.0,
         "coverage_recovery_pass": coverage_at_4 >= 0.54,
         "phase2_hotpot_fixed_k_gate_pass": (
             candidate_count_mean >= float(n) - 1e-9
             and avg_unique_bridges > 2.0
             and avg_unique_chains > 2.0
+            and avg_anchor_coverage > 0.0
+            and avg_aligned_chains > 2.0
+            and avg_valid_first_hop_anchors > 0.0
+            and avg_effective_diversity > 2.0
             and coverage_at_4 >= 0.54
         ),
     }
@@ -6538,6 +8777,23 @@ def main() -> None:
         default="default",
         help="HotpotQA Phase 2 candidate generator variant.",
     )
+    parser.add_argument(
+        "--hotpot-semantic-planner",
+        action="store_true",
+        help="Use one cached model call per HotpotQA question to propose semantic/topology/first-hop plans; execution and verification stay programmatic.",
+    )
+    parser.add_argument(
+        "--hotpot-reasoning-mode",
+        choices=("legacy", "level1_constructor", "level2_reasoner", "level3_pure_model"),
+        default="legacy",
+        help="HotpotQA model-purity ablation. Legacy preserves the existing constructor pipeline.",
+    )
+    parser.add_argument(
+        "--hotpot-model-repair-rounds",
+        type=int,
+        default=1,
+        help="Level 3 verifier-guided model repair rounds per candidate.",
+    )
     parser.add_argument("--current-baseline", type=float, default=0.0)
     parser.add_argument("--verifier-baseline", type=float, default=0.0)
     parser.add_argument("--min-repair-candidates", type=int, default=4)
@@ -6549,9 +8805,13 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
-    global MMLU_OPTIONWISE_MODE, HOTPOT_CANDIDATE_MODE
+    global MMLU_OPTIONWISE_MODE, HOTPOT_CANDIDATE_MODE, HOTPOT_SEMANTIC_PLANNER, HOTPOT_REASONING_MODE, HOTPOT_MODEL_REPAIR_ROUNDS, HOTPOT_REPAIR_MODE
     MMLU_OPTIONWISE_MODE = args.mmlu_optionwise_mode
     HOTPOT_CANDIDATE_MODE = args.hotpot_candidate_mode
+    HOTPOT_SEMANTIC_PLANNER = bool(args.hotpot_semantic_planner)
+    HOTPOT_REASONING_MODE = str(args.hotpot_reasoning_mode)
+    HOTPOT_MODEL_REPAIR_ROUNDS = max(0, int(args.hotpot_model_repair_rounds))
+    HOTPOT_REPAIR_MODE = "local_patch"
 
     rows = read(Path(args.data_path), args.domain, args.limit)
     model = SamplingModel(args.model_path, max_new_tokens=args.max_new_tokens)
@@ -6634,6 +8894,10 @@ def main() -> None:
         "model_path": args.model_path,
         "mmlu_optionwise_mode": args.mmlu_optionwise_mode,
         "hotpot_candidate_mode": args.hotpot_candidate_mode,
+        "hotpot_semantic_planner": bool(args.hotpot_semantic_planner),
+        "hotpot_reasoning_mode": args.hotpot_reasoning_mode,
+        "hotpot_model_repair_rounds": HOTPOT_MODEL_REPAIR_ROUNDS,
+        "hotpot_repair_mode": HOTPOT_REPAIR_MODE,
         "limit": args.limit,
         "seed": args.seed,
         "temperature": args.temperature,

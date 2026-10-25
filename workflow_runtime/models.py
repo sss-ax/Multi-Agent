@@ -8,9 +8,127 @@ through an explicit invalidation event without changing any digest.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Mapping, Optional, Set
 
 DEFAULT_BRANCH_ID = "main"
+
+
+class NodeOrigin:
+    """Trust boundary for graph nodes."""
+
+    SOURCE = "source"
+    MODEL = "model"
+    RUNTIME = "runtime"
+    EVALUATION = "evaluation"
+
+
+class VisibilityClass:
+    """Visibility boundary enforced by AgentGraphViewManager."""
+
+    PUBLIC = "public"
+    ROLE_SCOPED = "role_scoped"
+    TOOL_ONLY = "tool_only"
+    EVALUATOR_ONLY = "evaluator_only"
+
+
+_VALID_ORIGINS = frozenset({
+    NodeOrigin.SOURCE,
+    NodeOrigin.MODEL,
+    NodeOrigin.RUNTIME,
+    NodeOrigin.EVALUATION,
+})
+_VALID_VISIBILITIES = frozenset({
+    VisibilityClass.PUBLIC,
+    VisibilityClass.ROLE_SCOPED,
+    VisibilityClass.TOOL_ONLY,
+    VisibilityClass.EVALUATOR_ONLY,
+})
+
+
+def normalize_provenance(
+    provenance: Mapping[str, Any] | None = None,
+    *,
+    owner: str = "",
+    created_by_role: str = "",
+    node_type: str = "",
+) -> Dict[str, Any]:
+    """Return a backward-compatible, explicit provenance record.
+
+    Existing callers can continue passing sparse provenance.  The compatibility
+    inference deliberately treats only obvious source/mandatory nodes as public;
+    generated semantic nodes default to role-scoped visibility.
+    """
+    result = dict(provenance or {})
+    origin = str(result.get("origin", "")).strip()
+    visibility = str(result.get("visibility_class", "")).strip()
+    trust = str(result.get("trust", "")).strip()
+    role = str(created_by_role or owner or "").strip()
+
+    if origin not in _VALID_ORIGINS:
+        if role in {"dataset", "user", "source"} or node_type.endswith("_source"):
+            origin = NodeOrigin.SOURCE
+        elif role in {"evaluator", "evaluation"}:
+            origin = NodeOrigin.EVALUATION
+        elif role in {"runtime", "tool", "retriever"}:
+            origin = NodeOrigin.RUNTIME
+        else:
+            origin = NodeOrigin.MODEL
+    if visibility not in _VALID_VISIBILITIES:
+        if result.get("communication_scope") == "MANDATORY":
+            visibility = VisibilityClass.PUBLIC
+        elif origin == NodeOrigin.EVALUATION or role in {"evaluator", "evaluation"}:
+            visibility = VisibilityClass.EVALUATOR_ONLY
+        elif result.get("tool_only") or node_type in {"official_test_source", "private_test_source"}:
+            visibility = VisibilityClass.TOOL_ONLY
+        elif origin == NodeOrigin.SOURCE and role in {"dataset", "user", "source"}:
+            visibility = VisibilityClass.PUBLIC
+        else:
+            visibility = VisibilityClass.ROLE_SCOPED
+    if not trust:
+        trust = {
+            NodeOrigin.SOURCE: "trusted_input",
+            NodeOrigin.MODEL: "model_generated",
+            NodeOrigin.RUNTIME: "runtime_derived",
+            NodeOrigin.EVALUATION: "evaluator_only",
+        }[origin]
+    result.update({"origin": origin, "trust": trust, "visibility_class": visibility})
+    return result
+
+
+def node_visibility_class(node: Any) -> str:
+    """Read a node's explicit visibility with a safe default."""
+    provenance = getattr(node, "provenance", {})
+    if isinstance(provenance, Mapping):
+        value = str(provenance.get("visibility_class", "")).strip()
+        if value in _VALID_VISIBILITIES:
+            return value
+    normalized = normalize_provenance(
+        provenance,
+        owner=str(getattr(node, "owner", "")),
+        created_by_role=str(getattr(node, "created_by_role", "")),
+        node_type=str(getattr(node, "type", "")),
+    )
+    return str(normalized["visibility_class"])
+
+
+def node_visible_to_role(node: Any, role: str) -> bool:
+    """Return whether a node may enter a model/tool role view."""
+    visibility = node_visibility_class(node)
+    if visibility == VisibilityClass.PUBLIC:
+        return True
+    if visibility == VisibilityClass.TOOL_ONLY:
+        return role == "tool"
+    if visibility == VisibilityClass.EVALUATOR_ONLY:
+        return False
+    provenance = getattr(node, "provenance", {})
+    owner = str(getattr(node, "owner", ""))
+    created_by = str(getattr(node, "created_by_role", ""))
+    allowed_roles = ()
+    if isinstance(provenance, Mapping):
+        raw = provenance.get("roles", provenance.get("allowed_roles", ()))
+        if isinstance(raw, (list, tuple, set, frozenset)):
+            allowed_roles = tuple(str(item) for item in raw)
+    return role in allowed_roles or role in {owner, created_by}
 
 
 @dataclass(frozen=True)

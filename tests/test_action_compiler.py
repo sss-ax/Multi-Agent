@@ -1,351 +1,170 @@
-from pathlib import Path
-import sys
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
 import pytest
+import json
 
-from workflow_runtime import GraphStore
 from workflow_runtime.action_compiler import ActionCompilationError, ActionCompiler
 from workflow_runtime.domain_executors import execute_domain
+from workflow_runtime.graph_store import GraphStore
+from workflow_runtime.choice_audit import build_choice_audit_manifest
 
 
-def make_compiler() -> tuple[GraphStore, ActionCompiler]:
+def _numeric_compiler():
     store = GraphStore()
-    store.add_node(task_id="t", branch_id="main", logical_id="task", node_type="task", content="A plus B", owner="user")
-    return store, ActionCompiler(store, task_id="t", task_type="numeric_solve")
+    task = store.add_node(
+        task_id="t", branch_id="main", logical_id="task", node_type="task_source",
+        content="Alice has 2 apples and Bob has 3 apples.", owner="dataset",
+        provenance={"origin": "source", "visibility_class": "public"},
+    )
+    store.add_node(
+        task_id="t", branch_id="main", logical_id="query_spec", node_type="query_spec",
+        content={"task_type": "numeric_solve", "task_ref": task.node_id}, owner="runtime",
+    )
+    compiler = ActionCompiler(store, task_id="t", task_type="numeric_solve")
+    compiler.set_node_ref_context({"visible_node_ids": tuple(store.snapshot().nodes)})
+    return store, compiler
 
 
-def test_planner_actions_compile_to_graph_nodes_without_direct_graph_mutation() -> None:
-    store, compiler = make_compiler()
-    compiler.apply("planner", {"op": "declare_query", "content": {"question": "total"}})
-    compiler.apply("planner", {"op": "add_fact", "id": "A", "value": 2})
-    compiler.apply("planner", {"op": "add_fact", "id": "B", "value": 3})
-    compiler.apply("planner", {"op": "add_plan_step", "id": "R1", "operation": "add", "inputs": ["A", "B"]})
-
-    assert store.latest_valid("t", "main", "query_spec") is not None
-    assert store.latest_valid("t", "main", "facts").content == [{"id": "A", "value": 2}, {"id": "B", "value": 3}]
-    assert store.latest_valid("t", "main", "plan") is not None
-    assert store.latest_valid("t", "main", "plan_steps") is not None
-    assert store.latest_valid("t", "main", "task").content == "A plus B"
-
-
-def test_solver_critic_and_final_actions_compile() -> None:
-    store, compiler = make_compiler()
-    compiler.apply("planner", {"op": "declare_query", "content": {"question": "total"}})
-    compiler.apply("planner", {"op": "add_fact", "id": "A", "value": 2})
-    compiler.apply("planner", {"op": "add_fact", "id": "B", "value": 3})
-    compiler.apply("planner", {"op": "add_plan_step", "id": "R1", "operation": "add", "inputs": ["A", "B"]})
-    compiler.apply("solver", {"op": "calculate", "id": "R1", "expression": "2+3", "value": 5})
-    compiler.apply("solver", {"op": "set_result", "id": "R1", "value": 5})
-    compiler.apply("critic", {"op": "verify", "target": "result", "status": "verified"})
-    compiler.apply("final_solver", {"op": "answer", "source": "result", "value": 5})
-
-    assert store.latest_valid("t", "main", "verification").status == "verified"
-    assert store.latest_valid("t", "main", "final_answer").content == 5
+def test_typed_actions_compile_and_kernel_finalizes_verified_result():
+    store, compiler = _numeric_compiler()
+    planned = compiler.apply("planner", {
+        "op": "plan",
+        "facts": [{"content": "Alice has 2 apples", "source": "task", "quote": "2 apples"}],
+        "strategy": "add both quantities",
+    })
+    assert planned.node_ids
+    compiler.set_node_ref_context({"visible_node_ids": tuple(store.snapshot().nodes)})
+    solved = compiler.apply("solver", {"op": "solve_numeric", "expression": "2+3", "value": "5"})
+    assert solved.node_ids
+    judged = compiler.apply("critic", {
+        "op": "judge_numeric", "model_verdict": "consistent", "error_type": "none",
+        "error_location": "", "reason": "2+3=5", "repair_instruction": "",
+    })
+    assert judged.node_ids
+    finalized = compiler.copy_verified_result()
+    assert finalized.node_ids
+    assert store.latest_valid("t", "main", "final_answer").content == "5"
 
 
-def test_critic_verify_accepts_answer_alias_for_result() -> None:
+def test_choice_solver_reasons_are_resolved_against_source_option_slots():
     store = GraphStore()
     store.add_node(
-        task_id="t",
-        branch_id="main",
-        logical_id="result",
-        node_type="result",
-        content={"id": "answer", "value": "yes"},
-        owner="solver",
+        task_id="choice", branch_id="main", logical_id="choice_schema", node_type="choice_schema",
+        content={"allowed_labels": ["A", "I"], "slot_values": {
+            "A": ["Safe practices", "Fear", "Jealousy", "Trivial"],
+            "I": ["Unsafe practices", "Distress", "Fear", "Serious"],
+        }}, owner="dataset",
     )
-    compiler = ActionCompiler(store, task_id="t", task_type="multihop_qa")
-    compiler.apply("critic", {"op": "verify", "target": "answer", "status": "verified"})
-    verification = store.latest_valid("t", "main", "verification")
-    assert verification is not None
-    assert verification.content == {"target": "result", "status": "verified"}
+    compiler = ActionCompiler(store, task_id="choice", task_type="multiple_choice")
+    action = {
+        "op": "choose_option", "answer": "I",
+        "slot_reasons": [{"slot": i, "reason": f"slot {i} supports I"} for i in range(1, 5)],
+        "option_reviews": [
+            {"label": "A", "assessment": "rejected", "reason": "slot 1 and slot 4 conflict"},
+            {"label": "I", "assessment": "selected", "reason": "all slots fit"},
+        ],
+        "confidence": 0.9,
+    }
+    compiler.apply("solver", action)
+    value = store.latest_valid("choice", "main", "result").content["value"]
+    assert [item["selected_term"] for item in value["slot_analysis"]] == [
+        "Unsafe practices", "Distress", "Fear", "Serious"
+    ]
+    assert value["slot_reasons"] == action["slot_reasons"]
 
 
-def test_final_answer_falls_back_from_pseudo_source_alias() -> None:
-    store, compiler = make_compiler()
-    compiler.apply("solver", {"op": "set_result", "id": "R1", "value": 5})
-    result = store.latest_valid("t", "main", "result")
-
-    compiler.apply("final_solver", {"op": "answer", "source": "n10", "value": 5})
-
-    final = store.latest_valid("t", "main", "final_answer")
-    assert final.content == 5
-    assert final.provenance["declared_answer_source"] == "n10"
-    assert final.provenance["resolved_answer_source"] == result.node_id
-    assert final.provenance["answer_source_fallback"] is True
+def test_old_model_actions_are_not_compilable():
+    _store, compiler = _numeric_compiler()
+    for role, action in (
+        ("planner", {"op": "add_fact", "id": "A", "value": 2}),
+        ("solver", {"op": "set_result", "id": "R1", "value": 5}),
+        ("critic", {"op": "verify", "target": "result", "status": "verified"}),
+        ("final_solver", {"op": "answer", "source": "result", "value": 5}),
+    ):
+        with pytest.raises(ActionCompilationError):
+            compiler.apply(role, action)
 
 
-def test_final_answer_falls_back_from_hotpot_pseudo_source() -> None:
+def test_choice_critic_disagreement_compiles_need_fix():
     store = GraphStore()
-    result = store.add_node(
-        task_id="t",
-        branch_id="main",
-        logical_id="result",
-        node_type="result",
-        content={"id": "answer", "value": "bridge entity"},
-        owner="solver",
+    store.add_node(
+        task_id="t", branch_id="main", logical_id="task", node_type="task_source",
+        content="Choose the right term.", owner="dataset",
     )
-    compiler = ActionCompiler(store, task_id="t", task_type="multihop_qa")
-
-    compiler.apply("final_solver", {"op": "answer", "source": "R.id.n3", "value": "ignored"})
-
-    final = store.latest_valid("t", "main", "final_answer")
-    assert final.content == "bridge entity"
-    assert final.provenance["declared_answer_source"] == "R.id.n3"
-    assert final.provenance["resolved_answer_source"] == result.node_id
-    assert final.provenance["answer_source_fallback"] is True
-
-
-def test_solver_null_result_value_reuses_latest_valid_result() -> None:
-    store, compiler = make_compiler()
-    compiler.apply("solver", {"op": "set_result", "id": "R1", "value": 9})
-
-    compiler.apply("solver", {"op": "set_result", "id": "R2", "value": None})
-
-    result = store.latest_valid("t", "main", "result")
-    assert result.content == {"id": "R2", "value": 9}
-
-
-def test_final_answer_resolves_fragment_alias_to_canonical_node() -> None:
-    store, compiler = make_compiler()
-    compiler.apply("solver", {"op": "set_result", "id": "R1", "value": 5})
-    result = store.latest_valid("t", "main", "result")
-    compiler.set_node_ref_context({
-        "fragment_index": {
-            "result@v1#final_value": {
-                "fragment_id": "result@v1#final_value",
-                "fragment_type": "final_value",
-                "source_node_id": result.node_id,
-                "source_logical_id": "result",
-                "source_node_type": "result",
-                "local_node_id": "n4",
-            },
-            "final_value": {
-                "fragment_id": "result@v1#final_value",
-                "fragment_type": "final_value",
-                "source_node_id": result.node_id,
-                "source_logical_id": "result",
-                "source_node_type": "result",
-                "local_node_id": "n4",
-            },
-        },
-        "local_node_index": {
-            "n4": {
-                "source_node_id": result.node_id,
-                "source_logical_id": "result",
-                "source_node_type": "result",
-                "local_node_id": "n4",
-            },
-        },
+    store.add_node(task_id="t", branch_id="main", logical_id="choice_schema", node_type="choice_schema", content={"allowed_labels": ["A", "B"], "slot_values": {"A": ["wrong"], "B": ["right"]}}, owner="dataset")
+    for label, text in (("A", "wrong"), ("B", "right")):
+        store.add_node(task_id="t", branch_id="main", logical_id=f"choice_source_{label}", node_type="choice_source", content={"label": label, "text": text}, owner="dataset")
+    compiler = ActionCompiler(store, task_id="t", task_type="multiple_choice")
+    compiler.apply("solver", {"op": "choose_option", "answer": "A", "slot_reasons": [{"slot": 1, "reason": "wrong"}], "option_reviews": [{"label": "A", "assessment": "selected", "reason": "wrong"}, {"label": "B", "assessment": "rejected", "reason": "right"}], "confidence": 1})
+    manifest = build_choice_audit_manifest(store, task_id="t")
+    result = compiler.apply("critic", {
+        "op": "audit_choice",
+        "candidate_version": manifest["candidate_version"], "manifest_digest": manifest["manifest_digest"],
+        "selected_option_check": {"assessment": "violates", "reason": "wrong conflicts with the question"},
+        "slot_checks": [{"claim_id": manifest["slot_claims"][0]["claim_id"], "assessment": "violates", "reason": "wrong conflicts with the question"}],
+        "option_checks": [{"claim_id": item["claim_id"], "assessment": "violates", "reason": item["option_text"]} for item in manifest["elimination_claims"]],
+        "summary": "The selected claim is contradicted.",
     })
-
-    compiler.apply("final_solver", {"op": "answer", "source": "final_value", "value": 5})
-
-    final = store.latest_valid("t", "main", "final_answer")
-    assert final.content == 5
-    assert final.provenance["resolved_answer_source"] == result.node_id
-
-
-def test_final_answer_redirects_verification_to_value_bearing_target() -> None:
-    store, compiler = make_compiler()
-    compiler.apply("solver", {"op": "set_result", "id": "R1", "value": "I"})
-    result = store.latest_valid("t", "main", "result")
-    compiler.apply("critic", {"op": "verify", "target": "result", "status": "verified"})
-    verification = store.latest_valid("t", "main", "verification")
-
-    compiler.apply("final_solver", {"op": "answer", "source": "verification", "value": "verified"})
-
-    final = store.latest_valid("t", "main", "final_answer")
-    assert final.content == "I"
-    assert final.provenance["resolved_answer_source"] == verification.node_id
-    assert final.provenance["value_answer_source"] == result.node_id
-    assert final.provenance["value_answer_source_type"] == "result"
-
-
-def test_final_answer_rejects_non_value_source_without_redirect() -> None:
-    store, compiler = make_compiler()
-    compiler.apply("planner", {"op": "add_plan_step", "id": "R1", "operation": "add", "inputs": []})
-
-    with pytest.raises(ActionCompilationError, match="invalid final answer source type"):
-        compiler.apply("final_solver", {"op": "answer", "source": "plan", "value": "ignored"})
-
-
-def test_code_generation_uses_code_as_answer_boundary() -> None:
-    store = GraphStore()
-    store.add_node(task_id="t", branch_id="main", logical_id="code", node_type="code", content="def f():\n    return 1\n", owner="solver")
-    compiler = ActionCompiler(store, task_id="t", task_type="code_generation")
-
-    compiler.apply("critic", {"op": "verify", "target": "answer", "status": "verified"})
-    compiler.apply("final_solver", {"op": "answer", "source": "code", "value": "ignored"})
-
-    assert store.latest_valid("t", "main", "verification").content == {"target": "code", "status": "verified"}
-    assert store.latest_valid("t", "main", "final_answer").content == "def f():\n    return 1\n"
-
-
-def test_need_fix_verify_stores_structured_repair_feedback() -> None:
-    store = GraphStore()
-    store.add_node(task_id="t", branch_id="main", logical_id="code", node_type="code", content="def f():\n    return 2\n", owner="solver")
-    compiler = ActionCompiler(store, task_id="t", task_type="code_generation")
-
-    compiler.apply(
-        "critic",
-        {
-            "op": "verify",
-            "target": "code",
-            "status": "need_fix",
-            "error_type": "wrong_return",
-            "error_location": "return statement",
-            "reason": "The function returns 2 instead of 1.",
-            "repair_instruction": "Change the return value to 1 and preserve the signature.",
-            "preserve": ["function signature"],
-            "requested_fragments": ["code#function_body"],
-        },
-    )
-
+    assert result.node_ids
     verification = store.latest_valid("t", "main", "verification")
     assert verification.status == "need_fix"
-    assert verification.content["error_type"] == "wrong_return"
-    assert verification.content["repair_instruction"].startswith("Change the return value")
-    assert verification.content["preserve"] == ["function signature"]
+    assert verification.content["error_type"] == "contradicted_selected_option"
 
 
-def test_code_generation_final_answer_falls_back_from_local_source_alias() -> None:
-    store = GraphStore()
-    code = store.add_node(
-        task_id="t",
-        branch_id="main",
-        logical_id="code",
-        node_type="code",
-        content="def f():\n    return 2\n",
-        owner="solver",
-    )
-    compiler = ActionCompiler(store, task_id="t", task_type="code_generation")
-
-    compiler.apply("final_solver", {"op": "answer", "source": "n8", "value": "ignored"})
-
-    final = store.latest_valid("t", "main", "final_answer")
-    assert final.content == "def f():\n    return 2\n"
-    assert final.provenance["declared_answer_source"] == "n8"
-    assert final.provenance["resolved_answer_source"] == code.node_id
-    assert final.provenance["answer_source_fallback"] is True
-
-
-def test_code_generation_final_answer_prefers_code_over_execution_for_bad_source() -> None:
+def test_choice_critic_preserves_structured_repair_packet():
     store = GraphStore()
     store.add_node(
-        task_id="t",
-        branch_id="main",
-        logical_id="code",
-        node_type="code",
-        content="def f():\n    return 3\n",
-        owner="solver",
+        task_id="t", branch_id="main", logical_id="task", node_type="task_source", content="Choose the right term.", owner="dataset",
+    )
+    store.add_node(task_id="t", branch_id="main", logical_id="choice_schema", node_type="choice_schema", content={"allowed_labels": ["A", "I"], "slot_values": {"A": ["wrong"], "I": ["right"]}}, owner="dataset")
+    for label, text in (("A", "wrong"), ("I", "right")):
+        store.add_node(task_id="t", branch_id="main", logical_id=f"choice_source_{label}", node_type="choice_source", content={"label": label, "text": text}, owner="dataset")
+    compiler = ActionCompiler(store, task_id="t", task_type="multiple_choice")
+    compiler.apply("solver", {"op": "choose_option", "answer": "A", "slot_reasons": [{"slot": 1, "reason": "wrong"}], "option_reviews": [{"label": "A", "assessment": "selected", "reason": "wrong"}, {"label": "I", "assessment": "rejected", "reason": "right"}], "confidence": 1})
+    manifest = build_choice_audit_manifest(store, task_id="t")
+    compiler.apply("critic", {
+        "op": "audit_choice",
+        "candidate_version": manifest["candidate_version"], "manifest_digest": manifest["manifest_digest"],
+        "selected_option_check": {"assessment": "violates", "reason": "wrong is not supported"},
+        "slot_checks": [{"claim_id": manifest["slot_claims"][0]["claim_id"], "assessment": "violates", "reason": "wrong is wrong"}],
+        "option_checks": [{"claim_id": item["claim_id"], "assessment": "fits" if item["option"] == "I" else "violates", "reason": item["option_text"]} for item in manifest["elimination_claims"]],
+        "summary": "candidate is contradicted",
+    })
+    verification = store.latest_valid("t", "main", "verification")
+    packet = json.loads(verification.content["reason"])["repair_packet"]
+    assert packet["forbidden_answers"] == ["A"]
+    assert packet["contradicted_slots"][0]["slot"] == 1
+    assert packet["viable_challengers"] == ["I"]
+
+
+def test_code_critic_uses_kernel_execution_status():
+    store = GraphStore()
+    store.add_node(
+        task_id="t", branch_id="main", logical_id="code", node_type="code",
+        content={"code": "def solve():\n    return 1\n"}, owner="solver",
     )
     store.add_node(
-        task_id="t",
-        branch_id="main",
-        logical_id="execution",
-        node_type="execution",
-        content={"tests_passed": True, "stdout": ""},
-        owner="tool",
-    )
-    store.add_node(
-        task_id="t",
-        branch_id="main",
-        logical_id="result",
-        node_type="result",
-        content={"id": "execution", "value": {"tests_passed": True}},
-        owner="tool",
+        task_id="t", branch_id="main", logical_id="execution", node_type="execution",
+        content={"tests_passed": True}, owner="tool", status="verified",
+        validation={"schema_valid": True, "execution_valid": True},
     )
     compiler = ActionCompiler(store, task_id="t", task_type="code_generation")
-
-    compiler.apply("final_solver", {"op": "answer", "source": "n4", "value": "ignored"})
-
-    assert store.latest_valid("t", "main", "final_answer").content == "def f():\n    return 3\n"
-
-
-def test_duplicate_fact_and_plan_step_are_noops() -> None:
-    store, compiler = make_compiler()
-    first_fact = compiler.apply("planner", {"op": "add_fact", "id": "A", "value": 2})
-    second_fact = compiler.apply("planner", {"op": "add_fact", "id": "A", "value": 2})
-    first_step = compiler.apply("planner", {"op": "add_plan_step", "id": "R1", "operation": "add", "inputs": ["A"]})
-    second_step = compiler.apply("planner", {"op": "add_plan_step", "id": "R1", "operation": "add", "inputs": ["A"]})
-
-    assert first_fact.node_ids
-    assert second_fact.node_ids == ()
-    assert first_step.node_ids
-    assert second_step.node_ids == ()
-    assert store.latest_valid("t", "main", "facts").content == [{"id": "A", "value": 2}]
-
-
-def test_final_action_dereferences_source_value_and_unknown_target_is_rejected() -> None:
-    store, compiler = make_compiler()
-    compiler.apply("solver", {"op": "set_result", "id": "R1", "value": 5})
-    compiler.apply("final_solver", {"op": "answer", "source": "result", "value": "The answer is 5."})
-    assert store.latest_valid("t", "main", "final_answer").content == 5
-    with pytest.raises(ActionCompilationError, match="does not exist"):
-        compiler.apply("critic", {"op": "verify", "target": "missing", "status": "verified"})
-
-
-def test_solver_tool_action_is_allowlisted_and_compiled_with_result():
-    store, compiler = make_compiler()
-    result = compiler.apply(
-        "solver",
-        {
-            "op": "call_tool",
-            "call_id": "calc-1",
-            "name": "calculator",
-            "arguments": {"expression": "2 + 3 * 4"},
-        },
-    )
-    assert len(result.node_ids) == 2
-    tool_result = store.latest_valid("t", "main", "tool_result_calc-1")
-    assert tool_result.status == "verified"
-    assert tool_result.content["output"] == 14
-
-
-def test_unknown_tool_is_recorded_as_a_recoverable_tool_error():
-    store, compiler = make_compiler()
-    compiler.apply(
-        "solver",
-        {
-            "op": "call_tool",
-            "call_id": "bad-1",
-            "name": "not-registered",
-            "arguments": {},
-        },
-    )
-    tool_result = store.latest_valid("t", "main", "tool_result_bad-1")
-    assert tool_result.status == "need_fix"
-    assert tool_result.content["ok"] is False
+    compiler.apply("critic", {
+        "op": "diagnose_code", "diagnosis": "tests pass", "repair_instruction": "",
+    })
+    assert store.latest_valid("t", "main", "verification").status == "verified"
 
 
 def test_code_executor_prepends_imports_from_requirements() -> None:
     store = GraphStore()
     store.add_node(task_id="t", branch_id="main", logical_id="task", node_type="task", content="write first", owner="user")
     store.add_node(
-        task_id="t",
-        branch_id="main",
-        logical_id="requirements",
-        node_type="requirements",
-        content={"text": "from typing import List\n\ndef first(xs: List[int]) -> int:\n"},
-        owner="dataset",
+        task_id="t", branch_id="main", logical_id="requirements", node_type="requirements",
+        content={"text": "from typing import List\n\ndef first(xs: List[int]) -> int:\n"}, owner="dataset",
     )
     store.add_node(
-        task_id="t",
-        branch_id="main",
-        logical_id="test_1",
-        node_type="test",
-        content={"setup": "", "text": "assert first([3, 4]) == 3"},
-        owner="dataset",
+        task_id="t", branch_id="main", logical_id="test_1", node_type="test",
+        content={"setup": "", "text": "assert first([3, 4]) == 3"}, owner="dataset",
     )
-
     execution = execute_domain(
-        "code_generation",
-        store,
-        {"code": "def first(xs: List[int]) -> int:\n    return xs[0]\n"},
+        "code_generation", store, {"code": "def first(xs: List[int]) -> int:\n    return xs[0]\n"},
     )
-
     assert execution.success

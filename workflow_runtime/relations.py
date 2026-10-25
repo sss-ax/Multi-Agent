@@ -8,7 +8,7 @@ from typing import FrozenSet
 
 # All relations in this set are oriented producer/input -> consumer/output.
 DATA_DEPENDENCY_RELATIONS: FrozenSet[str] = frozenset(
-    {"input_to", "derived_from", "produces", "depends_on"}
+    {"input_to", "derived_from", "produces", "depends_on", "grounded_in"}
 )
 
 # These relations are oriented validator -> validated artifact.  If the
