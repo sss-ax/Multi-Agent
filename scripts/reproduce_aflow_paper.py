@@ -33,7 +33,13 @@ from baselines.aflow_runner import (  # noqa: E402
     _aflow_import_context,
     _patched_aflow_llm,
 )
+from baselines.aflow_graph_adapter import (  # noqa: E402
+    AFlowGraphSession,
+    make_aflow_operator_proxy_module,
+)
+from workflow_runtime.communication import make_communication_policy  # noqa: E402
 from workflow_runtime.model_backend import DirectTransformersModel  # noqa: E402
+from workflow_runtime.telemetry import WorkflowTelemetry  # noqa: E402
 
 
 DATASETS = ("DROP", "HotpotQA", "MATH", "GSM8K", "MBPP", "HumanEval")
@@ -91,7 +97,14 @@ def _paper_workflow_dir(dataset: str, workflow_round: int) -> Path:
     return AFLOW_ROOT / "data" / "results" / "results" / dataset / "graphs_test" / f"round_{workflow_round}"
 
 
-def _load_paper_workflow(dataset: str, workflow_round: int, bridge: Any) -> tuple[Any, str]:
+def _load_paper_workflow(
+    dataset: str,
+    workflow_round: int,
+    bridge: Any,
+    *,
+    graph_session: AFlowGraphSession | None = None,
+    communication_mode: str = "original",
+) -> tuple[Any, str]:
     """Load a downloaded paper graph while using the repository's local operators.
 
     The archived graphs import the older MetaGPT package layout.  Their graph
@@ -113,6 +126,22 @@ def _load_paper_workflow(dataset: str, workflow_round: int, bridge: Any) -> tupl
     prompt_spec.loader.exec_module(prompt_module)
 
     local_operator = f"from workspace.{dataset}.workflows.template import operator"
+    proxy_module_name = ""
+    if graph_session is not None and communication_mode != "original":
+        original_operator = importlib.import_module(
+            f"workspace.{dataset}.workflows.template.operator"
+        )
+        safe_task_id = re.sub(r"[^a-zA-Z0-9_]+", "_", graph_session.task_id)
+        proxy_module_name = (
+            f"_aflow_operator_proxy_{dataset}_{workflow_round}_{safe_task_id}"
+        )
+        proxy_operator = make_aflow_operator_proxy_module(
+            original_operator,
+            session=graph_session,
+            communication_mode=communication_mode,
+        )
+        sys.modules[proxy_module_name] = proxy_operator
+        local_operator = f"import {proxy_module_name} as operator"
     transformed: list[str] = []
     for line in graph_path.read_text(encoding="utf-8").splitlines():
         if re.match(r"^import .* as operator$", line.strip()):
@@ -139,7 +168,12 @@ def _load_paper_workflow(dataset: str, workflow_round: int, bridge: Any) -> tupl
 
 
 async def _load_rows(benchmark: Any, limit: int | None) -> list[dict[str, Any]]:
-    rows = await benchmark.load_data()
+    # Read the exact benchmark JSONL through the local filesystem.  AFlow's
+    # aiofiles loader can stall before evaluation in some environments; the
+    # official scorer still receives the same parsed rows.
+    data_path = Path(benchmark.file_path)
+    with data_path.open("r", encoding="utf-8") as handle:
+        rows = [json.loads(line) for line in handle if line.strip()]
     return rows if limit is None else rows[:limit]
 
 
@@ -153,6 +187,8 @@ async def _run_one(
     math_paper_subset: bool,
     log_dir: Path,
     generation_timeout_seconds: float | None,
+    communication_mode: str,
+    communication_policy: str,
     resume_result: dict[str, Any] | None,
     save_progress: Callable[[dict[str, Any]], None],
 ) -> dict[str, Any]:
@@ -224,6 +260,8 @@ async def _run_one(
             graph_path=str(graph_path_hint),
             data_path=data_path,
             resume_result=resume_result,
+            communication_mode=communication_mode,
+            communication_policy=communication_policy,
         )
         completed = int(result["completed_rows"])
         expected_ids = [_row_identifier(row, index) for index, row in enumerate(rows[:completed])]
@@ -236,12 +274,15 @@ async def _run_one(
         result["model_call_log"] = str(call_log_path)
         save_progress(result)
         print(f"[setup] {dataset}: loading paper workflow round {workflow_round}", flush=True)
-        workflow_module, graph_path = _load_paper_workflow(dataset, workflow_round, bridge)
-        workflow = workflow_module.Workflow(
-            name=f"aflow_paper_replay_{dataset}",
-            llm_config={"model": "local-qwen"},
-            dataset=dataset,
-        )
+        graph_path = str(_paper_workflow_dir(dataset, workflow_round) / "graph.py")
+        workflow = None
+        if communication_mode == "original":
+            workflow_module, graph_path = _load_paper_workflow(dataset, workflow_round, bridge)
+            workflow = workflow_module.Workflow(
+                name=f"aflow_paper_replay_{dataset}",
+                llm_config={"model": "local-qwen"},
+                dataset=dataset,
+            )
         result["workflow_module"] = graph_path
         result["setup_stage"] = "evaluating"
         print(f"[setup] {dataset}: workflow ready", flush=True)
@@ -273,8 +314,41 @@ async def _run_one(
                 )
                 progress.set_postfix_str(f"item {row_index + 1}: evaluating", refresh=True)
                 item_started = time.time()
-                record = await benchmark.evaluate_problem(rows[row_index], workflow)
+                graph_session = None
+                item_workflow = workflow
+                if communication_mode != "original":
+                    row_id = _row_identifier(rows[row_index], row_index)
+                    graph_session = AFlowGraphSession(
+                        task_id=row_id,
+                        task=_row_task_text(rows[row_index]),
+                        dataset=dataset,
+                        run_id=f"aflow:{dataset}:{row_id}",
+                        policy=make_communication_policy(
+                            communication_policy,
+                            task_family=dataset,
+                        ),
+                        telemetry=WorkflowTelemetry(
+                            log_dir / f"graph_{row_index + 1}.jsonl"
+                        ),
+                    )
+                    workflow_module, graph_path = _load_paper_workflow(
+                        dataset,
+                        workflow_round,
+                        bridge,
+                        graph_session=graph_session,
+                        communication_mode=communication_mode,
+                    )
+                    item_workflow = workflow_module.Workflow(
+                        name=f"aflow_graph_{dataset}_{row_index + 1}",
+                        llm_config={"model": "local-qwen"},
+                        dataset=dataset,
+                    )
+                record = await benchmark.evaluate_problem(rows[row_index], item_workflow)
                 item_calls = bridge.calls[call_offset:]
+                if graph_session is not None:
+                    result.setdefault("graph_telemetry", []).append(
+                        graph_session.telemetry.summary()
+                    )
                 result["records"].append(record)
                 result["record_ids"].append(_row_identifier(rows[row_index], row_index))
                 result["model_call_records"].extend(_compact_call_record(call) for call in item_calls)
@@ -301,6 +375,14 @@ def _row_identifier(row: dict[str, Any], index: int) -> str:
             return f"{key}:{row[key]}"
     canonical = json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
+def _row_task_text(row: dict[str, Any]) -> str:
+    for key in ("question", "problem", "prompt", "input"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return json.dumps(row, ensure_ascii=False, sort_keys=True)
 
 
 def _compact_call_record(call: dict[str, Any]) -> dict[str, Any]:
@@ -336,6 +418,8 @@ def _initial_run_result(
     graph_path: str,
     data_path: Path,
     resume_result: dict[str, Any] | None,
+    communication_mode: str = "original",
+    communication_policy: str = "send_all",
 ) -> dict[str, Any]:
     if resume_result is not None:
         result = dict(resume_result)
@@ -344,6 +428,7 @@ def _initial_run_result(
         result.setdefault("record_ids", [])
         result.setdefault("model_call_records", [])
         result.setdefault("item_wall_times_seconds", [])
+        result.setdefault("graph_telemetry", [])
         return result
     return {
         "status": "running",
@@ -366,6 +451,9 @@ def _initial_run_result(
         "record_ids": [],
         "model_call_records": [],
         "item_wall_times_seconds": [],
+        "communication_mode": communication_mode,
+        "communication_policy": communication_policy,
+        "graph_telemetry": [],
     }
 
 
@@ -432,6 +520,18 @@ def main() -> None:
             "(checked between generated tokens); 0 disables the deadline"
         ),
     )
+    parser.add_argument(
+        "--communication-mode",
+        choices=("original", "graph_shadow", "graph_sendall", "graph_ra"),
+        default="original",
+        help="Keep the paper Workflow topology and optionally route Operator context through GraphStore.",
+    )
+    parser.add_argument(
+        "--communication-policy",
+        choices=("send_all", "closure_aware_heuristic", "receiver_aware_heuristic", "receiver_aware_no_closure"),
+        default="send_all",
+        help="Graph communication policy used by graph_* modes.",
+    )
     parser.add_argument("--output", default=".runtime/aflow_paper_reproduction/results.json")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
@@ -442,6 +542,13 @@ def main() -> None:
         raise SystemExit("--generation-timeout-seconds cannot be negative")
     if args.max_new_tokens < 0:
         raise SystemExit("--max-new-tokens cannot be negative")
+    communication_policy = args.communication_policy
+    if args.communication_mode == "graph_ra" and communication_policy == "send_all":
+        # AFlow outputs are whole semantic nodes rather than fragment-labelled
+        # native Actions.  Use the existing closure-aware structural policy
+        # until an AFlow fragment utility table is supplied; this keeps the
+        # default RA smoke test from selecting an empty set.
+        communication_policy = "closure_aware_heuristic"
     selected = list(DATASETS if args.dataset == "all" else (args.dataset,))
     limit = args.limit or None
     output = Path(args.output)
@@ -468,6 +575,8 @@ def main() -> None:
         "max_new_tokens": args.max_new_tokens or None,
         "chat_template": args.chat_template,
         "generation_timeout_seconds": args.generation_timeout_seconds or None,
+        "communication_mode": args.communication_mode,
+        "communication_policy": communication_policy,
         "requested_limit": limit,
         "runs": {},
     }
@@ -479,6 +588,8 @@ def main() -> None:
             "math_paper_subset": args.math_paper_subset,
             "max_new_tokens": args.max_new_tokens or None,
             "chat_template": args.chat_template,
+            "communication_mode": args.communication_mode,
+            "communication_policy": communication_policy,
             "requested_limit": limit,
         }
         mismatches = [
@@ -527,6 +638,8 @@ def main() -> None:
                     math_paper_subset=args.math_paper_subset,
                     log_dir=output.parent / "aflow_logs" / dataset / f"run_{run_index}",
                     generation_timeout_seconds=args.generation_timeout_seconds or None,
+                    communication_mode=args.communication_mode,
+                    communication_policy=communication_policy,
                     resume_result=saved_run,
                     save_progress=save_run_progress,
                 )

@@ -537,13 +537,37 @@ def build_context_slice(
     task_id: str,
     branch_id: str,
     role: str,
+    root_node_ids: Optional[Iterable[str]] = None,
     policy: str = "dependency_closure",
     token_budget: Optional[int] = None,
     allow_missing: bool = False,
     visible_fragment_ids: Optional[Iterable[str]] = None,
     multihop_sentence_limit: Optional[int] = None,
 ) -> ContextSlice:
-    roots, missing = _required_roots(store, task_id, branch_id, role)
+    # External workflow adapters, such as AFlow, have their own receiver
+    # contracts rather than one of the native planner/solver/critic roles.
+    # They still use this same slicer; the adapter supplies deterministic roots
+    # after resolving its contract.  The native role-based path remains the
+    # default for all existing callers.
+    if root_node_ids is None:
+        roots, missing = _required_roots(store, task_id, branch_id, role)
+    else:
+        state = store.snapshot()
+        roots = []
+        missing = []
+        for raw_node_id in dict.fromkeys(str(item) for item in root_node_ids):
+            node = state.nodes.get(raw_node_id)
+            if node is None:
+                missing.append(raw_node_id)
+                continue
+            if node.task_id != task_id or node.branch_id != branch_id:
+                raise SliceError(
+                    f"context root {raw_node_id} belongs to a different task or branch"
+                )
+            if node.is_operationally_valid():
+                roots.append(raw_node_id)
+        if missing and not allow_missing:
+            raise SliceError(f"context roots missing for {role}: {', '.join(missing)}")
     if missing and not allow_missing:
         raise SliceError(f"semantic context missing for {role}: {', '.join(missing)}")
 
