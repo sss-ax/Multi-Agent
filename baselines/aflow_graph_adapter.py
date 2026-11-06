@@ -12,8 +12,9 @@ import inspect
 import json
 import re
 import types
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 from workflow_runtime.agent_graph_view import AgentGraphView, AgentGraphViewManager
 from workflow_runtime.communication import GraphCommunicationPolicy, SendAllPolicy
@@ -26,6 +27,14 @@ from workflow_runtime.semantic_contract import SemanticContract
 from workflow_runtime.semantic_resolver import SemanticResolver, all_requirements_sufficient
 from workflow_runtime.telemetry import WorkflowTelemetry
 
+from .aflow_reuse import (
+    AFlowArtifactRecord,
+    AFlowInvocationKey,
+    AFlowInvocationReuse,
+    normalize_output,
+    output_digest,
+)
+
 
 @dataclass(frozen=True)
 class AFlowCompiledOutput:
@@ -36,6 +45,10 @@ class AFlowCompiledOutput:
     operator: str
     invocation_index: int
     output_kind: str
+    content_digest: str = ""
+    invocation_node_id: str = ""
+    reused: bool = False
+    occurrence_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -52,6 +65,15 @@ class AFlowContextResult:
     sent_tokens: int
     contract_satisfied: bool
     missing_requirements: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AFlowOperatorInput:
+    """Graph-controlled input for one AFlow Operator invocation."""
+
+    kwargs: dict[str, Any]
+    source_node_ids: tuple[str, ...] = ()
+    context: AFlowContextResult | None = None
 
 
 def _as_mapping(value: Any) -> Mapping[str, Any] | None:
@@ -85,6 +107,14 @@ def _operator_kind(operator: str, output: Any) -> str:
     return "candidate_answer"
 
 
+def _is_candidate_output(operator: str, output_kind: str) -> bool:
+    """Return whether an output belongs to the current ensemble candidate batch."""
+    if output_kind not in {"candidate_answer", "code", "calculation"}:
+        return False
+    lowered = str(operator).casefold()
+    return not any(marker in lowered for marker in ("ensemble", "program", "test"))
+
+
 class AFlowOperatorOutputCompiler:
     """Compile AFlow's heterogeneous operator output without an LLM call."""
 
@@ -99,8 +129,37 @@ class AFlowOperatorOutputCompiler:
     ) -> AFlowCompiledOutput:
         index = int(invocation_index or session.next_invocation(operator))
         kind = _operator_kind(operator, output)
+        session.telemetry.record_aflow_metric(aflow_operator_invocations=1)
+        if session.content_dedup:
+            return self._compile_canonical(
+                session,
+                operator=operator,
+                output=output,
+                input_node_ids=input_node_ids,
+                invocation_index=index,
+                kind=kind,
+            )
+        return self._compile_legacy(
+            session,
+            operator=operator,
+            output=output,
+            input_node_ids=input_node_ids,
+            invocation_index=index,
+            kind=kind,
+        )
+
+    def _compile_legacy(
+        self,
+        session: "AFlowGraphSession",
+        *,
+        operator: str,
+        output: Any,
+        input_node_ids: Iterable[str],
+        invocation_index: int,
+        kind: str,
+    ) -> AFlowCompiledOutput:
         operator_key = re.sub(r"[^a-zA-Z0-9_]+", "_", operator).strip("_").lower() or "operator"
-        logical_id = f"aflow_{operator_key}_{index}"
+        logical_id = f"aflow_{operator_key}_{invocation_index}"
         content: Any = output
         mapping = _as_mapping(output)
         if mapping is not None:
@@ -130,7 +189,7 @@ class AFlowOperatorOutputCompiler:
                 "visibility_class": VisibilityClass.ROLE_SCOPED,
                 "communication_scope": "OPTIONAL_POLICY",
                 "aflow_operator": operator,
-                "aflow_invocation_index": index,
+                "aflow_invocation_index": invocation_index,
                 "aflow_output_kind": kind,
             },
             created_by_role=operator,
@@ -153,8 +212,140 @@ class AFlowOperatorOutputCompiler:
             node_ids=(node.node_id,),
             primary_node_id=node.node_id,
             operator=operator,
-            invocation_index=index,
+            invocation_index=invocation_index,
             output_kind=kind,
+        )
+
+    def _compile_canonical(
+        self,
+        session: "AFlowGraphSession",
+        *,
+        operator: str,
+        output: Any,
+        input_node_ids: Iterable[str],
+        invocation_index: int,
+        kind: str,
+    ) -> AFlowCompiledOutput:
+        operator_key = re.sub(r"[^a-zA-Z0-9_]+", "_", operator).strip("_").lower() or "operator"
+        source_refs = tuple(str(item) for item in input_node_ids)
+        normalized = normalize_output(output)
+        digest = output_digest(kind, normalized)
+        invocation = session.store.add_node(
+            task_id=session.task_id,
+            branch_id=session.branch_id,
+            logical_id=f"aflow_invocation_{operator_key}_{invocation_index}",
+            node_type="aflow_invocation",
+            content={
+                "operator": operator,
+                "invocation_index": invocation_index,
+                "content_digest": digest,
+            },
+            owner=operator,
+            source_refs=source_refs,
+            provenance={
+                "origin": NodeOrigin.MODEL,
+                "visibility_class": VisibilityClass.ROLE_SCOPED,
+                "communication_scope": "INTERNAL_ONLY",
+                "aflow_operator": operator,
+                "aflow_invocation_index": invocation_index,
+            },
+            created_by_role=operator,
+            run_id=session.run_id,
+        )
+        for source_id in source_refs:
+            session.store.add_edge(
+                source=source_id,
+                target=invocation.node_id,
+                relation="input_to",
+                created_by_role=operator,
+                run_id=session.run_id,
+            )
+
+        key = (kind, digest)
+        record = session._artifact_by_digest.get(key)
+        reused = record is not None
+        if record is None:
+            artifact = session.store.add_node(
+                task_id=session.task_id,
+                branch_id=session.branch_id,
+                logical_id=f"aflow_artifact_{kind}_{digest[:16]}",
+                node_type="aflow_artifact",
+                content=normalized,
+                owner=operator,
+                source_refs=source_refs,
+                provenance={
+                    "origin": NodeOrigin.MODEL,
+                    "visibility_class": VisibilityClass.ROLE_SCOPED,
+                    "communication_scope": "OPTIONAL_POLICY",
+                    "aflow_operator": operator,
+                    "aflow_output_kind": kind,
+                    "content_digest": digest,
+                },
+                created_by_role=operator,
+                run_id=session.run_id,
+            )
+            record = AFlowArtifactRecord(
+                node_id=artifact.node_id,
+                output_kind=kind,
+                content_digest=digest,
+                raw_output=output,
+            )
+            session._artifact_by_digest[key] = record
+            session._raw_outputs[artifact.node_id] = output
+            session._artifact_token_cost[artifact.node_id] = session._count_tokens(output)
+            session.telemetry.emit("aflow_artifact_created", {
+                "task_id": session.task_id,
+                "operator": operator,
+                "node_id": artifact.node_id,
+                "content_digest": digest,
+                "output_kind": kind,
+            })
+            session.telemetry.record_aflow_metric(aflow_canonical_artifacts=1)
+        else:
+            record.occurrence_count += 1
+            session.telemetry.emit("aflow_duplicate_artifact_detected", {
+                "task_id": session.task_id,
+                "operator": operator,
+                "canonical_node_id": record.node_id,
+                "content_digest": digest,
+                "occurrence_count": record.occurrence_count,
+            })
+            if _is_candidate_output(operator, kind):
+                session.telemetry.record_aflow_metric(aflow_duplicate_candidate_occurrences=1)
+        session.store.add_edge(
+            source=invocation.node_id,
+            target=record.node_id,
+            relation="materializes",
+            created_by_role=operator,
+            run_id=session.run_id,
+        )
+        session._raw_outputs[record.node_id] = record.raw_output
+        session._last_output_ids = (record.node_id,)
+        session._occurrence_artifact_ids[invocation.node_id] = record.node_id
+        if _is_candidate_output(operator, kind):
+            session._candidate_occurrence_ids.append(invocation.node_id)
+            is_new_candidate = record.node_id not in session._candidate_artifact_ids
+            if record.node_id not in session._candidate_artifact_ids:
+                session._candidate_artifact_ids.append(record.node_id)
+            session._candidate_tokens_before_dedup += session._count_tokens(output)
+            session.telemetry.record_aflow_metric(
+                aflow_candidate_occurrences=1,
+                aflow_candidate_tokens_before_dedup=session._count_tokens(output),
+            )
+            session.telemetry.record_aflow_metric(
+                aflow_canonical_candidates=1 if is_new_candidate else 0
+            )
+        session._refresh_views()
+        return AFlowCompiledOutput(
+            node_ids=(record.node_id,),
+            primary_node_id=record.node_id,
+            operator=operator,
+            invocation_index=invocation_index,
+            output_kind=kind,
+            content_digest=digest,
+            invocation_node_id=invocation.node_id,
+            reused=reused,
+            occurrence_count=record.occurrence_count,
         )
 
 
@@ -172,19 +363,40 @@ class AFlowGraphSession:
         telemetry: WorkflowTelemetry | None = None,
         run_id: str = "",
         endpoints: Iterable[str] = (),
+        content_dedup: bool = False,
+        invocation_reuse: bool = False,
+        dedup_mode: str = "exact",
+        model_fingerprint: str = "",
+        generation_config: Mapping[str, Any] | None = None,
+        tokenizer: Any = None,
     ) -> None:
         self.task_id = str(task_id)
         self.task = str(task)
         self.dataset = str(dataset)
         self.branch_id = str(branch_id)
         self.run_id = str(run_id or f"aflow:{self.task_id}")
+        if dedup_mode not in {"exact", "structured"}:
+            raise ValueError(f"unsupported AFlow dedup mode: {dedup_mode}")
+        self.content_dedup = bool(content_dedup)
+        self.invocation_reuse_enabled = bool(invocation_reuse)
+        self.dedup_mode = str(dedup_mode)
+        self.model_fingerprint = str(model_fingerprint)
+        self.generation_config = dict(generation_config or {})
+        self.tokenizer = tokenizer
         self.store = GraphStore()
         self.telemetry = telemetry or WorkflowTelemetry()
         self.policy = policy or SendAllPolicy()
         self._invocations: dict[str, int] = {}
         self._last_output_ids: tuple[str, ...] = ()
         self._candidate_pool_ids: list[str] = []
+        self._candidate_occurrence_ids: list[str] = []
+        self._candidate_artifact_ids: list[str] = []
+        self._artifact_by_digest: dict[tuple[str, str], AFlowArtifactRecord] = {}
+        self._artifact_token_cost: dict[str, int] = {}
+        self._occurrence_artifact_ids: dict[str, str] = {}
+        self._candidate_tokens_before_dedup = 0
         self._raw_outputs: dict[str, Any] = {}
+        self._invocation_reuse = AFlowInvocationReuse() if self.invocation_reuse_enabled else None
 
         task_node = self.store.add_node(
             task_id=self.task_id,
@@ -266,13 +478,170 @@ class AFlowGraphSession:
         return self._last_output_ids
 
     def candidate_pool_ids(self) -> tuple[str, ...]:
+        if self.content_dedup:
+            return tuple(self._candidate_artifact_ids)
         return tuple(self._candidate_pool_ids)
 
+    def candidate_occurrence_ids(self) -> tuple[str, ...]:
+        return tuple(self._candidate_occurrence_ids)
+
+    def artifact_multiplicity(self, node_id: str) -> int:
+        for record in self._artifact_by_digest.values():
+            if record.node_id == str(node_id):
+                return int(record.occurrence_count)
+        return 1
+
+    def _count_tokens(self, value: Any) -> int:
+        if self.tokenizer is None:
+            return max(1, len(_text_value(value).split()))
+        encoded = self.tokenizer(_text_value(value), add_special_tokens=False)
+        if hasattr(encoded, "get"):
+            encoded = encoded.get("input_ids", [])
+        elif hasattr(encoded, "input_ids"):
+            encoded = encoded.input_ids
+        return len(encoded)
+
+    def invocation_key(
+        self,
+        *,
+        operator: str,
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+    ) -> AFlowInvocationKey:
+        return AFlowInvocationKey.build(
+            task_id=self.task_id,
+            operator=operator,
+            args=args,
+            kwargs=kwargs,
+            model_fingerprint=self.model_fingerprint,
+            generation_config=self.generation_config,
+        )
+
+    async def execute_invocation(
+        self,
+        key: AFlowInvocationKey,
+        compute: Callable[[], Awaitable[Any]],
+    ) -> tuple[Any, bool]:
+        if self._invocation_reuse is None:
+            return await compute(), False
+        result = await self._invocation_reuse.get_or_compute(key, compute)
+        self.telemetry.record_aflow_metric(
+            aflow_invocation_reuse_hits=1 if result.hit else 0,
+        )
+        self.telemetry.emit(
+            "aflow_invocation_reused" if result.hit else "aflow_invocation_started",
+            {
+                "task_id": self.task_id,
+                "operator": key.operator,
+                "cache_hit": result.hit,
+                "normalized_input_digest": key.normalized_input_digest,
+            },
+        )
+        return result.value, result.hit
+
     def consume_candidate_pool(self) -> None:
+        if self.content_dedup and self._candidate_artifact_ids:
+            self.telemetry.record_aflow_metric(
+                aflow_candidate_tokens_after_dedup=sum(
+                    self._artifact_token_cost.get(node_id, 0)
+                    for node_id in self._candidate_artifact_ids
+                )
+            )
         self._candidate_pool_ids.clear()
+        self._candidate_occurrence_ids.clear()
+        self._candidate_artifact_ids.clear()
 
     def raw_output(self, node_id: str) -> Any:
         return self._raw_outputs.get(str(node_id))
+
+    def prepare_operator_input(
+        self,
+        *,
+        operator: str,
+        kwargs: Mapping[str, Any],
+        communication_mode: str,
+    ) -> AFlowOperatorInput:
+        """Make the graph slice the authoritative downstream input.
+
+        AFlow still owns the workflow topology and operator order.  Once an
+        operator has produced a graph node, however, the next operator in a
+        graph mode receives only the receiver-specific slice selected by the
+        shared communication runtime.  ``graph_shadow`` intentionally keeps
+        the original AFlow arguments as a non-intervening control.
+        """
+        rewritten = dict(kwargs)
+        if communication_mode == "graph_shadow":
+            return AFlowOperatorInput(kwargs=rewritten)
+
+        operator_name = str(operator)
+        lowered = operator_name.casefold()
+        candidate_ids = self.candidate_pool_ids() if "ensemble" in lowered else ()
+        latest_ids = self.latest_output_ids()
+        source_ids = tuple(candidate_ids)
+        if not source_ids:
+            raw_input = str(rewritten.get("input", ""))
+            has_embedded_previous = any(
+                marker in raw_input
+                for marker in (
+                    "Best solution:", "Best answer:", "Code output:",
+                    "Failed solution:", "Error:",
+                )
+            )
+            consumes_latest = (
+                "test" in lowered
+                or "program" in lowered
+                or "analysis" in rewritten
+                or has_embedded_previous
+                or (
+                    "generate" in lowered
+                    and bool(rewritten.get("instruction"))
+                    and not (
+                        latest_ids
+                        and self.store.node(latest_ids[-1]).type
+                        in {"candidate_answer", "code"}
+                    )
+                )
+            )
+            source_ids = latest_ids if consumes_latest else ()
+
+        if not source_ids:
+            return AFlowOperatorInput(kwargs=rewritten)
+
+        source_node = self.store.node(source_ids[0])
+        sender = str(source_node.provenance.get("aflow_operator", source_node.owner))
+        context = self.receiver_context_for_operator(
+            sender=sender,
+            receiver=operator_name,
+            input_node_ids=source_ids,
+        )
+        delivered_ids = tuple(context.sent_node_ids)
+
+        # Never fall back to the original full history.  An empty selected
+        # candidate set is a real protocol outcome and must remain observable.
+        if "solutions" in rewritten and candidate_ids:
+            rewritten["solutions"] = [
+                _operator_value(self.raw_output(node_id))
+                for node_id in delivered_ids
+                if node_id in candidate_ids
+            ]
+        elif "solution" in rewritten:
+            delivered_sources = [node_id for node_id in delivered_ids if node_id in source_ids]
+            rewritten["solution"] = (
+                _operator_value(self.raw_output(delivered_sources[-1]))
+                if delivered_sources else ""
+            )
+        elif "analysis" in rewritten:
+            rewritten["analysis"] = context.text
+        elif "input" in rewritten:
+            rewritten["input"] = context.text
+        elif "problem" in rewritten and "generate" in lowered:
+            rewritten["problem"] = context.text
+
+        return AFlowOperatorInput(
+            kwargs=rewritten,
+            source_node_ids=delivered_ids,
+            context=context,
+        )
 
     def receiver_context_for_operator(
         self,
@@ -373,6 +742,21 @@ class AFlowGraphSession:
         text = render_compact_context_slice(context_slice, self.store.snapshot())
         candidate_tokens = sum(item.token_cost for item in candidates)
         sent_tokens = int(context_slice.token_count)
+        if self.content_dedup and "ensemble" in receiver.casefold():
+            before_tokens = sum(
+                self._count_tokens(self.raw_output(self._occurrence_artifact_ids.get(invocation_id, "")))
+                for invocation_id in self._candidate_occurrence_ids
+            )
+            after_tokens = sum(
+                self._artifact_token_cost.get(node_id, 0)
+                for node_id in sent_ids
+                if node_id in self._candidate_artifact_ids
+            )
+            self.telemetry.record_aflow_metric(
+                aflow_downstream_tokens_before_dedup=before_tokens,
+                aflow_downstream_tokens_after_dedup=after_tokens,
+                aflow_dedup_saved_tokens=max(0, before_tokens - after_tokens),
+            )
         self.telemetry.record_graph_communication({
             "task_id": self.task_id,
             "dataset": self.dataset,
@@ -448,67 +832,30 @@ def make_aflow_operator_proxy_module(
 
             async def __call__(self, *args: Any, **kwargs: Any) -> Any:
                 operator_name = original.__name__
-                lowered = operator_name.casefold()
-                candidate_ids = session.candidate_pool_ids() if "ensemble" in lowered else ()
-                latest_ids = session.latest_output_ids()
-                source_ids = candidate_ids
-                if not source_ids:
-                    raw_input = str(kwargs.get("input", ""))
-                    has_embedded_previous = any(
-                        marker in raw_input
-                        for marker in ("Best solution:", "Best answer:", "Code output:", "Failed solution:", "Error:")
-                    )
-                    consumes_latest = (
-                        "test" in lowered
-                        or "program" in lowered
-                        or "analysis" in kwargs
-                        or has_embedded_previous
-                        or (
-                            "generate" in lowered
-                            and bool(kwargs.get("instruction"))
-                            and not (
-                                latest_ids
-                                and session.store.node(latest_ids[-1]).type in {"candidate_answer", "code"}
-                            )
-                        )
-                    )
-                    source_ids = latest_ids if consumes_latest else ()
-                rewritten_kwargs = dict(kwargs)
+                prepared = session.prepare_operator_input(
+                    operator=operator_name,
+                    kwargs=kwargs,
+                    communication_mode=communication_mode,
+                )
+                async def compute() -> Any:
+                    return await super(OperatorProxy, self).__call__(*args, **prepared.kwargs)
 
-                if communication_mode != "graph_shadow" and source_ids:
-                    source_node = session.store.node(source_ids[0])
-                    sender = str(source_node.provenance.get("aflow_operator", source_node.owner))
-                    context = session.receiver_context_for_operator(
-                        sender=sender,
-                        receiver=operator_name,
-                        input_node_ids=source_ids,
+                if session.invocation_reuse_enabled:
+                    key = session.invocation_key(
+                        operator=operator_name,
+                        args=args,
+                        kwargs=prepared.kwargs,
                     )
-                    if "solutions" in rewritten_kwargs and candidate_ids:
-                        selected = [
-                            _operator_value(session.raw_output(node_id))
-                            for node_id in context.sent_node_ids
-                            if node_id in candidate_ids
-                        ]
-                        if selected:
-                            rewritten_kwargs["solutions"] = selected
-                    elif "solution" in rewritten_kwargs:
-                        rewritten_kwargs["solution"] = _operator_value(
-                            session.raw_output(source_ids[-1])
-                        )
-                    elif "analysis" in rewritten_kwargs:
-                        rewritten_kwargs["analysis"] = context.text
-                    elif "input" in rewritten_kwargs:
-                        rewritten_kwargs["input"] = context.text
-                    elif "problem" in rewritten_kwargs and "generate" in lowered:
-                        rewritten_kwargs["problem"] = context.text
-
-                result = await super().__call__(*args, **rewritten_kwargs)
+                    result, cache_hit = await session.execute_invocation(key, compute)
+                else:
+                    result = await compute()
+                    cache_hit = False
                 session.compile_output(
                     operator=operator_name,
                     output=result,
-                    input_node_ids=source_ids,
+                    input_node_ids=prepared.source_node_ids,
                 )
-                if "ensemble" in lowered:
+                if "ensemble" in operator_name.casefold():
                     session.consume_candidate_pool()
                 return result
 

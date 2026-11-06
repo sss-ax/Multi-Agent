@@ -20,8 +20,13 @@ VALIDATION_RELATIONS: FrozenSet[str] = frozenset(
 
 LINEAGE_RELATIONS: FrozenSet[str] = frozenset({"supersedes"})
 
+# Audit/provenance links that must not be traversed as model-visible data
+# dependencies.  In particular, an internal AFlow invocation materializes a
+# canonical artifact but is not itself part of the receiver context.
+TRACE_RELATIONS: FrozenSet[str] = frozenset({"materializes"})
+
 ALL_RUNTIME_RELATIONS: FrozenSet[str] = (
-    DATA_DEPENDENCY_RELATIONS | VALIDATION_RELATIONS | LINEAGE_RELATIONS
+    DATA_DEPENDENCY_RELATIONS | VALIDATION_RELATIONS | LINEAGE_RELATIONS | TRACE_RELATIONS
 )
 
 
@@ -57,6 +62,19 @@ RELATION_SPECS.update(
             participates_in_dag=False,
         )
         for relation in VALIDATION_RELATIONS
+    }
+)
+RELATION_SPECS.update(
+    {
+        relation: RelationSpec(
+            name=relation,
+            source_role="invocation",
+            target_role="artifact",
+            propagates_source_change=False,
+            propagates_target_change=False,
+            participates_in_dag=False,
+        )
+        for relation in TRACE_RELATIONS
     }
 )
 RELATION_SPECS.update(

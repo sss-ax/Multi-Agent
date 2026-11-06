@@ -189,6 +189,10 @@ async def _run_one(
     generation_timeout_seconds: float | None,
     communication_mode: str,
     communication_policy: str,
+    model_fingerprint: str,
+    aflow_content_dedup: bool,
+    aflow_invocation_reuse: bool,
+    aflow_dedup_mode: str,
     resume_result: dict[str, Any] | None,
     save_progress: Callable[[dict[str, Any]], None],
 ) -> dict[str, Any]:
@@ -203,8 +207,13 @@ async def _run_one(
     progress: Any = None
     log_dir.mkdir(parents=True, exist_ok=True)
     call_log_path = log_dir / "model_calls.jsonl"
+    graph_log_path = log_dir / "graph_1.jsonl"
     if resume_result is None:
         call_log_path.write_text("", encoding="utf-8")
+        # A graph telemetry file is append-only by design, so explicitly
+        # truncate it at the beginning of a fresh run.  Otherwise a later
+        # audit can mix events from multiple experiments.
+        graph_log_path.write_text("", encoding="utf-8")
 
     def report_model_call(event: dict[str, Any]) -> None:
         persisted_event = {"timestamp": time.time(), **event}
@@ -227,7 +236,9 @@ async def _run_one(
             detail = (
                 f"[LLM {status}] {dataset} item={problem_number} call={problem_call} "
                 f"elapsed={float(event['elapsed_seconds']):.2f}s "
-                f"output_tokens={event['output_tokens']}"
+                f"output_tokens={event['output_tokens']} "
+                f"prefill_tokens={event.get('physical_prefill_tokens', '-') } "
+                f"cache_hit_tokens={event.get('prefix_cache_hit_tokens', '-') }"
             )
             if event.get("error"):
                 detail += f" error={event['error']}"
@@ -293,6 +304,13 @@ async def _run_one(
             "model_calls": int(result.get("model_calls", 0)),
             "timeout_count": int(result.get("timeout_count", 0)),
             "input_tokens": int(result.get("input_tokens", 0)),
+            "physical_prefill_tokens": int(result.get("physical_prefill_tokens", 0)),
+            "prefix_cache_hit_tokens": int(result.get("prefix_cache_hit_tokens", 0)),
+            "prefix_cache_miss_tokens": int(result.get("prefix_cache_miss_tokens", 0)),
+            "prefix_cache_warmup_tokens": int(result.get("prefix_cache_warmup_tokens", 0)),
+            "prefix_cache_hits": int(result.get("prefix_cache_hits", 0)),
+            "prefix_cache_misses": int(result.get("prefix_cache_misses", 0)),
+            "transformer_forward_calls": int(result.get("transformer_forward_calls", 0)),
             "output_tokens": int(result.get("output_tokens", 0)),
         }
         save_progress(result)
@@ -311,6 +329,7 @@ async def _run_one(
                     problem_index=row_index,
                     problem_id=_row_identifier(rows[row_index], row_index),
                     call_offset=call_offset,
+                    cache_namespace=f"aflow:{dataset}:{_row_identifier(rows[row_index], row_index)}",
                 )
                 progress.set_postfix_str(f"item {row_index + 1}: evaluating", refresh=True)
                 item_started = time.time()
@@ -318,6 +337,9 @@ async def _run_one(
                 item_workflow = workflow
                 if communication_mode != "original":
                     row_id = _row_identifier(rows[row_index], row_index)
+                    graph_log_path = log_dir / f"graph_{row_index + 1}.jsonl"
+                    if resume_result is None:
+                        graph_log_path.write_text("", encoding="utf-8")
                     graph_session = AFlowGraphSession(
                         task_id=row_id,
                         task=_row_task_text(rows[row_index]),
@@ -328,8 +350,21 @@ async def _run_one(
                             task_family=dataset,
                         ),
                         telemetry=WorkflowTelemetry(
-                            log_dir / f"graph_{row_index + 1}.jsonl"
+                            graph_log_path
                         ),
+                        content_dedup=aflow_content_dedup,
+                        invocation_reuse=aflow_invocation_reuse,
+                        dedup_mode=aflow_dedup_mode,
+                        model_fingerprint=model_fingerprint,
+                        generation_config={
+                            "max_new_tokens": getattr(model, "max_new_tokens", None),
+                            "use_chat_template": getattr(model, "use_chat_template", None),
+                            "do_sample": False,
+                            "temperature": 0.0,
+                            "top_p": 1.0,
+                            "seed": 42,
+                        },
+                        tokenizer=model.tokenizer,
                     )
                     workflow_module, graph_path = _load_paper_workflow(
                         dataset,
@@ -346,6 +381,9 @@ async def _run_one(
                 record = await benchmark.evaluate_problem(rows[row_index], item_workflow)
                 item_calls = bridge.calls[call_offset:]
                 if graph_session is not None:
+                    graph_session.telemetry.record_aflow_metric(
+                        aflow_actual_llm_calls=len(item_calls)
+                    )
                     result.setdefault("graph_telemetry", []).append(
                         graph_session.telemetry.summary()
                     )
@@ -392,11 +430,25 @@ def _compact_call_record(call: dict[str, Any]) -> dict[str, Any]:
             "dataset",
             "problem_index",
             "problem_id",
+            # Preserve the native AFlow operator trace so communication-cost
+            # audits can identify which intermediate outputs are copied into
+            # later operator prompts.  Token totals alone cannot recover this.
+            "prompt",
+            "output",
             "input_tokens",
             "output_tokens",
             "elapsed_seconds",
             "timed_out",
             "error",
+            "logical_input_tokens",
+            "physical_prefill_tokens",
+            "prefix_cache_hit_tokens",
+            "prefix_cache_miss_tokens",
+            "prefix_cache_warmup_tokens",
+            "prefix_cache_hit",
+            "prefix_cache_hits",
+            "prefix_cache_misses",
+            "transformer_forward_calls",
         )
         if key in call
     }
@@ -444,6 +496,13 @@ def _initial_run_result(
         "model_calls": 0,
         "timeout_count": 0,
         "input_tokens": 0,
+        "physical_prefill_tokens": 0,
+        "prefix_cache_hit_tokens": 0,
+        "prefix_cache_miss_tokens": 0,
+        "prefix_cache_warmup_tokens": 0,
+        "prefix_cache_hits": 0,
+        "prefix_cache_misses": 0,
+        "transformer_forward_calls": 0,
         "output_tokens": 0,
         "total_model_tokens": 0,
         "wall_time_seconds": 0.0,
@@ -473,6 +532,13 @@ def _refresh_run_totals(
     result["model_calls"] = prior_usage["model_calls"] + int(usage["call_count"])
     result["timeout_count"] = prior_usage["timeout_count"] + int(usage["timeout_count"])
     result["input_tokens"] = prior_usage["input_tokens"] + int(usage["total_input_tokens"])
+    result["physical_prefill_tokens"] = prior_usage["physical_prefill_tokens"] + int(usage["total_physical_prefill_tokens"])
+    result["prefix_cache_hit_tokens"] = prior_usage["prefix_cache_hit_tokens"] + int(usage["total_prefix_cache_hit_tokens"])
+    result["prefix_cache_miss_tokens"] = prior_usage["prefix_cache_miss_tokens"] + int(usage["total_prefix_cache_miss_tokens"])
+    result["prefix_cache_warmup_tokens"] = prior_usage["prefix_cache_warmup_tokens"] + int(usage["total_prefix_cache_warmup_tokens"])
+    result["prefix_cache_hits"] = prior_usage["prefix_cache_hits"] + int(usage["prefix_cache_hits"])
+    result["prefix_cache_misses"] = prior_usage["prefix_cache_misses"] + int(usage["prefix_cache_misses"])
+    result["transformer_forward_calls"] = prior_usage["transformer_forward_calls"] + int(usage["transformer_forward_calls"])
     result["output_tokens"] = prior_usage["output_tokens"] + int(usage["total_output_tokens"])
     result["total_model_tokens"] = result["input_tokens"] + result["output_tokens"]
     result["wall_time_seconds"] = prior_wall_time + time.time() - started
@@ -521,6 +587,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--prefix-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse identical prompt prefixes across calls within one problem.",
+    )
+    parser.add_argument(
+        "--prefix-cache-max-entries",
+        type=int,
+        default=16,
+        help="Maximum cached prompt-prefix KV states per model instance.",
+    )
+    parser.add_argument(
         "--communication-mode",
         choices=("original", "graph_shadow", "graph_sendall", "graph_ra"),
         default="original",
@@ -532,6 +610,22 @@ def main() -> None:
         default="send_all",
         help="Graph communication policy used by graph_* modes.",
     )
+    parser.add_argument(
+        "--aflow-content-dedup",
+        action="store_true",
+        help="Collapse exact duplicate AFlow outputs into one canonical GraphStore artifact.",
+    )
+    parser.add_argument(
+        "--aflow-invocation-reuse",
+        action="store_true",
+        help="Reuse deterministic duplicate Operator invocations with async single-flight.",
+    )
+    parser.add_argument(
+        "--aflow-dedup-mode",
+        choices=("exact", "structured"),
+        default="exact",
+        help="Canonical output deduplication mode; structured is reserved for conservative typed extraction.",
+    )
     parser.add_argument("--output", default=".runtime/aflow_paper_reproduction/results.json")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
@@ -542,6 +636,23 @@ def main() -> None:
         raise SystemExit("--generation-timeout-seconds cannot be negative")
     if args.max_new_tokens < 0:
         raise SystemExit("--max-new-tokens cannot be negative")
+    if args.prefix_cache_max_entries < 1:
+        raise SystemExit("--prefix-cache-max-entries must be positive")
+    if args.communication_mode == "original" and (
+        args.aflow_content_dedup or args.aflow_invocation_reuse
+    ):
+        raise SystemExit(
+            "AFlow reuse flags require graph_sendall or graph_ra; "
+            "original mode is intentionally untouched"
+        )
+    if args.aflow_dedup_mode == "structured":
+        raise SystemExit(
+            "--aflow-dedup-mode structured is not implemented yet; use exact"
+        )
+    if args.aflow_invocation_reuse and not args.aflow_content_dedup:
+        raise SystemExit(
+            "--aflow-invocation-reuse requires --aflow-content-dedup"
+        )
     communication_policy = args.communication_policy
     if args.communication_mode == "graph_ra" and communication_policy == "send_all":
         # AFlow outputs are whole semantic nodes rather than fragment-labelled
@@ -575,8 +686,13 @@ def main() -> None:
         "max_new_tokens": args.max_new_tokens or None,
         "chat_template": args.chat_template,
         "generation_timeout_seconds": args.generation_timeout_seconds or None,
+        "prefix_cache": args.prefix_cache,
+        "prefix_cache_max_entries": args.prefix_cache_max_entries,
         "communication_mode": args.communication_mode,
         "communication_policy": communication_policy,
+        "aflow_content_dedup": args.aflow_content_dedup,
+        "aflow_invocation_reuse": args.aflow_invocation_reuse,
+        "aflow_dedup_mode": args.aflow_dedup_mode,
         "requested_limit": limit,
         "runs": {},
     }
@@ -588,8 +704,13 @@ def main() -> None:
             "math_paper_subset": args.math_paper_subset,
             "max_new_tokens": args.max_new_tokens or None,
             "chat_template": args.chat_template,
+            "prefix_cache": args.prefix_cache,
+            "prefix_cache_max_entries": args.prefix_cache_max_entries,
             "communication_mode": args.communication_mode,
             "communication_policy": communication_policy,
+            "aflow_content_dedup": args.aflow_content_dedup,
+            "aflow_invocation_reuse": args.aflow_invocation_reuse,
+            "aflow_dedup_mode": args.aflow_dedup_mode,
             "requested_limit": limit,
         }
         mismatches = [
@@ -610,6 +731,8 @@ def main() -> None:
         args.model_path,
         max_new_tokens=args.max_new_tokens or None,
         use_chat_template=args.chat_template,
+        prefix_cache=args.prefix_cache,
+        prefix_cache_max_entries=args.prefix_cache_max_entries,
     )
     for dataset in selected:
         dataset_runs = payload["runs"].setdefault(dataset, {})
@@ -640,6 +763,10 @@ def main() -> None:
                     generation_timeout_seconds=args.generation_timeout_seconds or None,
                     communication_mode=args.communication_mode,
                     communication_policy=communication_policy,
+                    model_fingerprint=args.model_path,
+                    aflow_content_dedup=args.aflow_content_dedup,
+                    aflow_invocation_reuse=args.aflow_invocation_reuse,
+                    aflow_dedup_mode=args.aflow_dedup_mode,
                     resume_result=saved_run,
                     save_progress=save_run_progress,
                 )

@@ -139,6 +139,18 @@ class WorkflowTelemetry:
             "graph_role_aware_source_ref_saved_tokens": 0,
             "graph_role_aware_state_ref_saved_tokens": 0,
             "peak_context_tokens": 0,
+            "aflow_operator_invocations": 0,
+            "aflow_actual_llm_calls": 0,
+            "aflow_invocation_reuse_hits": 0,
+            "aflow_canonical_artifacts": 0,
+            "aflow_candidate_occurrences": 0,
+            "aflow_canonical_candidates": 0,
+            "aflow_duplicate_candidate_occurrences": 0,
+            "aflow_candidate_tokens_before_dedup": 0,
+            "aflow_candidate_tokens_after_dedup": 0,
+            "aflow_downstream_tokens_before_dedup": 0,
+            "aflow_downstream_tokens_after_dedup": 0,
+            "aflow_dedup_saved_tokens": 0,
             "quality": {
                 "protocol_valid_actions": 0,
                 "compiled_actions": 0,
@@ -161,6 +173,12 @@ class WorkflowTelemetry:
             with self.path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(record, ensure_ascii=False, default=str, separators=(",", ":")))
                 stream.write("\n")
+
+    def record_aflow_metric(self, **values: int) -> None:
+        """Accumulate AFlow adapter metrics without coupling telemetry to AFlow."""
+        for key, value in values.items():
+            if key in self._summary:
+                self._summary[key] += int(value or 0)
 
     def record_action(self, payload: dict[str, Any]) -> None:
         event = dict(payload)

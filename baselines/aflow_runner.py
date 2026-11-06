@@ -30,6 +30,7 @@ class AFlowModelRequest:
     session_reset: bool = True
     session_rollback: bool = False
     timeout_seconds: float | None = None
+    cache_namespace: str = ""
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,7 @@ class AFlowReplayRunner:
                         prompt=prompt,
                         session_prompt=prompt,
                         session_id=f"external:aflow:{sample_id}:{step.name}",
+                        cache_namespace=f"external:aflow:{sample_id}",
                     )
                 )
             )
@@ -333,6 +335,10 @@ class _AFlowLLMBridge:
                         session_prompt=prompt,
                         session_id=f"external:aflow:{call_number}",
                         timeout_seconds=self.call_timeout_seconds,
+                        cache_namespace=str(
+                            self.call_context.get("cache_namespace", "")
+                            or f"external:aflow:{call_number}"
+                        ),
                     )
                 )
             )
@@ -370,6 +376,15 @@ class _AFlowLLMBridge:
             "output_tokens": count_tokens(self.tokenizer, output),
             "elapsed_seconds": elapsed,
             "timed_out": timed_out,
+            "logical_input_tokens": int(model_metrics.get("logical_input_tokens", input_tokens)),
+            "physical_prefill_tokens": int(model_metrics.get("physical_prefill_tokens", input_tokens)),
+            "prefix_cache_hit_tokens": int(model_metrics.get("prefix_cache_hit_tokens", 0)),
+            "prefix_cache_miss_tokens": int(model_metrics.get("prefix_cache_miss_tokens", input_tokens)),
+            "prefix_cache_warmup_tokens": int(model_metrics.get("prefix_cache_warmup_tokens", 0)),
+            "prefix_cache_hit": bool(model_metrics.get("prefix_cache_hit", False)),
+            "prefix_cache_hits": int(model_metrics.get("prefix_cache_hits", 0)),
+            "prefix_cache_misses": int(model_metrics.get("prefix_cache_misses", 0)),
+            "transformer_forward_calls": int(model_metrics.get("transformer_forward_calls", 1)),
             "chat_template_applied": bool(model_metrics.get("chat_template_applied", False)),
             **self.call_context,
         }
@@ -379,6 +394,9 @@ class _AFlowLLMBridge:
             "call_number": call_number,
             "input_tokens": call["input_tokens"],
             "output_tokens": call["output_tokens"],
+            "physical_prefill_tokens": call["physical_prefill_tokens"],
+            "prefix_cache_hit_tokens": call["prefix_cache_hit_tokens"],
+            "prefix_cache_hit": call["prefix_cache_hit"],
             "elapsed_seconds": elapsed,
             "timed_out": timed_out,
             **self.call_context,
@@ -400,6 +418,14 @@ class _AFlowLLMBridge:
             "total_input_tokens": input_tokens,
             "total_output_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
+            "total_logical_input_tokens": sum(int(call.get("logical_input_tokens", call["input_tokens"])) for call in self.calls),
+            "total_physical_prefill_tokens": sum(int(call.get("physical_prefill_tokens", call["input_tokens"])) for call in self.calls),
+            "total_prefix_cache_hit_tokens": sum(int(call.get("prefix_cache_hit_tokens", 0)) for call in self.calls),
+            "total_prefix_cache_miss_tokens": sum(int(call.get("prefix_cache_miss_tokens", call["input_tokens"])) for call in self.calls),
+            "total_prefix_cache_warmup_tokens": sum(int(call.get("prefix_cache_warmup_tokens", 0)) for call in self.calls),
+            "prefix_cache_hits": sum(int(call.get("prefix_cache_hits", 0)) for call in self.calls),
+            "prefix_cache_misses": sum(int(call.get("prefix_cache_misses", 0)) for call in self.calls),
+            "transformer_forward_calls": sum(int(call.get("transformer_forward_calls", 1)) for call in self.calls),
             "total_cost": 0.0,
             "call_count": len(self.calls),
             "timeout_count": sum(bool(call.get("timed_out")) for call in self.calls),
