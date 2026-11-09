@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from baselines.aflow_runner import _AFlowLLMBridge
+from scripts.audit_aflow_native_features import _audit_run
 from scripts.reproduce_aflow_paper import (
     _initial_run_result,
     _row_identifier,
@@ -13,6 +14,35 @@ from workflow_runtime.model_backend import TransformersModel
 class SpaceTokenizer:
     def __call__(self, text, *, add_special_tokens=False):
         return {"input_ids": str(text).split()}
+
+
+def test_humaneval_audit_classifies_initial_reflection_and_repair_calls():
+    class IntTokenizer:
+        def __call__(self, text, *, add_special_tokens=False):
+            return {"input_ids": list(range(len(str(text).split())))}
+
+    run = {
+        "communication_mode": "original",
+        "model_call_records": [
+            {"problem_id": "p1", "prompt": "def f(x): return x", "output": "code"},
+            {
+                "problem_id": "p1",
+                "prompt": "Given a code problem and a python code solution which failed to pass test or execute, analyze it.",
+                "output": "reflection",
+            },
+            {
+                "problem_id": "p1",
+                "prompt": "The previous solution failed some test cases. Please analyze the problem carefully.",
+                "output": "fixed",
+            },
+        ],
+    }
+    audited = _audit_run("HumanEval", "1", run, IntTokenizer(), min_match_tokens=1)
+    counts = audited[0]["phase_call_counts"]
+    assert counts["initial_code_generation_calls"] == 1
+    assert counts["reflection_calls"] == 1
+    assert counts["custom_fix_calls"] == 1
+    assert counts["other_calls"] == 0
 
 
 def test_transformers_backend_renders_user_chat_template():

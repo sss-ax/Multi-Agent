@@ -20,12 +20,16 @@ class AFlowInvocationKey:
     normalized_input_digest: str
     model_fingerprint: str
     generation_digest: str
+    dataset: str = ""
+    workflow_round: int = 0
 
     @classmethod
     def build(
         cls,
         *,
         task_id: str,
+        dataset: str = "",
+        workflow_round: int = 0,
         operator: str,
         args: tuple[Any, ...],
         kwargs: Mapping[str, Any],
@@ -36,6 +40,8 @@ class AFlowInvocationKey:
         generation_digest = _digest(dict(generation_config))
         return cls(
             task_id=str(task_id),
+            dataset=str(dataset),
+            workflow_round=int(workflow_round),
             operator=str(operator),
             normalized_input_digest=input_digest,
             model_fingerprint=str(model_fingerprint),
@@ -52,6 +58,9 @@ class AFlowArtifactRecord:
     content_digest: str
     raw_output: Any
     occurrence_count: int = 1
+    artifact_kind: str = ""
+    candidate_role: str = ""
+    profile: str = ""
 
 
 @dataclass(frozen=True)

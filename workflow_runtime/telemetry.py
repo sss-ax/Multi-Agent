@@ -151,6 +151,20 @@ class WorkflowTelemetry:
             "aflow_downstream_tokens_before_dedup": 0,
             "aflow_downstream_tokens_after_dedup": 0,
             "aflow_dedup_saved_tokens": 0,
+            "aflow_operator_argument_tokens_before_dedup": 0,
+            "aflow_operator_argument_tokens_after_dedup": 0,
+            "aflow_delivered_candidate_count": 0,
+            "aflow_candidate_occurrence_count": 0,
+            "aflow_weighted_ensemble_calls": 0,
+            "aflow_weighted_unique_candidates": 0,
+            "aflow_weighted_candidate_occurrences": 0,
+            "aflow_weighted_ensemble_fallbacks": 0,
+            "aflow_native_ensemble_prompt_tokens": 0,
+            "aflow_weighted_ensemble_prompt_tokens": 0,
+            "aflow_weighted_candidate_content_tokens": 0,
+            "aflow_weighted_metadata_tokens": 0,
+            "aflow_weighted_prompt_saved_tokens": 0,
+            "aflow_candidate_diagnostics": [],
             "quality": {
                 "protocol_valid_actions": 0,
                 "compiled_actions": 0,
@@ -179,6 +193,12 @@ class WorkflowTelemetry:
         for key, value in values.items():
             if key in self._summary:
                 self._summary[key] += int(value or 0)
+
+    def record_aflow_diagnostic(self, diagnostic: dict[str, Any]) -> None:
+        """Keep bounded task-level AFlow diagnostics in the run summary."""
+        records = self._summary.setdefault("aflow_candidate_diagnostics", [])
+        records.append(dict(diagnostic))
+        del records[:-200]
 
     def record_action(self, payload: dict[str, Any]) -> None:
         event = dict(payload)

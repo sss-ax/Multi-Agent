@@ -912,3 +912,1010 @@ def check(candidate):
     assert candidate("   Exa 1 2 2 mple") == "-Exa_1_2_2_mple", "This prints if this assert fails 4 (good for debugging!)"
 
 
+2026-11-08 02:27:35 - Error: .
+ Solution: def is_Sum_Of_Powers_Of_Two(n):
+    if n <= 0:
+        return False
+    while n != 0:
+        if n % 2 == 1:
+            n -= 1
+        elif n % 2 == 0:
+            n //= 2
+        if n == 1:
+            return True
+    return False.
+ Test: def check():
+    assert is_Sum_Of_Powers_Of_Two(10) == True
+    assert is_Sum_Of_Powers_Of_Two(7) == False
+    assert is_Sum_Of_Powers_Of_Two(14) == True
+
+2026-11-08 02:28:16 - Error: .
+ Solution: def parabola_directrix(a, b, c):
+    k = -b / (2 * a)
+    directrix = k - 1 / (4 * a)
+    return directrix.
+ Test: def check():
+    assert parabola_directrix(5,3,2)==-198
+    assert parabola_directrix(9,8,4)==-2336
+    assert parabola_directrix(2,4,6)==-130
+
+2026-11-08 02:48:37 - Error: .
+ Solution: def is_samepatterns(colors, patterns):
+    """
+    Check if the colors follow the sequence given in the patterns array.
+    
+    :param colors: List[str] - a list of color strings
+    :param patterns: List[str] - a list of pattern strings indicating the sequence
+    :return: bool - True if the colors match the sequence in patterns, False otherwise
+    """
+    pattern_to_color = {pattern: color for color, pattern in zip(colors, patterns)}
+    return all((pattern_to_color[pattern] == color for color, pattern in zip(colors, patterns))).
+ Test: def check():
+    assert is_samepatterns(["red","green","green"], ["a", "b", "b"])==True
+    assert is_samepatterns(["red","green","greenn"], ["a","b","b"])==False
+    assert is_samepatterns(["red","green","greenn"], ["a","b"])==False
+
+2026-11-08 02:48:43 - Error: .
+ Solution: def is_Sum_Of_Powers_Of_Two(n):
+    if n <= 0:
+        return False
+    while n != 0:
+        if n % 2 == 1:
+            n -= 1
+        elif n % 2 == 0:
+            n //= 2
+        if n == 1:
+            return True
+    return False.
+ Test: def check():
+    assert is_Sum_Of_Powers_Of_Two(10) == True
+    assert is_Sum_Of_Powers_Of_Two(7) == False
+    assert is_Sum_Of_Powers_Of_Two(14) == True
+
+2026-11-08 02:49:04 - Error: .
+ Solution: def parabola_directrix(a, b, c):
+    k = -b / (2 * a)
+    directrix = k - 1 / (4 * a)
+    return directrix.
+ Test: def check():
+    assert parabola_directrix(5,3,2)==-198
+    assert parabola_directrix(9,8,4)==-2336
+    assert parabola_directrix(2,4,6)==-130
+
+2026-11-08 03:14:02 - Error: .
+ Solution: def is_samepatterns(colors, patterns):
+    """
+    Check if the colors follow the sequence given in the patterns array.
+    
+    :param colors: List[str] - a list of color strings
+    :param patterns: List[str] - a list of pattern strings indicating the sequence
+    :return: bool - True if the colors match the sequence in patterns, False otherwise
+    """
+    pattern_to_color = {pattern: color for color, pattern in zip(colors, patterns)}
+    return all((pattern_to_color[pattern] == color for color, pattern in zip(colors, patterns))).
+ Test: def check():
+    assert is_samepatterns(["red","green","green"], ["a", "b", "b"])==True
+    assert is_samepatterns(["red","green","greenn"], ["a","b","b"])==False
+    assert is_samepatterns(["red","green","greenn"], ["a","b"])==False
+
+2026-11-08 03:14:08 - Error: .
+ Solution: def is_Sum_Of_Powers_Of_Two(n):
+    if n <= 0:
+        return False
+    while n != 0:
+        if n % 2 == 1:
+            n -= 1
+        elif n % 2 == 0:
+            n //= 2
+        if n == 1:
+            return True
+    return False.
+ Test: def check():
+    assert is_Sum_Of_Powers_Of_Two(10) == True
+    assert is_Sum_Of_Powers_Of_Two(7) == False
+    assert is_Sum_Of_Powers_Of_Two(14) == True
+
+2026-11-08 03:14:28 - Error: .
+ Solution: def parabola_directrix(a, b, c):
+    k = -b / (2 * a)
+    directrix = k - 1 / (4 * a)
+    return directrix.
+ Test: def check():
+    assert parabola_directrix(5,3,2)==-198
+    assert parabola_directrix(9,8,4)==-2336
+    assert parabola_directrix(2,4,6)==-130
+
+2026-11-08 03:35:20 - Error: .
+ Solution: def is_samepatterns(colors, patterns):
+    """
+    Check if the colors follow the sequence given in the patterns array.
+    
+    :param colors: List[str] - a list of color strings
+    :param patterns: List[str] - a list of pattern strings indicating the sequence
+    :return: bool - True if the colors match the sequence in patterns, False otherwise
+    """
+    pattern_to_color = {pattern: color for color, pattern in zip(colors, patterns)}
+    return all((pattern_to_color[pattern] == color for color, pattern in zip(colors, patterns))).
+ Test: def check():
+    assert is_samepatterns(["red","green","green"], ["a", "b", "b"])==True
+    assert is_samepatterns(["red","green","greenn"], ["a","b","b"])==False
+    assert is_samepatterns(["red","green","greenn"], ["a","b"])==False
+
+2026-11-08 03:35:27 - Error: .
+ Solution: def is_Sum_Of_Powers_Of_Two(n):
+    if n <= 0:
+        return False
+    while n != 0:
+        if n % 2 == 1:
+            n -= 1
+        elif n % 2 == 0:
+            n //= 2
+        if n == 1:
+            return True
+    return False.
+ Test: def check():
+    assert is_Sum_Of_Powers_Of_Two(10) == True
+    assert is_Sum_Of_Powers_Of_Two(7) == False
+    assert is_Sum_Of_Powers_Of_Two(14) == True
+
+2026-11-08 03:35:48 - Error: .
+ Solution: def parabola_directrix(a, b, c):
+    k = -b / (2 * a)
+    directrix = k - 1 / (4 * a)
+    return directrix.
+ Test: def check():
+    assert parabola_directrix(5,3,2)==-198
+    assert parabola_directrix(9,8,4)==-2336
+    assert parabola_directrix(2,4,6)==-130
+
+2026-11-08 03:47:10 - Error: .
+ Solution: def is_Sum_Of_Powers_Of_Two(n):
+    if n <= 0:
+        return False
+    while n != 0:
+        if n % 2 == 1:
+            n -= 1
+        elif n % 2 == 0:
+            n //= 2
+        if n == 1:
+            return True
+    return False.
+ Test: def check():
+    assert is_Sum_Of_Powers_Of_Two(10) == True
+    assert is_Sum_Of_Powers_Of_Two(7) == False
+    assert is_Sum_Of_Powers_Of_Two(14) == True
+
+2026-11-08 03:47:30 - Error: .
+ Solution: def parabola_directrix(a, b, c):
+    k = -b / (2 * a)
+    directrix = k - 1 / (4 * a)
+    return directrix.
+ Test: def check():
+    assert parabola_directrix(5,3,2)==-198
+    assert parabola_directrix(9,8,4)==-2336
+    assert parabola_directrix(2,4,6)==-130
+
+2026-11-08 03:47:49 - Error: .
+ Solution: def replace_spaces(text):
+    text = text.replace(' ', '_')
+    text = text.replace('_', ' ')
+    return text.
+ Test: def check():
+    assert replace_spaces('Jumanji The Jungle') == 'Jumanji_The_Jungle'
+    assert replace_spaces('The_Avengers') == 'The Avengers'
+    assert replace_spaces('Fast and Furious') == 'Fast_and_Furious'
+
+2026-11-08 03:48:25 - Error: .
+ Solution: def count_vowels(test_str):
+    vowels = set('aeiouAEIOU')
+    count = 0
+    if test_str[0] in vowels and (len(test_str) == 1 or test_str[1] not in vowels):
+        count += 1
+    for i in range(1, len(test_str) - 1):
+        if test_str[i - 1] in vowels or test_str[i + 1] in vowels:
+            count += 1
+    if test_str[-1] in vowels and (len(test_str) == 1 or test_str[-2] not in vowels):
+        count += 1
+    return count.
+ Test: def check():
+    assert count_vowels('bestinstareels') == 7
+    assert count_vowels('partofthejourneyistheend') == 12
+    assert count_vowels('amazonprime') == 5
+
+2026-11-08 03:48:47 - Error: .
+ Solution: def find_First_Missing(array, start=0, end=None):
+    """
+    Finds the smallest missing number in a sorted list of natural numbers.
+    
+    :param array: List of sorted natural numbers
+    :param start: Starting index for the search (default is 0)
+    :param end: Ending index for the search (default is None, which means the last index of the array)
+    :return: The smallest missing number
+    """
+    if end is None:
+        end = len(array) - 1
+    if start > end:
+        return start
+    while start <= end:
+        mid = (start + end) // 2
+        if array[mid] == mid + array[0]:
+            start = mid + 1
+        else:
+            end = mid - 1
+    return start.
+ Test: def check():
+    assert find_First_Missing([0,1,2,3]) == 4
+    assert find_First_Missing([0,1,2,6,9]) == 3
+    assert find_First_Missing([2,3,5,8,9]) == 0
+
+2026-11-08 03:49:16 - Error: .
+ Solution: from typing import List
+def combinations_list(list1: List[int]) -> List[List[int]]:
+    """
+    Generate all possible combinations of the elements of a given list.
+    
+    Args:
+    list1: A list of integers.
+    
+    Returns:
+    A list of lists, where each inner list is a unique combination of elements from the input list.
+    """
+    if not list1:
+        return [[]]
+    first_element = list1[0]
+    rest_elements = list1[1:]
+    combinations_without_first = combinations_list(rest_elements)
+    combinations_with_first = [[first_element] + combo for combo in combinations_without_first]
+    all_combinations = combinations_without_first + combinations_with_first
+    return all_combinations.
+ Test: def check():
+    assert combinations_list(['orange', 'red', 'green', 'blue'])==[[], ['orange'], ['red'], ['red', 'orange'], ['green'], ['green', 'orange'], ['green', 'red'], ['green', 'red', 'orange'], ['blue'], ['blue', 'orange'], ['blue', 'red'], ['blue', 'red', 'orange'], ['blue', 'green'], ['blue', 'green', 'orange'], ['blue', 'green', 'red'], ['blue', 'green', 'red', 'orange']]
+    assert combinations_list(['red', 'green', 'blue', 'white', 'black', 'orange'])==[[], ['red'], ['green'], ['green', 'red'], ['blue'], ['blue', 'red'], ['blue', 'green'], ['blue', 'green', 'red'], ['white'], ['white', 'red'], ['white', 'green'], ['white', 'green', 'red'], ['white', 'blue'], ['white', 'blue', 'red'], ['white', 'blue', 'green'], ['white', 'blue', 'green', 'red'], ['black'], ['black', 'red'], ['black', 'green'], ['black', 'green', 'red'], ['black', 'blue'], ['black', 'blue', 'red'], ['black', 'blue', 'green'], ['black', 'blue', 'green', 'red'], ['black', 'white'], ['black', 'white', 'red'], ['black', 'white', 'green'], ['black', 'white', 'green', 'red'], ['black', 'white', 'blue'], ['black', 'white', 'blue', 'red'], ['black', 'white', 'blue', 'green'], ['black', 'white', 'blue', 'green', 'red'], ['orange'], ['orange', 'red'], ['orange', 'green'], ['orange', 'green', 'red'], ['orange', 'blue'], ['orange', 'blue', 'red'], ['orange', 'blue', 'green'], ['orange', 'blue', 'green', 'red'], ['orange', 'white'], ['orange', 'white', 'red'], ['orange', 'white', 'green'], ['orange', 'white', 'green', 'red'], ['orange', 'white', 'blue'], ['orange', 'white', 'blue', 'red'], ['orange', 'white', 'blue', 'green'], ['orange', 'white', 'blue', 'green', 'red'], ['orange', 'black'], ['orange', 'black', 'red'], ['orange', 'black', 'green'], ['orange', 'black', 'green', 'red'], ['orange', 'black', 'blue'], ['orange', 'black', 'blue', 'red'], ['orange', 'black', 'blue', 'green'], ['orange', 'black', 'blue', 'green', 'red'], ['orange', 'black', 'white'], ['orange', 'black', 'white', 'red'], ['orange', 'black', 'white', 'green'], ['orange', 'black', 'white', 'green', 'red'], ['orange', 'black', 'white', 'blue'], ['orange', 'black', 'white', 'blue', 'red'], ['orange', 'black', 'white', 'blue', 'green'], ['orange', 'black', 'white', 'blue', 'green', 'red']]
+    assert combinations_list(['red', 'green', 'black', 'orange'])==[[], ['red'], ['green'], ['green', 'red'], ['black'], ['black', 'red'], ['black', 'green'], ['black', 'green', 'red'], ['orange'], ['orange', 'red'], ['orange', 'green'], ['orange', 'green', 'red'], ['orange', 'black'], ['orange', 'black', 'red'], ['orange', 'black', 'green'], ['orange', 'black', 'green', 'red']]
+
+2026-11-08 03:49:48 - Error: argument of type 'int' is not iterable.
+ Solution: def check_K(test_tup, K):
+    return any((K in tup for tup in test_tup))
+test_tup = ((1, 2), (3, 4, 5), (6, 7, 8, 9))
+K = 5
+K = 10.
+ Test: def check():
+    assert check_K((10, 4, 5, 6, 8), 6) == True
+    assert check_K((1, 2, 3, 4, 5, 6), 7) == False
+    assert check_K((7, 8, 9, 44, 11, 12), 11) == True
+
+2026-11-08 03:50:22 - Error: unsupported operand type(s) for //: 'int' and 'tuple'.
+ Solution: def min_Jumps(steps, d):
+    """
+    Calculate the minimum number of jumps of given length required to reach a point of form (d, 0) from origin in a 2D plane.
+    
+    :param steps: int - The length of each jump.
+    :param d: int - The target distance on the x-axis.
+    :return: int - The minimum number of jumps required to reach the target. Returns -1 if it's not possible.
+    """
+    if d < 0:
+        return -1
+    if d == 0:
+        return 0
+    full_jumps = d // steps
+    remaining_distance = d % steps
+    if remaining_distance == 0:
+        return full_jumps
+    return full_jumps + 1.
+ Test: def check():
+    assert min_Jumps((3,4),11)==3.5
+    assert min_Jumps((3,4),0)==0
+    assert min_Jumps((11,14),11)==1
+
+2026-11-08 03:51:10 - Error: .
+ Solution: def all_Bits_Set_In_The_Given_Range(n, l, r):
+    """
+    Check if all bits in the range [l, r] of the integer n are set (i.e., 1).
+
+    :param n: Integer number to check bits in.
+    :param l: Left boundary of the bit range (1-based index).
+    :param r: Right boundary of the bit range (1-based index).
+    :return: True if all bits in the range [l, r] are set, False otherwise.
+    """
+    mask = (1 << r) - 1 ^ (1 << l - 1) - 1
+    mask = ~mask
+    mask >>= l - 1
+    return n & mask == mask.
+ Test: def check():
+    assert all_Bits_Set_In_The_Given_Range(4,1,2) == True
+    assert all_Bits_Set_In_The_Given_Range(17,2,4) == True
+    assert all_Bits_Set_In_The_Given_Range(39,4,6) == False
+
+2026-11-08 03:51:25 - Error: unsupported operand type(s) for +: 'int' and 'tuple'.
+ Solution: from itertools import combinations
+def find_combinations(test_list):
+    result = []
+    for r in range(1, len(test_list) + 1):
+        for comb in combinations(test_list, r):
+            result.append((sum(comb),) + comb)
+    return result.
+ Test: def check():
+    assert find_combinations([(2, 4), (6, 7), (5, 1), (6, 10)]) == [(8, 11), (7, 5), (8, 14), (11, 8), (12, 17), (11, 11)]
+    assert find_combinations([(3, 5), (7, 8), (6, 2), (7, 11)]) == [(10, 13), (9, 7), (10, 16), (13, 10), (14, 19), (13, 13)]
+    assert find_combinations([(4, 6), (8, 9), (7, 3), (8, 12)]) == [(12, 15), (11, 9), (12, 18), (15, 12), (16, 21), (15, 15)]
+
+2026-11-08 03:51:38 - Error: .
+ Solution: def even_bit_set_number(n):
+    mask = 2863311530
+    return n | mask.
+ Test: def check():
+    assert even_bit_set_number(10) == 10
+    assert even_bit_set_number(20) == 30
+    assert even_bit_set_number(30) == 30
+
+2026-11-08 03:51:43 - Error: .
+ Solution: def merge(lst):
+    first_elements = []
+    second_elements = []
+    for sub_lst in lst:
+        first_elements.append(sub_lst[0])
+        second_elements.append(sub_lst[1])
+    return [first_elements, second_elements].
+ Test: def check():
+    assert merge([['x', 'y'], ['a', 'b'], ['m', 'n']]) == [['x', 'a', 'm'], ['y', 'b', 'n']]
+    assert merge([[1, 2], [3, 4], [5, 6], [7, 8]]) == [[1, 3, 5, 7], [2, 4, 6, 8]]
+    assert merge([['x', 'y','z' ], ['a', 'b','c'], ['m', 'n','o']]) == [['x', 'a', 'm'], ['y', 'b', 'n'],['z', 'c','o']]
+
+2026-11-08 03:56:44 - Error: .
+ Solution: def is_samepatterns(colors, patterns):
+    """
+    Check if the colors follow the sequence given in the patterns array.
+    
+    :param colors: List[str] - a list of color strings
+    :param patterns: List[str] - a list of pattern strings indicating the sequence
+    :return: bool - True if the colors match the sequence in patterns, False otherwise
+    """
+    pattern_to_color = {pattern: color for color, pattern in zip(colors, patterns)}
+    return all((pattern_to_color[pattern] == color for color, pattern in zip(colors, patterns))).
+ Test: def check():
+    assert is_samepatterns(["red","green","green"], ["a", "b", "b"])==True
+    assert is_samepatterns(["red","green","greenn"], ["a","b","b"])==False
+    assert is_samepatterns(["red","green","greenn"], ["a","b"])==False
+
+2026-11-08 03:56:58 - Error: .
+ Solution: def is_Sum_Of_Powers_Of_Two(n):
+    if n <= 0:
+        return False
+    while n != 0:
+        if n % 2 == 1:
+            n -= 1
+        elif n % 2 == 0:
+            n //= 2
+        if n == 1:
+            return True
+    return False.
+ Test: def check():
+    assert is_Sum_Of_Powers_Of_Two(10) == True
+    assert is_Sum_Of_Powers_Of_Two(7) == False
+    assert is_Sum_Of_Powers_Of_Two(14) == True
+
+2026-11-08 03:57:39 - Error: .
+ Solution: def parabola_directrix(a, b, c):
+    k = -b / (2 * a)
+    directrix = k - 1 / (4 * a)
+    return directrix.
+ Test: def check():
+    assert parabola_directrix(5,3,2)==-198
+    assert parabola_directrix(9,8,4)==-2336
+    assert parabola_directrix(2,4,6)==-130
+
+2026-11-08 03:58:38 - Error: .
+ Solution: def replace_spaces(text):
+    text = text.replace(' ', '_')
+    text = text.replace('_', ' ')
+    return text.
+ Test: def check():
+    assert replace_spaces('Jumanji The Jungle') == 'Jumanji_The_Jungle'
+    assert replace_spaces('The_Avengers') == 'The Avengers'
+    assert replace_spaces('Fast and Furious') == 'Fast_and_Furious'
+
+2026-11-08 03:59:46 - Error: .
+ Solution: def count_vowels(test_str):
+    vowels = set('aeiouAEIOU')
+    count = 0
+    if test_str[0] in vowels and (len(test_str) == 1 or test_str[1] not in vowels):
+        count += 1
+    for i in range(1, len(test_str) - 1):
+        if test_str[i - 1] in vowels or test_str[i + 1] in vowels:
+            count += 1
+    if test_str[-1] in vowels and (len(test_str) == 1 or test_str[-2] not in vowels):
+        count += 1
+    return count.
+ Test: def check():
+    assert count_vowels('bestinstareels') == 7
+    assert count_vowels('partofthejourneyistheend') == 12
+    assert count_vowels('amazonprime') == 5
+
+2026-11-08 04:00:50 - Error: .
+ Solution: def find_First_Missing(array, start=0, end=None):
+    """
+    Finds the smallest missing number in a sorted list of natural numbers.
+    
+    :param array: List of sorted natural numbers
+    :param start: Starting index for the search (default is 0)
+    :param end: Ending index for the search (default is None, which means the last index of the array)
+    :return: The smallest missing number
+    """
+    if end is None:
+        end = len(array) - 1
+    if start > end:
+        return start
+    while start <= end:
+        mid = (start + end) // 2
+        if array[mid] == mid + array[0]:
+            start = mid + 1
+        else:
+            end = mid - 1
+    return start.
+ Test: def check():
+    assert find_First_Missing([0,1,2,3]) == 4
+    assert find_First_Missing([0,1,2,6,9]) == 3
+    assert find_First_Missing([2,3,5,8,9]) == 0
+
+2026-11-08 04:01:43 - Error: .
+ Solution: from typing import List
+def combinations_list(list1: List[int]) -> List[List[int]]:
+    """
+    Generate all possible combinations of the elements of a given list.
+    
+    Args:
+    list1: A list of integers.
+    
+    Returns:
+    A list of lists, where each inner list is a unique combination of elements from the input list.
+    """
+    if not list1:
+        return [[]]
+    first_element = list1[0]
+    rest_elements = list1[1:]
+    combinations_without_first = combinations_list(rest_elements)
+    combinations_with_first = [[first_element] + combo for combo in combinations_without_first]
+    all_combinations = combinations_without_first + combinations_with_first
+    return all_combinations.
+ Test: def check():
+    assert combinations_list(['orange', 'red', 'green', 'blue'])==[[], ['orange'], ['red'], ['red', 'orange'], ['green'], ['green', 'orange'], ['green', 'red'], ['green', 'red', 'orange'], ['blue'], ['blue', 'orange'], ['blue', 'red'], ['blue', 'red', 'orange'], ['blue', 'green'], ['blue', 'green', 'orange'], ['blue', 'green', 'red'], ['blue', 'green', 'red', 'orange']]
+    assert combinations_list(['red', 'green', 'blue', 'white', 'black', 'orange'])==[[], ['red'], ['green'], ['green', 'red'], ['blue'], ['blue', 'red'], ['blue', 'green'], ['blue', 'green', 'red'], ['white'], ['white', 'red'], ['white', 'green'], ['white', 'green', 'red'], ['white', 'blue'], ['white', 'blue', 'red'], ['white', 'blue', 'green'], ['white', 'blue', 'green', 'red'], ['black'], ['black', 'red'], ['black', 'green'], ['black', 'green', 'red'], ['black', 'blue'], ['black', 'blue', 'red'], ['black', 'blue', 'green'], ['black', 'blue', 'green', 'red'], ['black', 'white'], ['black', 'white', 'red'], ['black', 'white', 'green'], ['black', 'white', 'green', 'red'], ['black', 'white', 'blue'], ['black', 'white', 'blue', 'red'], ['black', 'white', 'blue', 'green'], ['black', 'white', 'blue', 'green', 'red'], ['orange'], ['orange', 'red'], ['orange', 'green'], ['orange', 'green', 'red'], ['orange', 'blue'], ['orange', 'blue', 'red'], ['orange', 'blue', 'green'], ['orange', 'blue', 'green', 'red'], ['orange', 'white'], ['orange', 'white', 'red'], ['orange', 'white', 'green'], ['orange', 'white', 'green', 'red'], ['orange', 'white', 'blue'], ['orange', 'white', 'blue', 'red'], ['orange', 'white', 'blue', 'green'], ['orange', 'white', 'blue', 'green', 'red'], ['orange', 'black'], ['orange', 'black', 'red'], ['orange', 'black', 'green'], ['orange', 'black', 'green', 'red'], ['orange', 'black', 'blue'], ['orange', 'black', 'blue', 'red'], ['orange', 'black', 'blue', 'green'], ['orange', 'black', 'blue', 'green', 'red'], ['orange', 'black', 'white'], ['orange', 'black', 'white', 'red'], ['orange', 'black', 'white', 'green'], ['orange', 'black', 'white', 'green', 'red'], ['orange', 'black', 'white', 'blue'], ['orange', 'black', 'white', 'blue', 'red'], ['orange', 'black', 'white', 'blue', 'green'], ['orange', 'black', 'white', 'blue', 'green', 'red']]
+    assert combinations_list(['red', 'green', 'black', 'orange'])==[[], ['red'], ['green'], ['green', 'red'], ['black'], ['black', 'red'], ['black', 'green'], ['black', 'green', 'red'], ['orange'], ['orange', 'red'], ['orange', 'green'], ['orange', 'green', 'red'], ['orange', 'black'], ['orange', 'black', 'red'], ['orange', 'black', 'green'], ['orange', 'black', 'green', 'red']]
+
+2026-11-08 04:02:31 - Error: argument of type 'int' is not iterable.
+ Solution: def check_K(test_tup, K):
+    return any((K in tup for tup in test_tup))
+test_tup = ((1, 2), (3, 4, 5), (6, 7, 8, 9))
+K = 5
+K = 10.
+ Test: def check():
+    assert check_K((10, 4, 5, 6, 8), 6) == True
+    assert check_K((1, 2, 3, 4, 5, 6), 7) == False
+    assert check_K((7, 8, 9, 44, 11, 12), 11) == True
+
+2026-11-08 04:03:31 - Error: unsupported operand type(s) for //: 'int' and 'tuple'.
+ Solution: def min_Jumps(steps, d):
+    """
+    Calculate the minimum number of jumps of given length required to reach a point of form (d, 0) from origin in a 2D plane.
+    
+    :param steps: int - The length of each jump.
+    :param d: int - The target distance on the x-axis.
+    :return: int - The minimum number of jumps required to reach the target. Returns -1 if it's not possible.
+    """
+    if d < 0:
+        return -1
+    if d == 0:
+        return 0
+    full_jumps = d // steps
+    remaining_distance = d % steps
+    if remaining_distance == 0:
+        return full_jumps
+    return full_jumps + 1.
+ Test: def check():
+    assert min_Jumps((3,4),11)==3.5
+    assert min_Jumps((3,4),0)==0
+    assert min_Jumps((11,14),11)==1
+
+2026-11-08 04:05:07 - Error: .
+ Solution: def all_Bits_Set_In_The_Given_Range(n, l, r):
+    """
+    Check if all bits in the range [l, r] of the integer n are set (i.e., 1).
+
+    :param n: Integer number to check bits in.
+    :param l: Left boundary of the bit range (1-based index).
+    :param r: Right boundary of the bit range (1-based index).
+    :return: True if all bits in the range [l, r] are set, False otherwise.
+    """
+    mask = (1 << r) - 1 ^ (1 << l - 1) - 1
+    mask = ~mask
+    mask >>= l - 1
+    return n & mask == mask.
+ Test: def check():
+    assert all_Bits_Set_In_The_Given_Range(4,1,2) == True
+    assert all_Bits_Set_In_The_Given_Range(17,2,4) == True
+    assert all_Bits_Set_In_The_Given_Range(39,4,6) == False
+
+2026-11-08 04:05:37 - Error: unsupported operand type(s) for +: 'int' and 'tuple'.
+ Solution: from itertools import combinations
+def find_combinations(test_list):
+    result = []
+    for r in range(1, len(test_list) + 1):
+        for comb in combinations(test_list, r):
+            result.append((sum(comb),) + comb)
+    return result.
+ Test: def check():
+    assert find_combinations([(2, 4), (6, 7), (5, 1), (6, 10)]) == [(8, 11), (7, 5), (8, 14), (11, 8), (12, 17), (11, 11)]
+    assert find_combinations([(3, 5), (7, 8), (6, 2), (7, 11)]) == [(10, 13), (9, 7), (10, 16), (13, 10), (14, 19), (13, 13)]
+    assert find_combinations([(4, 6), (8, 9), (7, 3), (8, 12)]) == [(12, 15), (11, 9), (12, 18), (15, 12), (16, 21), (15, 15)]
+
+2026-11-08 04:06:02 - Error: .
+ Solution: def even_bit_set_number(n):
+    mask = 2863311530
+    return n | mask.
+ Test: def check():
+    assert even_bit_set_number(10) == 10
+    assert even_bit_set_number(20) == 30
+    assert even_bit_set_number(30) == 30
+
+2026-11-08 04:06:21 - Error: .
+ Solution: def merge(lst):
+    first_elements = []
+    second_elements = []
+    for sub_lst in lst:
+        first_elements.append(sub_lst[0])
+        second_elements.append(sub_lst[1])
+    return [first_elements, second_elements].
+ Test: def check():
+    assert merge([['x', 'y'], ['a', 'b'], ['m', 'n']]) == [['x', 'a', 'm'], ['y', 'b', 'n']]
+    assert merge([[1, 2], [3, 4], [5, 6], [7, 8]]) == [[1, 3, 5, 7], [2, 4, 6, 8]]
+    assert merge([['x', 'y','z' ], ['a', 'b','c'], ['m', 'n','o']]) == [['x', 'a', 'm'], ['y', 'b', 'n'],['z', 'c','o']]
+
+2026-11-08 04:18:27 - Error: .
+ Solution: def is_Sum_Of_Powers_Of_Two(n):
+    if n <= 0:
+        return False
+    while n != 0:
+        if n % 2 == 1:
+            n -= 1
+        elif n % 2 == 0:
+            n //= 2
+        if n == 1:
+            return True
+    return False.
+ Test: def check():
+    assert is_Sum_Of_Powers_Of_Two(10) == True
+    assert is_Sum_Of_Powers_Of_Two(7) == False
+    assert is_Sum_Of_Powers_Of_Two(14) == True
+
+2026-11-08 04:19:08 - Error: .
+ Solution: def parabola_directrix(a, b, c):
+    k = -b / (2 * a)
+    directrix = k - 1 / (4 * a)
+    return directrix.
+ Test: def check():
+    assert parabola_directrix(5,3,2)==-198
+    assert parabola_directrix(9,8,4)==-2336
+    assert parabola_directrix(2,4,6)==-130
+
+2026-11-08 04:20:06 - Error: .
+ Solution: def replace_spaces(text):
+    text = text.replace(' ', '_')
+    text = text.replace('_', ' ')
+    return text.
+ Test: def check():
+    assert replace_spaces('Jumanji The Jungle') == 'Jumanji_The_Jungle'
+    assert replace_spaces('The_Avengers') == 'The Avengers'
+    assert replace_spaces('Fast and Furious') == 'Fast_and_Furious'
+
+2026-11-08 04:21:14 - Error: .
+ Solution: def count_vowels(test_str):
+    vowels = set('aeiouAEIOU')
+    count = 0
+    if test_str[0] in vowels and (len(test_str) == 1 or test_str[1] not in vowels):
+        count += 1
+    for i in range(1, len(test_str) - 1):
+        if test_str[i - 1] in vowels or test_str[i + 1] in vowels:
+            count += 1
+    if test_str[-1] in vowels and (len(test_str) == 1 or test_str[-2] not in vowels):
+        count += 1
+    return count.
+ Test: def check():
+    assert count_vowels('bestinstareels') == 7
+    assert count_vowels('partofthejourneyistheend') == 12
+    assert count_vowels('amazonprime') == 5
+
+2026-11-08 04:22:17 - Error: .
+ Solution: def find_First_Missing(array, start=0, end=None):
+    """
+    Finds the smallest missing number in a sorted list of natural numbers.
+    
+    :param array: List of sorted natural numbers
+    :param start: Starting index for the search (default is 0)
+    :param end: Ending index for the search (default is None, which means the last index of the array)
+    :return: The smallest missing number
+    """
+    if end is None:
+        end = len(array) - 1
+    if start > end:
+        return start
+    while start <= end:
+        mid = (start + end) // 2
+        if array[mid] == mid + array[0]:
+            start = mid + 1
+        else:
+            end = mid - 1
+    return start.
+ Test: def check():
+    assert find_First_Missing([0,1,2,3]) == 4
+    assert find_First_Missing([0,1,2,6,9]) == 3
+    assert find_First_Missing([2,3,5,8,9]) == 0
+
+2026-11-08 04:23:10 - Error: .
+ Solution: from typing import List
+def combinations_list(list1: List[int]) -> List[List[int]]:
+    """
+    Generate all possible combinations of the elements of a given list.
+    
+    Args:
+    list1: A list of integers.
+    
+    Returns:
+    A list of lists, where each inner list is a unique combination of elements from the input list.
+    """
+    if not list1:
+        return [[]]
+    first_element = list1[0]
+    rest_elements = list1[1:]
+    combinations_without_first = combinations_list(rest_elements)
+    combinations_with_first = [[first_element] + combo for combo in combinations_without_first]
+    all_combinations = combinations_without_first + combinations_with_first
+    return all_combinations.
+ Test: def check():
+    assert combinations_list(['orange', 'red', 'green', 'blue'])==[[], ['orange'], ['red'], ['red', 'orange'], ['green'], ['green', 'orange'], ['green', 'red'], ['green', 'red', 'orange'], ['blue'], ['blue', 'orange'], ['blue', 'red'], ['blue', 'red', 'orange'], ['blue', 'green'], ['blue', 'green', 'orange'], ['blue', 'green', 'red'], ['blue', 'green', 'red', 'orange']]
+    assert combinations_list(['red', 'green', 'blue', 'white', 'black', 'orange'])==[[], ['red'], ['green'], ['green', 'red'], ['blue'], ['blue', 'red'], ['blue', 'green'], ['blue', 'green', 'red'], ['white'], ['white', 'red'], ['white', 'green'], ['white', 'green', 'red'], ['white', 'blue'], ['white', 'blue', 'red'], ['white', 'blue', 'green'], ['white', 'blue', 'green', 'red'], ['black'], ['black', 'red'], ['black', 'green'], ['black', 'green', 'red'], ['black', 'blue'], ['black', 'blue', 'red'], ['black', 'blue', 'green'], ['black', 'blue', 'green', 'red'], ['black', 'white'], ['black', 'white', 'red'], ['black', 'white', 'green'], ['black', 'white', 'green', 'red'], ['black', 'white', 'blue'], ['black', 'white', 'blue', 'red'], ['black', 'white', 'blue', 'green'], ['black', 'white', 'blue', 'green', 'red'], ['orange'], ['orange', 'red'], ['orange', 'green'], ['orange', 'green', 'red'], ['orange', 'blue'], ['orange', 'blue', 'red'], ['orange', 'blue', 'green'], ['orange', 'blue', 'green', 'red'], ['orange', 'white'], ['orange', 'white', 'red'], ['orange', 'white', 'green'], ['orange', 'white', 'green', 'red'], ['orange', 'white', 'blue'], ['orange', 'white', 'blue', 'red'], ['orange', 'white', 'blue', 'green'], ['orange', 'white', 'blue', 'green', 'red'], ['orange', 'black'], ['orange', 'black', 'red'], ['orange', 'black', 'green'], ['orange', 'black', 'green', 'red'], ['orange', 'black', 'blue'], ['orange', 'black', 'blue', 'red'], ['orange', 'black', 'blue', 'green'], ['orange', 'black', 'blue', 'green', 'red'], ['orange', 'black', 'white'], ['orange', 'black', 'white', 'red'], ['orange', 'black', 'white', 'green'], ['orange', 'black', 'white', 'green', 'red'], ['orange', 'black', 'white', 'blue'], ['orange', 'black', 'white', 'blue', 'red'], ['orange', 'black', 'white', 'blue', 'green'], ['orange', 'black', 'white', 'blue', 'green', 'red']]
+    assert combinations_list(['red', 'green', 'black', 'orange'])==[[], ['red'], ['green'], ['green', 'red'], ['black'], ['black', 'red'], ['black', 'green'], ['black', 'green', 'red'], ['orange'], ['orange', 'red'], ['orange', 'green'], ['orange', 'green', 'red'], ['orange', 'black'], ['orange', 'black', 'red'], ['orange', 'black', 'green'], ['orange', 'black', 'green', 'red']]
+
+2026-11-08 04:23:58 - Error: argument of type 'int' is not iterable.
+ Solution: def check_K(test_tup, K):
+    return any((K in tup for tup in test_tup))
+test_tup = ((1, 2), (3, 4, 5), (6, 7, 8, 9))
+K = 5
+K = 10.
+ Test: def check():
+    assert check_K((10, 4, 5, 6, 8), 6) == True
+    assert check_K((1, 2, 3, 4, 5, 6), 7) == False
+    assert check_K((7, 8, 9, 44, 11, 12), 11) == True
+
+2026-11-08 04:24:57 - Error: unsupported operand type(s) for //: 'int' and 'tuple'.
+ Solution: def min_Jumps(steps, d):
+    """
+    Calculate the minimum number of jumps of given length required to reach a point of form (d, 0) from origin in a 2D plane.
+    
+    :param steps: int - The length of each jump.
+    :param d: int - The target distance on the x-axis.
+    :return: int - The minimum number of jumps required to reach the target. Returns -1 if it's not possible.
+    """
+    if d < 0:
+        return -1
+    if d == 0:
+        return 0
+    full_jumps = d // steps
+    remaining_distance = d % steps
+    if remaining_distance == 0:
+        return full_jumps
+    return full_jumps + 1.
+ Test: def check():
+    assert min_Jumps((3,4),11)==3.5
+    assert min_Jumps((3,4),0)==0
+    assert min_Jumps((11,14),11)==1
+
+2026-11-08 04:26:33 - Error: .
+ Solution: def all_Bits_Set_In_The_Given_Range(n, l, r):
+    """
+    Check if all bits in the range [l, r] of the integer n are set (i.e., 1).
+
+    :param n: Integer number to check bits in.
+    :param l: Left boundary of the bit range (1-based index).
+    :param r: Right boundary of the bit range (1-based index).
+    :return: True if all bits in the range [l, r] are set, False otherwise.
+    """
+    mask = (1 << r) - 1 ^ (1 << l - 1) - 1
+    mask = ~mask
+    mask >>= l - 1
+    return n & mask == mask.
+ Test: def check():
+    assert all_Bits_Set_In_The_Given_Range(4,1,2) == True
+    assert all_Bits_Set_In_The_Given_Range(17,2,4) == True
+    assert all_Bits_Set_In_The_Given_Range(39,4,6) == False
+
+2026-11-08 04:27:03 - Error: unsupported operand type(s) for +: 'int' and 'tuple'.
+ Solution: from itertools import combinations
+def find_combinations(test_list):
+    result = []
+    for r in range(1, len(test_list) + 1):
+        for comb in combinations(test_list, r):
+            result.append((sum(comb),) + comb)
+    return result.
+ Test: def check():
+    assert find_combinations([(2, 4), (6, 7), (5, 1), (6, 10)]) == [(8, 11), (7, 5), (8, 14), (11, 8), (12, 17), (11, 11)]
+    assert find_combinations([(3, 5), (7, 8), (6, 2), (7, 11)]) == [(10, 13), (9, 7), (10, 16), (13, 10), (14, 19), (13, 13)]
+    assert find_combinations([(4, 6), (8, 9), (7, 3), (8, 12)]) == [(12, 15), (11, 9), (12, 18), (15, 12), (16, 21), (15, 15)]
+
+2026-11-08 04:27:28 - Error: .
+ Solution: def even_bit_set_number(n):
+    mask = 2863311530
+    return n | mask.
+ Test: def check():
+    assert even_bit_set_number(10) == 10
+    assert even_bit_set_number(20) == 30
+    assert even_bit_set_number(30) == 30
+
+2026-11-08 04:27:46 - Error: .
+ Solution: def merge(lst):
+    first_elements = []
+    second_elements = []
+    for sub_lst in lst:
+        first_elements.append(sub_lst[0])
+        second_elements.append(sub_lst[1])
+    return [first_elements, second_elements].
+ Test: def check():
+    assert merge([['x', 'y'], ['a', 'b'], ['m', 'n']]) == [['x', 'a', 'm'], ['y', 'b', 'n']]
+    assert merge([[1, 2], [3, 4], [5, 6], [7, 8]]) == [[1, 3, 5, 7], [2, 4, 6, 8]]
+    assert merge([['x', 'y','z' ], ['a', 'b','c'], ['m', 'n','o']]) == [['x', 'a', 'm'], ['y', 'b', 'n'],['z', 'c','o']]
+
+2026-11-08 04:29:05 - Error: .
+ Solution: def is_Sum_Of_Powers_Of_Two(n):
+    if n <= 0:
+        return False
+    while n != 0:
+        if n % 2 == 1:
+            n -= 1
+        elif n % 2 == 0:
+            n //= 2
+        if n == 1:
+            return True
+    return False.
+ Test: def check():
+    assert is_Sum_Of_Powers_Of_Two(10) == True
+    assert is_Sum_Of_Powers_Of_Two(7) == False
+    assert is_Sum_Of_Powers_Of_Two(14) == True
+
+2026-11-08 04:29:25 - Error: .
+ Solution: def parabola_directrix(a, b, c):
+    k = -b / (2 * a)
+    directrix = k - 1 / (4 * a)
+    return directrix.
+ Test: def check():
+    assert parabola_directrix(5,3,2)==-198
+    assert parabola_directrix(9,8,4)==-2336
+    assert parabola_directrix(2,4,6)==-130
+
+2026-11-08 04:29:43 - Error: .
+ Solution: def replace_spaces(text):
+    text = text.replace(' ', '_')
+    text = text.replace('_', ' ')
+    return text.
+ Test: def check():
+    assert replace_spaces('Jumanji The Jungle') == 'Jumanji_The_Jungle'
+    assert replace_spaces('The_Avengers') == 'The Avengers'
+    assert replace_spaces('Fast and Furious') == 'Fast_and_Furious'
+
+2026-11-08 04:30:19 - Error: .
+ Solution: def count_vowels(test_str):
+    vowels = set('aeiouAEIOU')
+    count = 0
+    if test_str[0] in vowels and (len(test_str) == 1 or test_str[1] not in vowels):
+        count += 1
+    for i in range(1, len(test_str) - 1):
+        if test_str[i - 1] in vowels or test_str[i + 1] in vowels:
+            count += 1
+    if test_str[-1] in vowels and (len(test_str) == 1 or test_str[-2] not in vowels):
+        count += 1
+    return count.
+ Test: def check():
+    assert count_vowels('bestinstareels') == 7
+    assert count_vowels('partofthejourneyistheend') == 12
+    assert count_vowels('amazonprime') == 5
+
+2026-11-08 04:30:41 - Error: .
+ Solution: def find_First_Missing(array, start=0, end=None):
+    """
+    Finds the smallest missing number in a sorted list of natural numbers.
+    
+    :param array: List of sorted natural numbers
+    :param start: Starting index for the search (default is 0)
+    :param end: Ending index for the search (default is None, which means the last index of the array)
+    :return: The smallest missing number
+    """
+    if end is None:
+        end = len(array) - 1
+    if start > end:
+        return start
+    while start <= end:
+        mid = (start + end) // 2
+        if array[mid] == mid + array[0]:
+            start = mid + 1
+        else:
+            end = mid - 1
+    return start.
+ Test: def check():
+    assert find_First_Missing([0,1,2,3]) == 4
+    assert find_First_Missing([0,1,2,6,9]) == 3
+    assert find_First_Missing([2,3,5,8,9]) == 0
+
+2026-11-08 04:31:09 - Error: .
+ Solution: from typing import List
+def combinations_list(list1: List[int]) -> List[List[int]]:
+    """
+    Generate all possible combinations of the elements of a given list.
+    
+    Args:
+    list1: A list of integers.
+    
+    Returns:
+    A list of lists, where each inner list is a unique combination of elements from the input list.
+    """
+    if not list1:
+        return [[]]
+    first_element = list1[0]
+    rest_elements = list1[1:]
+    combinations_without_first = combinations_list(rest_elements)
+    combinations_with_first = [[first_element] + combo for combo in combinations_without_first]
+    all_combinations = combinations_without_first + combinations_with_first
+    return all_combinations.
+ Test: def check():
+    assert combinations_list(['orange', 'red', 'green', 'blue'])==[[], ['orange'], ['red'], ['red', 'orange'], ['green'], ['green', 'orange'], ['green', 'red'], ['green', 'red', 'orange'], ['blue'], ['blue', 'orange'], ['blue', 'red'], ['blue', 'red', 'orange'], ['blue', 'green'], ['blue', 'green', 'orange'], ['blue', 'green', 'red'], ['blue', 'green', 'red', 'orange']]
+    assert combinations_list(['red', 'green', 'blue', 'white', 'black', 'orange'])==[[], ['red'], ['green'], ['green', 'red'], ['blue'], ['blue', 'red'], ['blue', 'green'], ['blue', 'green', 'red'], ['white'], ['white', 'red'], ['white', 'green'], ['white', 'green', 'red'], ['white', 'blue'], ['white', 'blue', 'red'], ['white', 'blue', 'green'], ['white', 'blue', 'green', 'red'], ['black'], ['black', 'red'], ['black', 'green'], ['black', 'green', 'red'], ['black', 'blue'], ['black', 'blue', 'red'], ['black', 'blue', 'green'], ['black', 'blue', 'green', 'red'], ['black', 'white'], ['black', 'white', 'red'], ['black', 'white', 'green'], ['black', 'white', 'green', 'red'], ['black', 'white', 'blue'], ['black', 'white', 'blue', 'red'], ['black', 'white', 'blue', 'green'], ['black', 'white', 'blue', 'green', 'red'], ['orange'], ['orange', 'red'], ['orange', 'green'], ['orange', 'green', 'red'], ['orange', 'blue'], ['orange', 'blue', 'red'], ['orange', 'blue', 'green'], ['orange', 'blue', 'green', 'red'], ['orange', 'white'], ['orange', 'white', 'red'], ['orange', 'white', 'green'], ['orange', 'white', 'green', 'red'], ['orange', 'white', 'blue'], ['orange', 'white', 'blue', 'red'], ['orange', 'white', 'blue', 'green'], ['orange', 'white', 'blue', 'green', 'red'], ['orange', 'black'], ['orange', 'black', 'red'], ['orange', 'black', 'green'], ['orange', 'black', 'green', 'red'], ['orange', 'black', 'blue'], ['orange', 'black', 'blue', 'red'], ['orange', 'black', 'blue', 'green'], ['orange', 'black', 'blue', 'green', 'red'], ['orange', 'black', 'white'], ['orange', 'black', 'white', 'red'], ['orange', 'black', 'white', 'green'], ['orange', 'black', 'white', 'green', 'red'], ['orange', 'black', 'white', 'blue'], ['orange', 'black', 'white', 'blue', 'red'], ['orange', 'black', 'white', 'blue', 'green'], ['orange', 'black', 'white', 'blue', 'green', 'red']]
+    assert combinations_list(['red', 'green', 'black', 'orange'])==[[], ['red'], ['green'], ['green', 'red'], ['black'], ['black', 'red'], ['black', 'green'], ['black', 'green', 'red'], ['orange'], ['orange', 'red'], ['orange', 'green'], ['orange', 'green', 'red'], ['orange', 'black'], ['orange', 'black', 'red'], ['orange', 'black', 'green'], ['orange', 'black', 'green', 'red']]
+
+2026-11-08 04:31:41 - Error: argument of type 'int' is not iterable.
+ Solution: def check_K(test_tup, K):
+    return any((K in tup for tup in test_tup))
+test_tup = ((1, 2), (3, 4, 5), (6, 7, 8, 9))
+K = 5
+K = 10.
+ Test: def check():
+    assert check_K((10, 4, 5, 6, 8), 6) == True
+    assert check_K((1, 2, 3, 4, 5, 6), 7) == False
+    assert check_K((7, 8, 9, 44, 11, 12), 11) == True
+
+2026-11-08 04:32:15 - Error: unsupported operand type(s) for //: 'int' and 'tuple'.
+ Solution: def min_Jumps(steps, d):
+    """
+    Calculate the minimum number of jumps of given length required to reach a point of form (d, 0) from origin in a 2D plane.
+    
+    :param steps: int - The length of each jump.
+    :param d: int - The target distance on the x-axis.
+    :return: int - The minimum number of jumps required to reach the target. Returns -1 if it's not possible.
+    """
+    if d < 0:
+        return -1
+    if d == 0:
+        return 0
+    full_jumps = d // steps
+    remaining_distance = d % steps
+    if remaining_distance == 0:
+        return full_jumps
+    return full_jumps + 1.
+ Test: def check():
+    assert min_Jumps((3,4),11)==3.5
+    assert min_Jumps((3,4),0)==0
+    assert min_Jumps((11,14),11)==1
+
+2026-11-08 04:33:03 - Error: .
+ Solution: def all_Bits_Set_In_The_Given_Range(n, l, r):
+    """
+    Check if all bits in the range [l, r] of the integer n are set (i.e., 1).
+
+    :param n: Integer number to check bits in.
+    :param l: Left boundary of the bit range (1-based index).
+    :param r: Right boundary of the bit range (1-based index).
+    :return: True if all bits in the range [l, r] are set, False otherwise.
+    """
+    mask = (1 << r) - 1 ^ (1 << l - 1) - 1
+    mask = ~mask
+    mask >>= l - 1
+    return n & mask == mask.
+ Test: def check():
+    assert all_Bits_Set_In_The_Given_Range(4,1,2) == True
+    assert all_Bits_Set_In_The_Given_Range(17,2,4) == True
+    assert all_Bits_Set_In_The_Given_Range(39,4,6) == False
+
+2026-11-08 04:33:18 - Error: unsupported operand type(s) for +: 'int' and 'tuple'.
+ Solution: from itertools import combinations
+def find_combinations(test_list):
+    result = []
+    for r in range(1, len(test_list) + 1):
+        for comb in combinations(test_list, r):
+            result.append((sum(comb),) + comb)
+    return result.
+ Test: def check():
+    assert find_combinations([(2, 4), (6, 7), (5, 1), (6, 10)]) == [(8, 11), (7, 5), (8, 14), (11, 8), (12, 17), (11, 11)]
+    assert find_combinations([(3, 5), (7, 8), (6, 2), (7, 11)]) == [(10, 13), (9, 7), (10, 16), (13, 10), (14, 19), (13, 13)]
+    assert find_combinations([(4, 6), (8, 9), (7, 3), (8, 12)]) == [(12, 15), (11, 9), (12, 18), (15, 12), (16, 21), (15, 15)]
+
+2026-11-08 04:33:30 - Error: .
+ Solution: def even_bit_set_number(n):
+    mask = 2863311530
+    return n | mask.
+ Test: def check():
+    assert even_bit_set_number(10) == 10
+    assert even_bit_set_number(20) == 30
+    assert even_bit_set_number(30) == 30
+
+2026-11-08 04:33:36 - Error: .
+ Solution: def merge(lst):
+    first_elements = []
+    second_elements = []
+    for sub_lst in lst:
+        first_elements.append(sub_lst[0])
+        second_elements.append(sub_lst[1])
+    return [first_elements, second_elements].
+ Test: def check():
+    assert merge([['x', 'y'], ['a', 'b'], ['m', 'n']]) == [['x', 'a', 'm'], ['y', 'b', 'n']]
+    assert merge([[1, 2], [3, 4], [5, 6], [7, 8]]) == [[1, 3, 5, 7], [2, 4, 6, 8]]
+    assert merge([['x', 'y','z' ], ['a', 'b','c'], ['m', 'n','o']]) == [['x', 'a', 'm'], ['y', 'b', 'n'],['z', 'c','o']]
+
+2026-11-08 16:19:03 - Error: .
+ Solution: from typing import List
+def remove_duplicates(numbers: List[int]) -> List[int]:
+    seen = set()
+    unique_numbers = []
+    for number in numbers:
+        if number not in seen:
+            unique_numbers.append(number)
+            seen.add(number)
+    return unique_numbers.
+ Test: 
+
+METADATA = {
+    'author': 'jt',
+    'dataset': 'test'
+}
+
+
+def check(candidate):
+    assert candidate([]) == []
+    assert candidate([1, 2, 3, 4]) == [1, 2, 3, 4]
+    assert candidate([1, 2, 3, 2, 4, 3, 5]) == [1, 4, 5]
+
+2026-11-08 16:19:09 - Error: .
+ Solution: import re
+def file_name_check(file_name):
+    pattern = '^[a-zA-Z][a-zA-Z._]{0,8}[0-9]{0,3}(\\.txt|\\.exe|\\.dll)$'
+    return 'Yes' if re.match(pattern, file_name) else 'No'.
+ Test: def check(candidate):
+
+    # Check some simple cases
+    assert candidate("example.txt") == 'Yes'
+    assert candidate("1example.dll") == 'No'
+    assert candidate('s1sdf3.asd') == 'No'
+    assert candidate('K.dll') == 'Yes'
+    assert candidate('MY16FILE3.exe') == 'Yes'
+    assert candidate('His12FILE94.exe') == 'No'
+    assert candidate('_Y.txt') == 'No'
+    assert candidate('?aREYA.exe') == 'No'
+    assert candidate('/this_is_valid.dll') == 'No'
+    assert candidate('this_is_valid.wow') == 'No'
+    assert candidate('this_is_valid.txt') == 'Yes'
+    assert candidate('this_is_valid.txtexe') == 'No'
+    assert candidate('#this2_i4s_5valid.ten') == 'No'
+    assert candidate('@this1_is6_valid.exe') == 'No'
+    assert candidate('this_is_12valid.6exe4.txt') == 'No'
+    assert candidate('all.exe.txt') == 'No'
+    assert candidate('I563_No.exe') == 'Yes'
+    assert candidate('Is3youfault.txt') == 'Yes'
+    assert candidate('no_one#knows.dll') == 'Yes'
+    assert candidate('1I563_Yes3.exe') == 'No'
+    assert candidate('I563_Yes3.txtt') == 'No'
+    assert candidate('final..txt') == 'No'
+    assert candidate('final132') == 'No'
+    assert candidate('_f4indsartal132.') == 'No'
+    
+        
+
+    # Check some edge cases that are easy to work out by hand.
+    assert candidate('.txt') == 'No'
+    assert candidate('s.') == 'No'
+
+

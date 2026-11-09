@@ -175,3 +175,224 @@ test_error of fix_spaces
 test_error of fix_spaces
 test_error of fix_spaces
 test_error of fix_spaces
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of max_aggregate
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of sum_Of_product
+test_error of is_samepatterns
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of max_aggregate
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of sum_Of_product
+test_error of is_samepatterns
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of max_aggregate
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of sum_Of_product
+test_error of is_samepatterns
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of max_aggregate
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of sum_Of_product
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of max_aggregate
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of sum_Of_product
+test_error of find_substring
+sector_area name 'math' is not defined
+test_error of count_vowels
+test_error of count_vowels
+test_error of count_vowels
+test_error of count_vowels
+test_error of find_First_Missing
+test_error of combinations_list
+test_error of combinations_list
+test_error of combinations_list
+test_error of combinations_list
+common_in_nested_lists 'int' object is not iterable
+common_in_nested_lists 'int' object is not iterable
+common_in_nested_lists 'int' object is not iterable
+common_in_nested_lists 'int' object is not iterable
+check_K argument of type 'int' is not iterable
+check_K argument of type 'int' is not iterable
+check_K argument of type 'int' is not iterable
+check_K argument of type 'int' is not iterable
+test_error of comb_sort
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+test_error of remove_Occ
+test_error of all_Bits_Set_In_The_Given_Range
+test_error of all_Bits_Set_In_The_Given_Range
+test_error of all_Bits_Set_In_The_Given_Range
+test_error of all_Bits_Set_In_The_Given_Range
+find_combinations unsupported operand type(s) for +: 'int' and 'tuple'
+find_combinations name 'r' is not defined
+find_combinations unsupported operand type(s) for +: 'int' and 'tuple'
+find_combinations unsupported operand type(s) for +: 'int' and 'tuple'
+test_error of even_bit_set_number
+test_error of even_bit_set_number
+test_error of even_bit_set_number
+test_error of even_bit_set_number
+test_error of is_samepatterns
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of max_aggregate
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of sum_Of_product
+test_error of find_substring
+sector_area name 'math' is not defined
+test_error of count_vowels
+test_error of count_vowels
+test_error of count_vowels
+test_error of count_vowels
+test_error of find_First_Missing
+test_error of combinations_list
+test_error of combinations_list
+test_error of combinations_list
+test_error of combinations_list
+common_in_nested_lists 'int' object is not iterable
+common_in_nested_lists 'int' object is not iterable
+common_in_nested_lists 'int' object is not iterable
+common_in_nested_lists 'int' object is not iterable
+check_K argument of type 'int' is not iterable
+check_K argument of type 'int' is not iterable
+check_K argument of type 'int' is not iterable
+check_K argument of type 'int' is not iterable
+test_error of comb_sort
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+test_error of remove_Occ
+test_error of all_Bits_Set_In_The_Given_Range
+test_error of all_Bits_Set_In_The_Given_Range
+test_error of all_Bits_Set_In_The_Given_Range
+test_error of all_Bits_Set_In_The_Given_Range
+find_combinations unsupported operand type(s) for +: 'int' and 'tuple'
+find_combinations name 'r' is not defined
+find_combinations unsupported operand type(s) for +: 'int' and 'tuple'
+find_combinations unsupported operand type(s) for +: 'int' and 'tuple'
+test_error of even_bit_set_number
+test_error of even_bit_set_number
+test_error of even_bit_set_number
+test_error of even_bit_set_number
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of max_aggregate
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of sum_Of_product
+test_error of find_substring
+sector_area name 'math' is not defined
+test_error of count_vowels
+test_error of count_vowels
+test_error of count_vowels
+test_error of count_vowels
+test_error of find_First_Missing
+test_error of combinations_list
+test_error of combinations_list
+test_error of combinations_list
+test_error of combinations_list
+common_in_nested_lists 'int' object is not iterable
+common_in_nested_lists 'int' object is not iterable
+common_in_nested_lists 'int' object is not iterable
+common_in_nested_lists 'int' object is not iterable
+check_K argument of type 'int' is not iterable
+check_K argument of type 'int' is not iterable
+check_K argument of type 'int' is not iterable
+check_K argument of type 'int' is not iterable
+test_error of comb_sort
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+test_error of remove_Occ
+test_error of all_Bits_Set_In_The_Given_Range
+test_error of all_Bits_Set_In_The_Given_Range
+test_error of all_Bits_Set_In_The_Given_Range
+test_error of all_Bits_Set_In_The_Given_Range
+find_combinations unsupported operand type(s) for +: 'int' and 'tuple'
+find_combinations name 'r' is not defined
+find_combinations unsupported operand type(s) for +: 'int' and 'tuple'
+find_combinations unsupported operand type(s) for +: 'int' and 'tuple'
+test_error of even_bit_set_number
+test_error of even_bit_set_number
+test_error of even_bit_set_number
+test_error of even_bit_set_number
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of is_Sum_Of_Powers_Of_Two
+test_error of max_aggregate
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of parabola_directrix
+test_error of sum_Of_product
+test_error of find_substring
+sector_area name 'math' is not defined
+test_error of count_vowels
+test_error of count_vowels
+test_error of count_vowels
+test_error of count_vowels
+test_error of find_First_Missing
+test_error of combinations_list
+test_error of combinations_list
+test_error of combinations_list
+test_error of combinations_list
+common_in_nested_lists 'int' object is not iterable
+common_in_nested_lists 'int' object is not iterable
+common_in_nested_lists 'int' object is not iterable
+common_in_nested_lists 'int' object is not iterable
+check_K argument of type 'int' is not iterable
+check_K argument of type 'int' is not iterable
+check_K argument of type 'int' is not iterable
+check_K argument of type 'int' is not iterable
+test_error of comb_sort
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+min_Jumps unsupported operand type(s) for %: 'int' and 'tuple'
+test_error of remove_Occ
+test_error of all_Bits_Set_In_The_Given_Range
+test_error of all_Bits_Set_In_The_Given_Range
+test_error of all_Bits_Set_In_The_Given_Range
+test_error of all_Bits_Set_In_The_Given_Range
+find_combinations unsupported operand type(s) for +: 'int' and 'tuple'
+find_combinations name 'r' is not defined
+find_combinations unsupported operand type(s) for +: 'int' and 'tuple'
+find_combinations unsupported operand type(s) for +: 'int' and 'tuple'
+test_error of even_bit_set_number
+test_error of even_bit_set_number
+test_error of even_bit_set_number
+test_error of even_bit_set_number
+test_error of remove_duplicates
+test_error of remove_duplicates
+test_error of remove_duplicates
+test_error of remove_duplicates
+test_error of file_name_check

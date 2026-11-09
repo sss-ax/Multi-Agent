@@ -37,6 +37,7 @@ from baselines.aflow_graph_adapter import (  # noqa: E402
     AFlowGraphSession,
     make_aflow_operator_proxy_module,
 )
+from baselines.aflow_profiles import aflow_profile_names, get_aflow_profile  # noqa: E402
 from workflow_runtime.communication import make_communication_policy  # noqa: E402
 from workflow_runtime.model_backend import DirectTransformersModel  # noqa: E402
 from workflow_runtime.telemetry import WorkflowTelemetry  # noqa: E402
@@ -193,6 +194,8 @@ async def _run_one(
     aflow_content_dedup: bool,
     aflow_invocation_reuse: bool,
     aflow_dedup_mode: str,
+    aflow_profile: Any,
+    aflow_profile_explicit: bool,
     resume_result: dict[str, Any] | None,
     save_progress: Callable[[dict[str, Any]], None],
 ) -> dict[str, Any]:
@@ -273,6 +276,8 @@ async def _run_one(
             resume_result=resume_result,
             communication_mode=communication_mode,
             communication_policy=communication_policy,
+            aflow_profile=aflow_profile.profile_name if aflow_profile else "none",
+            profile_validated=bool(aflow_profile and aflow_profile.validated),
         )
         completed = int(result["completed_rows"])
         expected_ids = [_row_identifier(row, index) for index, row in enumerate(rows[:completed])]
@@ -344,6 +349,12 @@ async def _run_one(
                         task_id=row_id,
                         task=_row_task_text(rows[row_index]),
                         dataset=dataset,
+                        workflow_round=workflow_round,
+                        task_metadata={
+                            "entry_point": rows[row_index].get("entry_point", ""),
+                        },
+                        profile=aflow_profile,
+                        profile_explicit=aflow_profile_explicit,
                         run_id=f"aflow:{dataset}:{row_id}",
                         policy=make_communication_policy(
                             communication_policy,
@@ -366,6 +377,7 @@ async def _run_one(
                         },
                         tokenizer=model.tokenizer,
                     )
+                    result["aflow_effective_policy"] = graph_session.optimization_status
                     workflow_module, graph_path = _load_paper_workflow(
                         dataset,
                         workflow_round,
@@ -472,6 +484,8 @@ def _initial_run_result(
     resume_result: dict[str, Any] | None,
     communication_mode: str = "original",
     communication_policy: str = "send_all",
+    aflow_profile: str = "none",
+    profile_validated: bool = False,
 ) -> dict[str, Any]:
     if resume_result is not None:
         result = dict(resume_result)
@@ -512,6 +526,11 @@ def _initial_run_result(
         "item_wall_times_seconds": [],
         "communication_mode": communication_mode,
         "communication_policy": communication_policy,
+        "aflow_profile": aflow_profile,
+        "profile_validated": profile_validated,
+        "input_binding_version": "v1",
+        "candidate_policy_version": "v1",
+        "reuse_policy_version": "v1",
         "graph_telemetry": [],
     }
 
@@ -626,6 +645,12 @@ def main() -> None:
         default="exact",
         help="Canonical output deduplication mode; structured is reserved for conservative typed extraction.",
     )
+    parser.add_argument(
+        "--aflow-profile",
+        choices=("none", "auto", *aflow_profile_names()),
+        default="auto",
+        help="Dataset/workflow-specific profile; auto enables validated profiles only.",
+    )
     parser.add_argument("--output", default=".runtime/aflow_paper_reproduction/results.json")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
@@ -661,6 +686,22 @@ def main() -> None:
         # default RA smoke test from selecting an empty set.
         communication_policy = "closure_aware_heuristic"
     selected = list(DATASETS if args.dataset == "all" else (args.dataset,))
+    selected_rounds = {dataset: args.workflow_round or PAPER_TEST_ROUNDS[dataset] for dataset in selected}
+    selected_profiles: dict[str, Any] = {}
+    for dataset in selected:
+        round_index = selected_rounds[dataset]
+        profile = None if args.aflow_profile == "none" else get_aflow_profile(dataset, round_index)
+        if args.aflow_profile not in {"none", "auto"}:
+            if profile is None or profile.profile_name != args.aflow_profile:
+                raise SystemExit(f"Profile {args.aflow_profile!r} does not match {dataset} round {round_index}")
+        if args.communication_mode not in {"original", "graph_shadow"}:
+            if profile is None:
+                raise SystemExit(f"No registered AFlow profile for {dataset} round {round_index}; use original or graph_shadow")
+            if args.aflow_profile == "auto" and not profile.validated:
+                raise SystemExit(
+                    f"Profile {profile.profile_name} is not validated; explicitly pass --aflow-profile {profile.profile_name} for experimental use"
+                )
+        selected_profiles[dataset] = profile
     limit = args.limit or None
     output = Path(args.output)
     missing = [_data_path(dataset, args.split) for dataset in selected if not _data_path(dataset, args.split).exists()]
@@ -680,7 +721,7 @@ def main() -> None:
         "test_fraction": 0.8,
         "workflow_round": args.workflow_round,
         "workflow_rounds": {
-            dataset: args.workflow_round or PAPER_TEST_ROUNDS[dataset] for dataset in selected
+            dataset: selected_rounds[dataset] for dataset in selected
         },
         "math_paper_subset": args.math_paper_subset,
         "max_new_tokens": args.max_new_tokens or None,
@@ -693,6 +734,11 @@ def main() -> None:
         "aflow_content_dedup": args.aflow_content_dedup,
         "aflow_invocation_reuse": args.aflow_invocation_reuse,
         "aflow_dedup_mode": args.aflow_dedup_mode,
+        "aflow_profile": args.aflow_profile,
+        "profile_validated": all(bool(profile and profile.validated) for profile in selected_profiles.values()),
+        "input_binding_version": "v1",
+        "candidate_policy_version": "v1",
+        "reuse_policy_version": "v1",
         "requested_limit": limit,
         "runs": {},
     }
@@ -711,6 +757,7 @@ def main() -> None:
             "aflow_content_dedup": args.aflow_content_dedup,
             "aflow_invocation_reuse": args.aflow_invocation_reuse,
             "aflow_dedup_mode": args.aflow_dedup_mode,
+            "aflow_profile": args.aflow_profile,
             "requested_limit": limit,
         }
         mismatches = [
@@ -767,6 +814,8 @@ def main() -> None:
                     aflow_content_dedup=args.aflow_content_dedup,
                     aflow_invocation_reuse=args.aflow_invocation_reuse,
                     aflow_dedup_mode=args.aflow_dedup_mode,
+                    aflow_profile=selected_profiles[dataset],
+                    aflow_profile_explicit=args.aflow_profile not in {"none", "auto"},
                     resume_result=saved_run,
                     save_progress=save_run_progress,
                 )

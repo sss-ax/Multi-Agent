@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import types
 
 import pytest
 
 from baselines.aflow_graph_adapter import AFlowGraphSession, make_aflow_operator_proxy_module
 from baselines.aflow_reuse import AFlowInvocationKey, AFlowInvocationReuse
+from workflow_runtime.telemetry import WorkflowTelemetry
 
 
 class SpaceTokenizer:
@@ -117,6 +119,38 @@ def test_graph_shadow_path_does_not_replace_original_input():
     )
     result = asyncio.run(proxy.Operator()(input="original"))
     assert result == "original"
+
+
+def test_graph_shadow_compile_failure_does_not_change_native_result(tmp_path):
+    class Custom:
+        __module__ = "test_math_shadow_module"
+
+        async def __call__(self, *, input, instruction):
+            return {"response": "native result"}
+
+    module = types.ModuleType("test_math_shadow_module")
+    module.Custom = Custom
+    session = AFlowGraphSession(
+        task_id="math-shadow",
+        task="problem",
+        dataset="MATH",
+        workflow_round=5,
+        telemetry=WorkflowTelemetry(tmp_path / "shadow.jsonl"),
+    )
+    proxy = make_aflow_operator_proxy_module(
+        module,
+        session=session,
+        communication_mode="graph_shadow",
+    )
+
+    result = asyncio.run(proxy.Custom()(input="problem", instruction="unknown"))
+
+    assert result == {"response": "native result"}
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "shadow.jsonl").read_text().splitlines()
+    ]
+    assert any(event.get("event") == "aflow_shadow_compile_error" for event in events)
 
 
 def test_candidate_pool_is_consumed_after_ensemble():
