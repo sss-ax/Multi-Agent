@@ -165,6 +165,135 @@ class WorkflowTelemetry:
             "aflow_weighted_metadata_tokens": 0,
             "aflow_weighted_prompt_saved_tokens": 0,
             "aflow_candidate_diagnostics": [],
+            "aflow_context_original_input_tokens": 0,
+            "aflow_context_selected_input_tokens": 0,
+            "aflow_context_saved_input_tokens": 0,
+            "aflow_context_selected_node_count": 0,
+            "aflow_context_closure_node_count": 0,
+            "aflow_context_contract_satisfied": 0,
+            "aflow_context_fallback_count": 0,
+            "aflow_context_selection_overhead_ms": 0,
+            "aflow_context_level_usage_L0": 0,
+            "aflow_context_level_usage_L1": 0,
+            "aflow_context_level_usage_L2": 0,
+            "aflow_context_risk_score": 0,
+            "aflow_context_L0_sample_count": 0,
+            "aflow_context_L1_sample_count": 0,
+            "aflow_context_L2_sample_count": 0,
+            "aflow_context_adaptive_recovery_count": 0,
+            "aflow_context_safety_fallback_count": 0,
+            "aflow_context_plan_cache_hits": 0,
+            "aflow_context_unique_selection_runs": 0,
+            "aflow_context_risk_reason_counts": {},
+            "aflow_context_plans": [],
+            "aflow_semantic_entity_count": 0,
+            "aflow_semantic_entity_mention_count": 0,
+            "aflow_semantic_title_entity_count": 0,
+            "aflow_semantic_bridge_entity_count": 0,
+            "aflow_semantic_candidate_path_count": 0,
+            "aflow_semantic_selected_path_count": 0,
+            "aflow_semantic_complete_path_count": 0,
+            "aflow_semantic_selected_document_count": 0,
+            "aflow_semantic_selected_sentence_count": 0,
+            "aflow_semantic_entity_coverage": 0,
+            "aflow_semantic_relation_coverage": 0,
+            "aflow_semantic_graph_build_ms": 0,
+            "aflow_semantic_path_selection_ms": 0,
+            "aflow_semantic_neighbor_tokens": 0,
+            "aflow_semantic_closure_tokens": 0,
+            "aflow_semantic_S0_count": 0,
+            "aflow_semantic_S1_count": 0,
+            "aflow_semantic_S2_count": 0,
+            "aflow_semantic_fallback_reason_counts": {},
+            "aflow_query_subgoal_count": 0,
+            "aflow_required_relation_count": 0,
+            "aflow_claim_count": 0,
+            "aflow_grounded_claim_count": 0,
+            "aflow_rejected_claim_count": 0,
+            "aflow_candidate_proof_count": 0,
+            "aflow_complete_proof_count": 0,
+            "aflow_false_complete_count": 0,
+            "aflow_S0_eligible_count": 0,
+            "aflow_claim_extraction_ms": 0,
+            "aflow_proof_selection_ms": 0,
+            "aflow_artifact_count": 0,
+            "aflow_artifact_type_counts": {},
+            "aflow_artifact_compile_ms": 0,
+            "aflow_artifact_parse_failures": 0,
+            "aflow_artifact_opaque_count": 0,
+            "aflow_artifact_route_count": 0,
+            "aflow_artifact_selected_count": 0,
+            "aflow_artifact_closure_count": 0,
+            "aflow_artifact_original_input_tokens": 0,
+            "aflow_artifact_selected_input_tokens": 0,
+            "aflow_artifact_saved_input_tokens": 0,
+            "aflow_artifact_fallback_count": 0,
+            "aflow_artifact_fallback_reason_counts": {},
+            "aflow_artifact_contract_failures": 0,
+            "aflow_artifact_multiplicity_preserved": 0,
+            "aflow_artifact_shadow_parity": 0,
+            "aflow_artifact_cache_hits": 0,
+            "aflow_artifact_selection_overhead_ms": 0,
+            "aflow_artifact_route_events_by_operator": {},
+            "aflow_artifact_original_tokens_by_operator": {},
+            "aflow_artifact_sendall_tokens_by_operator": {},
+            "aflow_artifact_minctx_tokens_by_operator": {},
+            "aflow_artifact_saved_tokens_by_operator": {},
+            "aflow_artifact_fallbacks_by_operator": {},
+            "aflow_artifact_contract_failures_by_operator": {},
+            "aflow_artifact_source_producer_passthrough_count": 0,
+            "aflow_artifact_occurrence_count": 0,
+            "aflow_artifact_canonical_count": 0,
+            "aflow_artifact_multiplicity_expected": 0,
+            "aflow_artifact_multiplicity_delivered": 0,
+            "aflow_artifact_closure_replay_success_count": 0,
+            "aflow_artifact_evaluator_field_rejections": 0,
+            "aflow_artifact_compression_opportunity": {},
+            "aflow_artifact_binding_count": 0,
+            "aflow_artifact_exact_binding_count": 0,
+            "aflow_artifact_unresolved_binding_count": 0,
+            "aflow_artifact_hard_edge_count": 0,
+            "aflow_artifact_edges_by_relation": {},
+            "aflow_artifact_closure_success_count": 0,
+            "aflow_artifact_closure_failure_count": 0,
+            "aflow_artifact_closure_hops": 0,
+            "aflow_artifact_cross_task_rejection_count": 0,
+            "aflow_artifact_cross_batch_rejection_count": 0,
+            "aflow_artifact_sendall_nodes_by_operator": {},
+            "aflow_artifact_minctx_nodes_by_operator": {},
+            "aflow_artifact_removed_nodes_by_operator": {},
+            "aflow_artifact_edge_count_by_operator": {},
+            "aflow_artifact_closure_replay_success_by_operator": {},
+            "aflow_artifact_selection_ambiguous_count": 0,
+            "aflow_artifact_binding_failure_count": 0,
+            "aflow_artifact_binding_failures_by_reason": {},
+            "aflow_artifact_compression_opportunity_reasons": {},
+            "aflow_artifact_transport_sendall_tokens": 0,
+            "aflow_artifact_transport_minctx_tokens": 0,
+            "aflow_artifact_transport_saved_tokens": 0,
+            "aflow_artifact_model_original_tokens": 0,
+            "aflow_artifact_model_minctx_tokens": 0,
+            "aflow_artifact_model_saved_tokens": 0,
+            "aflow_artifact_avoided_call_input_tokens": 0,
+            "aflow_artifact_avoided_call_output_tokens": 0,
+            "aflow_artifact_closure_complete_count": 0,
+            "aflow_artifact_metric_version": "v4.3",
+            "aflow_artifact_required_binding_count": 0,
+            "aflow_artifact_valid_required_binding_count": 0,
+            "aflow_artifact_invalid_required_binding_count": 0,
+            "aflow_artifact_exact_binding_rate": 0.0,
+            "aflow_artifact_closure_attempt_count": 0,
+            "aflow_artifact_closure_complete_count": 0,
+            "aflow_artifact_closure_incomplete_count": 0,
+            "aflow_artifact_replay_attempt_count": 0,
+            "aflow_artifact_replay_success_count": 0,
+            "aflow_artifact_replay_failure_count": 0,
+            "aflow_artifact_ensemble_expected_occurrences": 0,
+            "aflow_artifact_ensemble_delivered_occurrences": 0,
+            "aflow_artifact_multiplicity_preservation_rate": 0.0,
+            "aflow_artifact_invocation_plan_count": 0,
+            "aflow_artifact_direct_binding_count": 0,
+            "aflow_artifact_route_plans": [],
             "quality": {
                 "protocol_valid_actions": 0,
                 "compiled_actions": 0,
@@ -192,13 +321,44 @@ class WorkflowTelemetry:
         """Accumulate AFlow adapter metrics without coupling telemetry to AFlow."""
         for key, value in values.items():
             if key in self._summary:
-                self._summary[key] += int(value or 0)
+                if key.endswith("_ms"):
+                    self._summary[key] += float(value or 0)
+                elif key.endswith("_rate") or key.endswith("_ratio"):
+                    self._summary[key] = float(value or 0)
+                else:
+                    self._summary[key] += int(value or 0)
+
+    def update_aflow_mapping_metric(self, key: str, values: dict[str, Any]) -> None:
+        """Update bounded dictionary telemetry without exposing internal state."""
+        current = self._summary.setdefault(key, {})
+        if not isinstance(current, dict):
+            current = {}
+            self._summary[key] = current
+        for name, value in values.items():
+            current[str(name)] = current.get(str(name), 0) + value
 
     def record_aflow_diagnostic(self, diagnostic: dict[str, Any]) -> None:
         """Keep bounded task-level AFlow diagnostics in the run summary."""
         records = self._summary.setdefault("aflow_candidate_diagnostics", [])
         records.append(dict(diagnostic))
         del records[:-200]
+
+    def record_aflow_context_plan(self, plan: dict[str, Any]) -> None:
+        plans = self._summary.setdefault("aflow_context_plans", [])
+        plans.append(dict(plan))
+        del plans[:-20]
+        for reason in list(plan.get("critical_reasons", ())) + list(plan.get("soft_reasons", ())):
+            counts = self._summary.setdefault("aflow_context_risk_reason_counts", {})
+            counts[str(reason)] = int(counts.get(str(reason), 0)) + 1
+
+    def record_aflow_artifact_route_plan(self, plan: dict[str, Any]) -> None:
+        plans = self._summary.setdefault("aflow_artifact_route_plans", [])
+        plans.append(dict(plan))
+        del plans[:-100]
+
+    def record_aflow_semantic_fallback(self, reason: str) -> None:
+        counts = self._summary.setdefault("aflow_semantic_fallback_reason_counts", {})
+        counts[str(reason)] = int(counts.get(str(reason), 0)) + 1
 
     def record_action(self, payload: dict[str, Any]) -> None:
         event = dict(payload)

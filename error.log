@@ -1919,3 +1919,496 @@ def file_name_check(file_name):
     assert candidate('s.') == 'No'
 
 
+2026-11-10 01:54:27 - Error: .
+ Solution: def is_samepatterns(colors, patterns):
+    """
+    Check if the colors follow the sequence given in the patterns array.
+    
+    :param colors: List[str] - a list of color strings
+    :param patterns: List[str] - a list of pattern strings indicating the sequence
+    :return: bool - True if the colors match the sequence in patterns, False otherwise
+    """
+    pattern_to_color = {pattern: color for color, pattern in zip(colors, patterns)}
+    return all((pattern_to_color[pattern] == color for color, pattern in zip(colors, patterns))).
+ Test: def check():
+    assert is_samepatterns(["red","green","green"], ["a", "b", "b"])==True
+    assert is_samepatterns(["red","green","greenn"], ["a","b","b"])==False
+    assert is_samepatterns(["red","green","greenn"], ["a","b"])==False
+
+2026-11-10 01:54:33 - Error: .
+ Solution: def is_Sum_Of_Powers_Of_Two(n):
+    if n <= 0:
+        return False
+    while n != 0:
+        if n % 2 == 1:
+            n -= 1
+        elif n % 2 == 0:
+            n //= 2
+        if n == 1:
+            return True
+    return False.
+ Test: def check():
+    assert is_Sum_Of_Powers_Of_Two(10) == True
+    assert is_Sum_Of_Powers_Of_Two(7) == False
+    assert is_Sum_Of_Powers_Of_Two(14) == True
+
+2026-11-10 01:54:52 - Error: .
+ Solution: def parabola_directrix(a, b, c):
+    k = -b / (2 * a)
+    directrix = k - 1 / (4 * a)
+    return directrix.
+ Test: def check():
+    assert parabola_directrix(5,3,2)==-198
+    assert parabola_directrix(9,8,4)==-2336
+    assert parabola_directrix(2,4,6)==-130
+
+2026-11-10 01:55:23 - Error: .
+ Solution: def is_samepatterns(colors, patterns):
+    """
+    Check if the colors follow the sequence given in the patterns array.
+    
+    :param colors: List[str] - a list of color strings
+    :param patterns: List[str] - a list of pattern strings indicating the sequence
+    :return: bool - True if the colors match the sequence in patterns, False otherwise
+    """
+    pattern_to_color = {pattern: color for color, pattern in zip(colors, patterns)}
+    return all((pattern_to_color[pattern] == color for color, pattern in zip(colors, patterns))).
+ Test: def check():
+    assert is_samepatterns(["red","green","green"], ["a", "b", "b"])==True
+    assert is_samepatterns(["red","green","greenn"], ["a","b","b"])==False
+    assert is_samepatterns(["red","green","greenn"], ["a","b"])==False
+
+2026-11-10 01:55:29 - Error: .
+ Solution: def is_Sum_Of_Powers_Of_Two(n):
+    if n <= 0:
+        return False
+    while n != 0:
+        if n % 2 == 1:
+            n -= 1
+        elif n % 2 == 0:
+            n //= 2
+        if n == 1:
+            return True
+    return False.
+ Test: def check():
+    assert is_Sum_Of_Powers_Of_Two(10) == True
+    assert is_Sum_Of_Powers_Of_Two(7) == False
+    assert is_Sum_Of_Powers_Of_Two(14) == True
+
+2026-11-10 01:55:48 - Error: .
+ Solution: def parabola_directrix(a, b, c):
+    k = -b / (2 * a)
+    directrix = k - 1 / (4 * a)
+    return directrix.
+ Test: def check():
+    assert parabola_directrix(5,3,2)==-198
+    assert parabola_directrix(9,8,4)==-2336
+    assert parabola_directrix(2,4,6)==-130
+
+2026-11-10 01:56:21 - Error: .
+ Solution: def is_Sum_Of_Powers_Of_Two(n):
+    if n <= 0:
+        return False
+    while n != 0:
+        if n % 2 == 1:
+            n -= 1
+        elif n % 2 == 0:
+            n //= 2
+        if n == 1:
+            return True
+    return False.
+ Test: def check():
+    assert is_Sum_Of_Powers_Of_Two(10) == True
+    assert is_Sum_Of_Powers_Of_Two(7) == False
+    assert is_Sum_Of_Powers_Of_Two(14) == True
+
+2026-11-10 01:56:39 - Error: .
+ Solution: def parabola_directrix(a, b, c):
+    k = -b / (2 * a)
+    directrix = k - 1 / (4 * a)
+    return directrix.
+ Test: def check():
+    assert parabola_directrix(5,3,2)==-198
+    assert parabola_directrix(9,8,4)==-2336
+    assert parabola_directrix(2,4,6)==-130
+
+2026-11-10 01:57:12 - Error: .
+ Solution: def is_Sum_Of_Powers_Of_Two(n):
+    if n <= 0:
+        return False
+    while n != 0:
+        if n % 2 == 1:
+            n -= 1
+        elif n % 2 == 0:
+            n //= 2
+        if n == 1:
+            return True
+    return False.
+ Test: def check():
+    assert is_Sum_Of_Powers_Of_Two(10) == True
+    assert is_Sum_Of_Powers_Of_Two(7) == False
+    assert is_Sum_Of_Powers_Of_Two(14) == True
+
+2026-11-10 01:57:31 - Error: .
+ Solution: def parabola_directrix(a, b, c):
+    k = -b / (2 * a)
+    directrix = k - 1 / (4 * a)
+    return directrix.
+ Test: def check():
+    assert parabola_directrix(5,3,2)==-198
+    assert parabola_directrix(9,8,4)==-2336
+    assert parabola_directrix(2,4,6)==-130
+
+2026-11-10 02:45:23 - Error: .
+ Solution: def is_samepatterns(colors, patterns):
+    """
+    Check if the colors follow the sequence given in the patterns array.
+    
+    :param colors: List[str] - a list of color strings
+    :param patterns: List[str] - a list of pattern strings indicating the sequence
+    :return: bool - True if the colors match the sequence in patterns, False otherwise
+    """
+    pattern_to_color = {pattern: color for color, pattern in zip(colors, patterns)}
+    return all((pattern_to_color[pattern] == color for color, pattern in zip(colors, patterns))).
+ Test: def check():
+    assert is_samepatterns(["red","green","green"], ["a", "b", "b"])==True
+    assert is_samepatterns(["red","green","greenn"], ["a","b","b"])==False
+    assert is_samepatterns(["red","green","greenn"], ["a","b"])==False
+
+2026-11-10 02:45:29 - Error: .
+ Solution: def is_Sum_Of_Powers_Of_Two(n):
+    if n <= 0:
+        return False
+    while n != 0:
+        if n % 2 == 1:
+            n -= 1
+        elif n % 2 == 0:
+            n //= 2
+        if n == 1:
+            return True
+    return False.
+ Test: def check():
+    assert is_Sum_Of_Powers_Of_Two(10) == True
+    assert is_Sum_Of_Powers_Of_Two(7) == False
+    assert is_Sum_Of_Powers_Of_Two(14) == True
+
+2026-11-10 02:45:48 - Error: .
+ Solution: def parabola_directrix(a, b, c):
+    k = -b / (2 * a)
+    directrix = k - 1 / (4 * a)
+    return directrix.
+ Test: def check():
+    assert parabola_directrix(5,3,2)==-198
+    assert parabola_directrix(9,8,4)==-2336
+    assert parabola_directrix(2,4,6)==-130
+
+2026-11-10 02:46:20 - Error: .
+ Solution: def is_samepatterns(colors, patterns):
+    """
+    Check if the colors follow the sequence given in the patterns array.
+    
+    :param colors: List[str] - a list of color strings
+    :param patterns: List[str] - a list of pattern strings indicating the sequence
+    :return: bool - True if the colors match the sequence in patterns, False otherwise
+    """
+    pattern_to_color = {pattern: color for color, pattern in zip(colors, patterns)}
+    return all((pattern_to_color[pattern] == color for color, pattern in zip(colors, patterns))).
+ Test: def check():
+    assert is_samepatterns(["red","green","green"], ["a", "b", "b"])==True
+    assert is_samepatterns(["red","green","greenn"], ["a","b","b"])==False
+    assert is_samepatterns(["red","green","greenn"], ["a","b"])==False
+
+2026-11-10 02:46:26 - Error: .
+ Solution: def is_Sum_Of_Powers_Of_Two(n):
+    if n <= 0:
+        return False
+    while n != 0:
+        if n % 2 == 1:
+            n -= 1
+        elif n % 2 == 0:
+            n //= 2
+        if n == 1:
+            return True
+    return False.
+ Test: def check():
+    assert is_Sum_Of_Powers_Of_Two(10) == True
+    assert is_Sum_Of_Powers_Of_Two(7) == False
+    assert is_Sum_Of_Powers_Of_Two(14) == True
+
+2026-11-10 02:46:44 - Error: .
+ Solution: def parabola_directrix(a, b, c):
+    k = -b / (2 * a)
+    directrix = k - 1 / (4 * a)
+    return directrix.
+ Test: def check():
+    assert parabola_directrix(5,3,2)==-198
+    assert parabola_directrix(9,8,4)==-2336
+    assert parabola_directrix(2,4,6)==-130
+
+2026-11-10 02:47:17 - Error: .
+ Solution: def is_Sum_Of_Powers_Of_Two(n):
+    if n <= 0:
+        return False
+    while n != 0:
+        if n % 2 == 1:
+            n -= 1
+        elif n % 2 == 0:
+            n //= 2
+        if n == 1:
+            return True
+    return False.
+ Test: def check():
+    assert is_Sum_Of_Powers_Of_Two(10) == True
+    assert is_Sum_Of_Powers_Of_Two(7) == False
+    assert is_Sum_Of_Powers_Of_Two(14) == True
+
+2026-11-10 02:47:36 - Error: .
+ Solution: def parabola_directrix(a, b, c):
+    k = -b / (2 * a)
+    directrix = k - 1 / (4 * a)
+    return directrix.
+ Test: def check():
+    assert parabola_directrix(5,3,2)==-198
+    assert parabola_directrix(9,8,4)==-2336
+    assert parabola_directrix(2,4,6)==-130
+
+2026-11-11 05:35:49 - Error: .
+ Solution: def string_to_tuple(s):
+    return tuple(s).
+ Test: def check():
+    assert string_to_tuple("python 3.0")==('p', 'y', 't', 'h', 'o', 'n', '3', '.', '0')
+    assert string_to_tuple("item1")==('i', 't', 'e', 'm', '1')
+    assert string_to_tuple("15.10")==('1', '5', '.', '1', '0')
+
+2026-11-11 05:36:16 - Error: .
+ Solution: def sum_div(number):
+    div_sum = 0
+    for i in range(1, number + 1):
+        if number % i == 0:
+            div_sum += i
+    return div_sum.
+ Test: def check():
+    assert sum_div(8)==7
+    assert sum_div(12)==16
+    assert sum_div(7)==1
+
+2026-11-11 05:36:54 - Error: .
+ Solution: def string_to_tuple(s):
+    return tuple(s).
+ Test: def check():
+    assert string_to_tuple("python 3.0")==('p', 'y', 't', 'h', 'o', 'n', '3', '.', '0')
+    assert string_to_tuple("item1")==('i', 't', 'e', 'm', '1')
+    assert string_to_tuple("15.10")==('1', '5', '.', '1', '0')
+
+2026-11-11 05:37:21 - Error: .
+ Solution: def sum_div(number):
+    div_sum = 0
+    for i in range(1, number + 1):
+        if number % i == 0:
+            div_sum += i
+    return div_sum.
+ Test: def check():
+    assert sum_div(8)==7
+    assert sum_div(12)==16
+    assert sum_div(7)==1
+
+2026-11-11 05:37:59 - Error: .
+ Solution: def string_to_tuple(s):
+    return tuple(s).
+ Test: def check():
+    assert string_to_tuple("python 3.0")==('p', 'y', 't', 'h', 'o', 'n', '3', '.', '0')
+    assert string_to_tuple("item1")==('i', 't', 'e', 'm', '1')
+    assert string_to_tuple("15.10")==('1', '5', '.', '1', '0')
+
+2026-11-11 05:38:27 - Error: .
+ Solution: def sum_div(number):
+    div_sum = 0
+    for i in range(1, number + 1):
+        if number % i == 0:
+            div_sum += i
+    return div_sum.
+ Test: def check():
+    assert sum_div(8)==7
+    assert sum_div(12)==16
+    assert sum_div(7)==1
+
+2026-11-11 05:39:04 - Error: .
+ Solution: def string_to_tuple(s):
+    return tuple(s).
+ Test: def check():
+    assert string_to_tuple("python 3.0")==('p', 'y', 't', 'h', 'o', 'n', '3', '.', '0')
+    assert string_to_tuple("item1")==('i', 't', 'e', 'm', '1')
+    assert string_to_tuple("15.10")==('1', '5', '.', '1', '0')
+
+2026-11-11 05:39:31 - Error: .
+ Solution: def sum_div(number):
+    div_sum = 0
+    for i in range(1, number + 1):
+        if number % i == 0:
+            div_sum += i
+    return div_sum.
+ Test: def check():
+    assert sum_div(8)==7
+    assert sum_div(12)==16
+    assert sum_div(7)==1
+
+2026-11-11 05:57:38 - Error: .
+ Solution: def string_to_tuple(s):
+    return tuple(s).
+ Test: def check():
+    assert string_to_tuple("python 3.0")==('p', 'y', 't', 'h', 'o', 'n', '3', '.', '0')
+    assert string_to_tuple("item1")==('i', 't', 'e', 'm', '1')
+    assert string_to_tuple("15.10")==('1', '5', '.', '1', '0')
+
+2026-11-11 05:58:03 - Error: .
+ Solution: def sum_div(number):
+    div_sum = 0
+    for i in range(1, number + 1):
+        if number % i == 0:
+            div_sum += i
+    return div_sum.
+ Test: def check():
+    assert sum_div(8)==7
+    assert sum_div(12)==16
+    assert sum_div(7)==1
+
+2026-11-11 05:58:40 - Error: .
+ Solution: def string_to_tuple(s):
+    return tuple(s).
+ Test: def check():
+    assert string_to_tuple("python 3.0")==('p', 'y', 't', 'h', 'o', 'n', '3', '.', '0')
+    assert string_to_tuple("item1")==('i', 't', 'e', 'm', '1')
+    assert string_to_tuple("15.10")==('1', '5', '.', '1', '0')
+
+2026-11-11 05:59:05 - Error: .
+ Solution: def sum_div(number):
+    div_sum = 0
+    for i in range(1, number + 1):
+        if number % i == 0:
+            div_sum += i
+    return div_sum.
+ Test: def check():
+    assert sum_div(8)==7
+    assert sum_div(12)==16
+    assert sum_div(7)==1
+
+2026-11-11 06:19:06 - Error: .
+ Solution: def string_to_tuple(s):
+    return tuple(s).
+ Test: def check():
+    assert string_to_tuple("python 3.0")==('p', 'y', 't', 'h', 'o', 'n', '3', '.', '0')
+    assert string_to_tuple("item1")==('i', 't', 'e', 'm', '1')
+    assert string_to_tuple("15.10")==('1', '5', '.', '1', '0')
+
+2026-11-11 06:19:34 - Error: .
+ Solution: def sum_div(number):
+    div_sum = 0
+    for i in range(1, number + 1):
+        if number % i == 0:
+            div_sum += i
+    return div_sum.
+ Test: def check():
+    assert sum_div(8)==7
+    assert sum_div(12)==16
+    assert sum_div(7)==1
+
+2026-11-11 06:20:12 - Error: .
+ Solution: def string_to_tuple(s):
+    return tuple(s).
+ Test: def check():
+    assert string_to_tuple("python 3.0")==('p', 'y', 't', 'h', 'o', 'n', '3', '.', '0')
+    assert string_to_tuple("item1")==('i', 't', 'e', 'm', '1')
+    assert string_to_tuple("15.10")==('1', '5', '.', '1', '0')
+
+2026-11-11 06:20:39 - Error: .
+ Solution: def sum_div(number):
+    div_sum = 0
+    for i in range(1, number + 1):
+        if number % i == 0:
+            div_sum += i
+    return div_sum.
+ Test: def check():
+    assert sum_div(8)==7
+    assert sum_div(12)==16
+    assert sum_div(7)==1
+
+2026-11-11 06:37:15 - Error: .
+ Solution: def string_to_tuple(s):
+    return tuple(s).
+ Test: def check():
+    assert string_to_tuple("python 3.0")==('p', 'y', 't', 'h', 'o', 'n', '3', '.', '0')
+    assert string_to_tuple("item1")==('i', 't', 'e', 'm', '1')
+    assert string_to_tuple("15.10")==('1', '5', '.', '1', '0')
+
+2026-11-11 06:37:43 - Error: .
+ Solution: def sum_div(number):
+    div_sum = 0
+    for i in range(1, number + 1):
+        if number % i == 0:
+            div_sum += i
+    return div_sum.
+ Test: def check():
+    assert sum_div(8)==7
+    assert sum_div(12)==16
+    assert sum_div(7)==1
+
+2026-11-11 06:38:21 - Error: .
+ Solution: def string_to_tuple(s):
+    return tuple(s).
+ Test: def check():
+    assert string_to_tuple("python 3.0")==('p', 'y', 't', 'h', 'o', 'n', '3', '.', '0')
+    assert string_to_tuple("item1")==('i', 't', 'e', 'm', '1')
+    assert string_to_tuple("15.10")==('1', '5', '.', '1', '0')
+
+2026-11-11 06:38:49 - Error: .
+ Solution: def sum_div(number):
+    div_sum = 0
+    for i in range(1, number + 1):
+        if number % i == 0:
+            div_sum += i
+    return div_sum.
+ Test: def check():
+    assert sum_div(8)==7
+    assert sum_div(12)==16
+    assert sum_div(7)==1
+
+2026-11-11 08:33:41 - Error: .
+ Solution: def string_to_tuple(s):
+    return tuple(s).
+ Test: def check():
+    assert string_to_tuple("python 3.0")==('p', 'y', 't', 'h', 'o', 'n', '3', '.', '0')
+    assert string_to_tuple("item1")==('i', 't', 'e', 'm', '1')
+    assert string_to_tuple("15.10")==('1', '5', '.', '1', '0')
+
+2026-11-11 08:34:07 - Error: .
+ Solution: def sum_div(number):
+    div_sum = 0
+    for i in range(1, number + 1):
+        if number % i == 0:
+            div_sum += i
+    return div_sum.
+ Test: def check():
+    assert sum_div(8)==7
+    assert sum_div(12)==16
+    assert sum_div(7)==1
+
+2026-11-11 08:34:45 - Error: .
+ Solution: def string_to_tuple(s):
+    return tuple(s).
+ Test: def check():
+    assert string_to_tuple("python 3.0")==('p', 'y', 't', 'h', 'o', 'n', '3', '.', '0')
+    assert string_to_tuple("item1")==('i', 't', 'e', 'm', '1')
+    assert string_to_tuple("15.10")==('1', '5', '.', '1', '0')
+
+2026-11-11 08:35:11 - Error: .
+ Solution: def sum_div(number):
+    div_sum = 0
+    for i in range(1, number + 1):
+        if number % i == 0:
+            div_sum += i
+    return div_sum.
+ Test: def check():
+    assert sum_div(8)==7
+    assert sum_div(12)==16
+    assert sum_div(7)==1
+

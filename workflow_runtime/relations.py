@@ -25,8 +25,24 @@ LINEAGE_RELATIONS: FrozenSet[str] = frozenset({"supersedes"})
 # canonical artifact but is not itself part of the receiver context.
 TRACE_RELATIONS: FrozenSet[str] = frozenset({"materializes"})
 
+# Structural source-order links are auditable context metadata, not data
+# dependencies.  They must not force a full sentence chain into a closure.
+CONTEXT_RELATIONS: FrozenSet[str] = frozenset({
+    "next_sentence", "query_mentions_entity", "title_identifies_entity",
+    "sentence_mentions_entity", "entity_co_occurs", "query_requires_subgoal",
+    "subgoal_requires_relation", "sentence_supports_claim", "claim_subject",
+    "claim_object", "claim_depends_on", "claim_answers_subgoal",
+    "produces_artifact", "artifact_depends_on", "artifact_supports",
+    "artifact_contradicts", "artifact_refines", "artifact_supersedes",
+    "artifact_cites",
+})
+
 ALL_RUNTIME_RELATIONS: FrozenSet[str] = (
-    DATA_DEPENDENCY_RELATIONS | VALIDATION_RELATIONS | LINEAGE_RELATIONS | TRACE_RELATIONS
+    DATA_DEPENDENCY_RELATIONS
+    | VALIDATION_RELATIONS
+    | LINEAGE_RELATIONS
+    | TRACE_RELATIONS
+    | CONTEXT_RELATIONS
 )
 
 
@@ -62,6 +78,19 @@ RELATION_SPECS.update(
             participates_in_dag=False,
         )
         for relation in VALIDATION_RELATIONS
+    }
+)
+RELATION_SPECS.update(
+    {
+        relation: RelationSpec(
+            name=relation,
+            source_role="predecessor",
+            target_role="successor",
+            propagates_source_change=False,
+            propagates_target_change=False,
+            participates_in_dag=False,
+        )
+        for relation in CONTEXT_RELATIONS
     }
 )
 RELATION_SPECS.update(

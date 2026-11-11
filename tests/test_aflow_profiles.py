@@ -15,6 +15,153 @@ def test_profile_registry_marks_only_gsm8k_validated():
     assert get_aflow_profile("HumanEval", 5).validated is False
 
 
+def _hotpot_session(*, policy: str = "full", budget: int = 0, top_k: int = 4):
+    context = [
+        ["Doc A", ["Alice works at Acme.", "Acme is based in Paris."]],
+        ["Doc B", ["Bob works at Beta.", "Beta is based in Rome."]],
+    ]
+    question = "Where is Alice's company based?"
+    original = "Context: " + "\n".join(" ".join(item[1]) for item in context)
+    original += f"\n\nQuestion: {question}\n\nAnswer:"
+    session = AFlowGraphSession(
+        task_id="hotpot-source",
+        task=question,
+        dataset="HotpotQA",
+        workflow_round=3,
+        profile_explicit=True,
+        context_mode="graph_minctx",
+        context_policy=policy,
+        context_budget_tokens=budget,
+        context_top_k_documents=top_k,
+        task_metadata={"question": question, "context": context},
+    )
+    return session, original
+
+
+def test_hotpot_source_graph_roundtrip_and_no_gold_labels():
+    session, original = _hotpot_session()
+    graph = session.hotpot_source_graph()
+    assert len(graph["question"]) == 1
+    assert len(graph["documents"]) == 2
+    assert len(graph["sentences"]) == 4
+    assert session.render_hotpot_context(graph["sentences"]) == original
+    contents = [node.content for node in session.store.snapshot().nodes.values()]
+    assert not any("supporting_facts" in str(value) for value in contents)
+
+
+def test_hotpot_graph_minctx_full_is_lossless():
+    session, original = _hotpot_session(policy="full")
+    prepared = session.prepare_operator_input(
+        operator="AnswerGenerate",
+        kwargs={"input": original},
+        communication_mode="graph_minctx",
+    )
+    assert prepared.kwargs["input"] == original
+    assert prepared.source_node_ids
+    assert session._context_plans[-1].fallback is False
+    assert session._context_plans[-1].contract_satisfied is True
+
+
+def test_hotpot_topk_context_is_shorter_and_deterministic():
+    session, original = _hotpot_session(policy="topk_documents", top_k=1)
+    prepared = session.prepare_operator_input(
+        operator="AnswerGenerate",
+        kwargs={"input": original},
+        communication_mode="graph_minctx",
+    )
+    assert len(prepared.kwargs["input"]) < len(original)
+    assert len({session.store.node(node_id).provenance["document_index"] for node_id in prepared.source_node_ids}) == 1
+    assert session._context_plans[-1].fallback is False
+
+
+def test_hotpot_dependency_minimal_context_adds_sentence_neighbors():
+    session, original = _hotpot_session(policy="dependency_minimal", top_k=1)
+    prepared = session.prepare_operator_input(
+        operator="AnswerGenerate",
+        kwargs={"input": original},
+        communication_mode="graph_minctx",
+    )
+    assert prepared.kwargs["input"]
+    assert session._context_plans[-1].fallback is False
+    assert session._context_plans[-1].closure_node_ids
+
+
+def test_hotpot_context_budget_falls_back_to_original_without_visibility_mutation():
+    session, original = _hotpot_session(policy="topk_documents", budget=1, top_k=1)
+    before = set(session.store.snapshot().nodes)
+    prepared = session.prepare_operator_input(
+        operator="AnswerGenerate",
+        kwargs={"input": original},
+        communication_mode="graph_minctx",
+    )
+    assert prepared.kwargs["input"] == original
+    assert session._context_plans[-1].fallback is True
+    assert session._context_plans[-1].fallback_reason == "context_budget_exceeded"
+    assert set(session.store.snapshot().nodes) == before
+
+
+def test_hotpot_flat_topk_alias_and_selection_audit_are_deterministic():
+    left, original = _hotpot_session(policy="topk_documents", top_k=1)
+    right, _ = _hotpot_session(policy="flat_topk_documents", top_k=1)
+    for session in (left, right):
+        session.prepare_operator_input(operator="AnswerGenerate", kwargs={"input": original}, communication_mode="graph_minctx")
+    assert left._context_plans[-1].selected_node_ids == right._context_plans[-1].selected_node_ids
+    plan = left._context_plans[-1]
+    assert plan.document_scores and plan.sentence_scores
+    assert plan.tokens_by_level and plan.risk_by_level
+
+
+def test_hotpot_adaptive_recovery_records_levels_and_uses_original_at_l2():
+    session, original = _hotpot_session(policy="dependency_minimal", top_k=1)
+    session.context_recovery = "adaptive"
+    session.context_recovery_top_k_documents = 2
+    prepared = session.prepare_operator_input(operator="AnswerGenerate", kwargs={"input": original}, communication_mode="graph_minctx")
+    plan = session._context_plans[-1]
+    assert plan.attempted_levels[0] == "L0"
+    assert plan.effective_level in {"L0", "L1", "L2"}
+    assert set(plan.tokens_by_level) >= {"L0"}
+    if plan.effective_level == "L2":
+        assert prepared.kwargs["input"] == original
+
+
+def test_hotpot_question_without_valid_entity_does_not_trigger_entity_risk():
+    question = "What is mentioned?"
+    context = [["Doc A", ["A short fact is mentioned."]], ["Doc B", ["Another fact is mentioned."]]]
+    session = AFlowGraphSession(
+        task_id="no-entity", task=question, dataset="HotpotQA", workflow_round=3,
+        profile_explicit=True, context_mode="graph_minctx", context_policy="full",
+        task_metadata={"question": question, "context": context},
+    )
+    selection = session._hotpot_select_source_nodes("full", 4)
+    risk = session._hotpot_context_risk(selection, original_tokens=100, selected_tokens=50, level="L0")
+    assert "low_entity_coverage" not in risk.soft_reasons
+    assert "question_entities_uncovered" not in risk.critical_reasons
+
+
+def test_hotpot_bridge_detects_shared_sentence_entity():
+    context = [
+        ["Alice", ["Alice founded Acme."]],
+        ["Paris", ["Acme is based in Paris."]],
+    ]
+    question = "Where is Alice's company based?"
+    session = AFlowGraphSession(
+        task_id="bridge", task=question, dataset="HotpotQA", workflow_round=3,
+        profile_explicit=True, context_mode="graph_minctx", context_policy="dependency_minimal",
+        task_metadata={"question": question, "context": context},
+    )
+    selection = session._hotpot_select_source_nodes("dependency_minimal", 2)
+    assert selection.bridge_paths
+
+
+def test_hotpot_selection_plan_cache_is_reused():
+    session, original = _hotpot_session(policy="dependency_minimal", top_k=2)
+    session.context_recovery = "adaptive"
+    session.prepare_operator_input(operator="AnswerGenerate", kwargs={"input": original}, communication_mode="graph_minctx")
+    session.prepare_operator_input(operator="AnswerGenerate", kwargs={"input": original}, communication_mode="graph_minctx")
+    assert session._context_plan_cache_hits > 0
+    assert session._context_plans[-1].cache_hit is True
+
+
 def test_humaneval_profile_preserves_generation_and_test_dependency():
     session = AFlowGraphSession(
         task_id="he-profile", task="def f(x):", dataset="HumanEval",

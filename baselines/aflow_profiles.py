@@ -13,10 +13,42 @@ from typing import Any, Callable, Mapping
 
 
 @dataclass(frozen=True)
+class ReceiverContract:
+    receiver: str
+    required_artifact_types: tuple[str, ...] = ()
+    optional_artifact_types: tuple[str, ...] = ()
+    forbidden_artifact_types: tuple[str, ...] = ()
+    required_source_types: tuple[str, ...] = ()
+    required_relations: tuple[str, ...] = ()
+    preserve_multiplicity: bool = True
+    include_source_refs: bool = False
+    dependency_closure: bool = True
+    max_tokens: int = 0
+    renderer: str = "native"
+    fallback: str = "original"
+    required_bindings: tuple["RequiredBindingSpec", ...] = ()
+
+
+@dataclass(frozen=True)
+class RequiredBindingSpec:
+    """Field-level requirements used by the v4.2 replay gate."""
+    field_name: str
+    requirement_class: str
+    value_kind: str = "raw"
+    cardinality: str = "one"
+    ordered: bool = False
+    preserve_multiplicity: bool = False
+
+
+@dataclass(frozen=True)
 class AFlowOperatorInput:
     kwargs: dict[str, Any]
     source_node_ids: tuple[str, ...] = ()
     context: Any = None
+    artifact_binding_hints: Mapping[str, tuple[str, ...]] = None
+    candidate_batch_id: str | None = None
+    invocation_id: str | None = None
+    source_binding_hints: Mapping[str, tuple[str, ...]] = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +82,11 @@ class AFlowOptimizationProfile:
     ensemble_fill_mode: str | None = None
     supports_content_dedup: bool = True
     supports_invocation_reuse: bool = True
+    # Context compression is deliberately opt-in.  Profiles that do not
+    # provide a lossless source binding continue to use their native inputs.
+    supports_context_compression: bool = False
+    receiver_contracts: Mapping[str, ReceiverContract] = None
+    operator_roles: Mapping[str, str] = None
 
     @property
     def profile_name(self) -> str:
@@ -71,6 +108,19 @@ class AFlowOptimizationProfile:
         if self.invocation_predicate is not None:
             return bool(self.invocation_predicate(operator=operator, kwargs=kwargs or {}))
         return True
+
+    def receiver_contract(self, operator: str) -> ReceiverContract:
+        contracts = self.receiver_contracts or {}
+        for name, contract in contracts.items():
+            if str(name).casefold() == str(operator).casefold():
+                return contract
+        return ReceiverContract(receiver=str(operator))
+
+    def operator_role(self, operator: str, kwargs: Mapping[str, Any] | None = None) -> str:
+        for name, role in (self.operator_roles or {}).items():
+            if str(name).casefold() == str(operator).casefold():
+                return str(role)
+        return "passthrough"
 
 
 def _identity_output(value: Any) -> Any:
@@ -436,7 +486,7 @@ def _math_reuse_predicate(*, operator: str, kwargs: Mapping[str, Any]) -> bool:
     return str(operator).casefold() == "custom" and _math_custom_role(kwargs) == "generated"
 
 
-def _profile(dataset: str, round_index: int, *, candidates: tuple[str, ...], ensembles: tuple[str, ...], reusable: tuple[str, ...], binding: Callable[..., AFlowOperatorInput], signature: Callable[..., str], validated: bool = False, invocation_predicate: Callable[..., bool] | None = None, source_selector: Callable[..., tuple[str, ...]] | None = None, candidate_projection: Callable[..., Any] | None = None, ensemble_strategy: str = "native", ensemble_prompt_builder: Callable[..., tuple[str, dict[str, str]]] | None = None, ensemble_fill_mode: str | None = None, supports_content_dedup: bool = True, supports_invocation_reuse: bool = True) -> AFlowOptimizationProfile:
+def _profile(dataset: str, round_index: int, *, candidates: tuple[str, ...], ensembles: tuple[str, ...], reusable: tuple[str, ...], binding: Callable[..., AFlowOperatorInput], signature: Callable[..., str], validated: bool = False, invocation_predicate: Callable[..., bool] | None = None, source_selector: Callable[..., tuple[str, ...]] | None = None, candidate_projection: Callable[..., Any] | None = None, ensemble_strategy: str = "native", ensemble_prompt_builder: Callable[..., tuple[str, dict[str, str]]] | None = None, ensemble_fill_mode: str | None = None, supports_content_dedup: bool = True, supports_invocation_reuse: bool = True, supports_context_compression: bool = False, receiver_contracts: Mapping[str, ReceiverContract] | None = None, operator_roles: Mapping[str, str] | None = None) -> AFlowOptimizationProfile:
     return AFlowOptimizationProfile(
         dataset=dataset,
         workflow_round=round_index,
@@ -456,7 +506,44 @@ def _profile(dataset: str, round_index: int, *, candidates: tuple[str, ...], ens
         ensemble_fill_mode=ensemble_fill_mode,
         supports_content_dedup=supports_content_dedup,
         supports_invocation_reuse=supports_invocation_reuse,
+        supports_context_compression=supports_context_compression,
+        receiver_contracts=receiver_contracts or {},
+        operator_roles=operator_roles or {},
     )
+
+
+_HOTPOT_CONTRACTS = {
+    "AnswerGenerate": ReceiverContract("AnswerGenerate", ("evidence_ref", "opaque_text"), ("constraint", "uncertainty"), required_source_types=("question_source", "sentence_source"), include_source_refs=True),
+    "ScEnsemble": ReceiverContract("ScEnsemble", ("candidate_answer",), ("confidence", "uncertainty", "evidence_ref"), forbidden_artifact_types=("reasoning_summary", "opaque_text"), preserve_multiplicity=True),
+    "Custom": ReceiverContract("Custom", ("candidate_answer",), ("evidence_ref", "uncertainty"), forbidden_artifact_types=("reasoning_summary", "opaque_text"), preserve_multiplicity=True),
+}
+
+_MBPP_CONTRACTS = {
+    "ScEnsemble": ReceiverContract(
+        "ScEnsemble", ("code",),
+        forbidden_artifact_types=("reasoning_summary", "test_result", "opaque_text"),
+        preserve_multiplicity=True, renderer="mbpp_ensemble",
+        required_bindings=(RequiredBindingSpec("solutions", "required_artifact", "artifact", "exact_batch", True, True),),
+    ),
+    "Test": ReceiverContract(
+        "Test", ("code",), required_source_types=("problem", "entry_point"), renderer="mbpp_test",
+        required_bindings=(
+            RequiredBindingSpec("solution", "required_artifact", "artifact", "one"),
+            RequiredBindingSpec("problem", "required_source", "source", "one"),
+            RequiredBindingSpec("entry_point", "required_source", "source", "one"),
+            RequiredBindingSpec("tests", "required_source", "source", "zero_or_one"),
+        ),
+    ),
+    "Custom": ReceiverContract(
+        "Custom", ("code", "test_result"), optional_artifact_types=("critique",),
+        required_source_types=("problem",), forbidden_artifact_types=("opaque_text",), renderer="mbpp_fix",
+        required_bindings=(
+            RequiredBindingSpec("failed_code", "required_artifact", "artifact", "one"),
+            RequiredBindingSpec("test_result", "required_artifact", "artifact", "one"),
+            RequiredBindingSpec("problem", "required_source", "source", "one"),
+        ),
+    ),
+}
 
 
 _PROFILES = {
@@ -464,11 +551,11 @@ _PROFILES = {
     ("DROP", 3): _profile("DROP", 3, candidates=("AnswerGenerate",), ensembles=("ScEnsemble",), reusable=("AnswerGenerate",), binding=_drop_binding, signature=_drop_candidate_signature, source_selector=_drop_source_selector, validated=True),
     # Validated on the paired 10-row native/shadow/sendall/weighted runs:
     # weighted ensemble + exact candidate projection + deterministic reuse.
-    ("HotpotQA", 3): _profile("HotpotQA", 3, candidates=("AnswerGenerate",), ensembles=("ScEnsemble",), reusable=("AnswerGenerate",), binding=_hotpotqa_binding, signature=_hotpotqa_candidate_signature, source_selector=_hotpotqa_source_selector, candidate_projection=_hotpotqa_candidate_projection, ensemble_strategy="weighted", validated=True),
+    ("HotpotQA", 3): _profile("HotpotQA", 3, candidates=("AnswerGenerate",), ensembles=("ScEnsemble",), reusable=("AnswerGenerate",), binding=_hotpotqa_binding, signature=_hotpotqa_candidate_signature, source_selector=_hotpotqa_source_selector, candidate_projection=_hotpotqa_candidate_projection, ensemble_strategy="weighted", validated=True, supports_context_compression=True, receiver_contracts=_HOTPOT_CONTRACTS, operator_roles={"AnswerGenerate": "source_producer", "ScEnsemble": "artifact_receiver", "Custom": "hybrid_receiver"}),
 ("MATH", 5): _profile("MATH", 5, candidates=("Custom",), ensembles=("ScEnsemble",), reusable=("Custom",), binding=_math_binding, signature=_math_candidate_signature, source_selector=_math_source_selector, candidate_projection=_math_candidate_projection, invocation_predicate=_math_reuse_predicate, ensemble_strategy="native_multiplicity", ensemble_prompt_builder=_math_weighted_prompt, ensemble_fill_mode="context_fill"),
     # Validated on the paired 50-row run with PYTHONHASHSEED=0: score parity,
     # deterministic reuse, exact code deduplication, and zero weighted fallbacks.
-    ("MBPP", 14): _profile("MBPP", 14, candidates=("CustomCodeGenerate",), ensembles=("ScEnsemble",), reusable=("CustomCodeGenerate",), binding=_mbpp_binding, signature=_mbpp_candidate_signature, source_selector=_mbpp_source_selector, candidate_projection=_mbpp_candidate_projection, ensemble_strategy="weighted_code", ensemble_prompt_builder=_mbpp_weighted_prompt, ensemble_fill_mode="context_fill", validated=True),
+    ("MBPP", 14): _profile("MBPP", 14, candidates=("CustomCodeGenerate",), ensembles=("ScEnsemble",), reusable=("CustomCodeGenerate",), binding=_mbpp_binding, signature=_mbpp_candidate_signature, source_selector=_mbpp_source_selector, candidate_projection=_mbpp_candidate_projection, ensemble_strategy="weighted_code", ensemble_prompt_builder=_mbpp_weighted_prompt, ensemble_fill_mode="context_fill", validated=True, receiver_contracts=_MBPP_CONTRACTS, operator_roles={"CustomCodeGenerate": "source_producer", "ScEnsemble": "artifact_receiver", "Test": "hybrid_receiver", "Custom": "hybrid_receiver"}),
     ("HumanEval", 5): _profile("HumanEval", 5, candidates=("CustomCodeGenerate",), ensembles=(), reusable=(), binding=_humaneval_binding, signature=_humaneval_candidate_signature, source_selector=_humaneval_source_selector, candidate_projection=_humaneval_candidate_projection, supports_content_dedup=False, supports_invocation_reuse=False),
 }
 

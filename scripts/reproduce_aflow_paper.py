@@ -196,6 +196,19 @@ async def _run_one(
     aflow_dedup_mode: str,
     aflow_profile: Any,
     aflow_profile_explicit: bool,
+    aflow_context_policy: str,
+    aflow_context_budget_tokens: int,
+    aflow_context_top_k_documents: int,
+    aflow_context_fallback: str,
+    aflow_context_recovery: str,
+    aflow_context_recovery_top_k_documents: int,
+    aflow_semantic_max_paths: int,
+    aflow_semantic_max_document_hops: int,
+    aflow_semantic_budget_tokens: int,
+    aflow_semantic_entity_policy: str,
+    artifact_routing_policy: str,
+    artifact_fallback: str,
+    artifact_preserve_multiplicity: bool,
     resume_result: dict[str, Any] | None,
     save_progress: Callable[[dict[str, Any]], None],
 ) -> dict[str, Any]:
@@ -352,6 +365,11 @@ async def _run_one(
                         workflow_round=workflow_round,
                         task_metadata={
                             "entry_point": rows[row_index].get("entry_point", ""),
+                            # Public HotpotQA context is used only to build
+                            # source artifacts.  Gold supporting_facts and
+                            # answer labels are intentionally not copied.
+                            "question": rows[row_index].get("question", ""),
+                            "context": rows[row_index].get("context", []) if dataset == "HotpotQA" else [],
                         },
                         profile=aflow_profile,
                         profile_explicit=aflow_profile_explicit,
@@ -376,6 +394,20 @@ async def _run_one(
                             "seed": 42,
                         },
                         tokenizer=model.tokenizer,
+                        context_mode=communication_mode,
+                        context_policy=aflow_context_policy,
+                        context_budget_tokens=aflow_context_budget_tokens,
+                        context_top_k_documents=aflow_context_top_k_documents,
+                        context_fallback=aflow_context_fallback,
+                        context_recovery=aflow_context_recovery,
+                        context_recovery_top_k_documents=aflow_context_recovery_top_k_documents,
+                        semantic_max_paths=aflow_semantic_max_paths,
+                        semantic_max_document_hops=aflow_semantic_max_document_hops,
+                        semantic_budget_tokens=aflow_semantic_budget_tokens,
+                        semantic_entity_policy=aflow_semantic_entity_policy,
+                        artifact_routing_policy=artifact_routing_policy,
+                        artifact_fallback=artifact_fallback,
+                        artifact_preserve_multiplicity=artifact_preserve_multiplicity,
                     )
                     result["aflow_effective_policy"] = graph_session.optimization_status
                     workflow_module, graph_path = _load_paper_workflow(
@@ -396,9 +428,9 @@ async def _run_one(
                     graph_session.telemetry.record_aflow_metric(
                         aflow_actual_llm_calls=len(item_calls)
                     )
-                    result.setdefault("graph_telemetry", []).append(
-                        graph_session.telemetry.summary()
-                    )
+                    graph_summary = graph_session.telemetry.summary()
+                    graph_summary["sample_id"] = row_id
+                    result.setdefault("graph_telemetry", []).append(graph_summary)
                 result["records"].append(record)
                 result["record_ids"].append(_row_identifier(rows[row_index], row_index))
                 result["model_call_records"].extend(_compact_call_record(call) for call in item_calls)
@@ -619,7 +651,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--communication-mode",
-        choices=("original", "graph_shadow", "graph_sendall", "graph_ra"),
+        choices=("original", "graph_shadow", "graph_sendall", "graph_ra", "graph_minctx", "artifact_shadow", "artifact_sendall", "artifact_minctx"),
         default="original",
         help="Keep the paper Workflow topology and optionally route Operator context through GraphStore.",
     )
@@ -629,6 +661,39 @@ def main() -> None:
         default="send_all",
         help="Graph communication policy used by graph_* modes.",
     )
+    parser.add_argument(
+        "--aflow-context-policy",
+        choices=("full", "topk_documents", "flat_topk_documents", "dependency_minimal", "semantic_minimal", "semantic_shadow"),
+        default="full",
+        help="HotpotQA source-artifact context policy used by graph_minctx.",
+    )
+    parser.add_argument(
+        "--aflow-context-budget-tokens",
+        type=int,
+        default=0,
+        help="Optional hard budget for a compressed HotpotQA Operator input; 0 disables it.",
+    )
+    parser.add_argument(
+        "--aflow-context-top-k-documents",
+        type=int,
+        default=4,
+        help="Number of deterministic HotpotQA documents considered by top-k policies.",
+    )
+    parser.add_argument(
+        "--aflow-context-fallback",
+        choices=("original",),
+        default="original",
+        help="Fallback policy when a compressed context fails its safety contract.",
+    )
+    parser.add_argument("--aflow-context-recovery", choices=("none", "adaptive", "semantic_adaptive"), default="none")
+    parser.add_argument("--aflow-context-recovery-top-k-documents", type=int, default=6)
+    parser.add_argument("--aflow-semantic-max-paths", type=int, default=2)
+    parser.add_argument("--aflow-semantic-max-document-hops", type=int, default=2)
+    parser.add_argument("--aflow-semantic-budget-tokens", type=int, default=512)
+    parser.add_argument("--aflow-semantic-entity-policy", choices=("deterministic_v1",), default="deterministic_v1")
+    parser.add_argument("--artifact-routing-policy", choices=("send_all", "contract_minimal"), default="send_all")
+    parser.add_argument("--artifact-fallback", choices=("original",), default="original")
+    parser.add_argument("--artifact-preserve-multiplicity", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--aflow-content-dedup",
         action="store_true",
@@ -663,6 +728,14 @@ def main() -> None:
         raise SystemExit("--max-new-tokens cannot be negative")
     if args.prefix_cache_max_entries < 1:
         raise SystemExit("--prefix-cache-max-entries must be positive")
+    if args.aflow_context_budget_tokens < 0:
+        raise SystemExit("--aflow-context-budget-tokens cannot be negative")
+    if args.aflow_context_top_k_documents < 1:
+        raise SystemExit("--aflow-context-top-k-documents must be positive")
+    if args.aflow_context_recovery_top_k_documents < 1:
+        raise SystemExit("--aflow-context-recovery-top-k-documents must be positive")
+    if args.aflow_semantic_max_paths < 1 or args.aflow_semantic_max_document_hops < 1 or args.aflow_semantic_budget_tokens < 1:
+        raise SystemExit("AFlow semantic limits and budget must be positive")
     if args.communication_mode == "original" and (
         args.aflow_content_dedup or args.aflow_invocation_reuse
     ):
@@ -735,6 +808,19 @@ def main() -> None:
         "aflow_invocation_reuse": args.aflow_invocation_reuse,
         "aflow_dedup_mode": args.aflow_dedup_mode,
         "aflow_profile": args.aflow_profile,
+        "aflow_context_policy": args.aflow_context_policy,
+        "aflow_context_budget_tokens": args.aflow_context_budget_tokens,
+        "aflow_context_top_k_documents": args.aflow_context_top_k_documents,
+        "aflow_context_fallback": args.aflow_context_fallback,
+        "aflow_context_recovery": args.aflow_context_recovery,
+        "aflow_context_recovery_top_k_documents": args.aflow_context_recovery_top_k_documents,
+        "aflow_semantic_max_paths": args.aflow_semantic_max_paths,
+        "aflow_semantic_max_document_hops": args.aflow_semantic_max_document_hops,
+        "aflow_semantic_budget_tokens": args.aflow_semantic_budget_tokens,
+        "aflow_semantic_entity_policy": args.aflow_semantic_entity_policy,
+        "artifact_routing_policy": args.artifact_routing_policy,
+        "artifact_fallback": args.artifact_fallback,
+        "artifact_preserve_multiplicity": args.artifact_preserve_multiplicity,
         "profile_validated": all(bool(profile and profile.validated) for profile in selected_profiles.values()),
         "input_binding_version": "v1",
         "candidate_policy_version": "v1",
@@ -758,6 +844,19 @@ def main() -> None:
             "aflow_invocation_reuse": args.aflow_invocation_reuse,
             "aflow_dedup_mode": args.aflow_dedup_mode,
             "aflow_profile": args.aflow_profile,
+            "aflow_context_policy": args.aflow_context_policy,
+            "aflow_context_budget_tokens": args.aflow_context_budget_tokens,
+            "aflow_context_top_k_documents": args.aflow_context_top_k_documents,
+            "aflow_context_fallback": args.aflow_context_fallback,
+            "aflow_context_recovery": args.aflow_context_recovery,
+            "aflow_context_recovery_top_k_documents": args.aflow_context_recovery_top_k_documents,
+            "aflow_semantic_max_paths": args.aflow_semantic_max_paths,
+            "aflow_semantic_max_document_hops": args.aflow_semantic_max_document_hops,
+            "aflow_semantic_budget_tokens": args.aflow_semantic_budget_tokens,
+            "aflow_semantic_entity_policy": args.aflow_semantic_entity_policy,
+            "artifact_routing_policy": args.artifact_routing_policy,
+            "artifact_fallback": args.artifact_fallback,
+            "artifact_preserve_multiplicity": args.artifact_preserve_multiplicity,
             "requested_limit": limit,
         }
         mismatches = [
@@ -816,6 +915,19 @@ def main() -> None:
                     aflow_dedup_mode=args.aflow_dedup_mode,
                     aflow_profile=selected_profiles[dataset],
                     aflow_profile_explicit=args.aflow_profile not in {"none", "auto"},
+                    aflow_context_policy=args.aflow_context_policy,
+                    aflow_context_budget_tokens=args.aflow_context_budget_tokens,
+                    aflow_context_top_k_documents=args.aflow_context_top_k_documents,
+                    aflow_context_fallback=args.aflow_context_fallback,
+                    aflow_context_recovery=args.aflow_context_recovery,
+                    aflow_context_recovery_top_k_documents=args.aflow_context_recovery_top_k_documents,
+                    aflow_semantic_max_paths=args.aflow_semantic_max_paths,
+                    aflow_semantic_max_document_hops=args.aflow_semantic_max_document_hops,
+                    aflow_semantic_budget_tokens=args.aflow_semantic_budget_tokens,
+                    aflow_semantic_entity_policy=args.aflow_semantic_entity_policy,
+                    artifact_routing_policy=args.artifact_routing_policy,
+                    artifact_fallback=args.artifact_fallback,
+                    artifact_preserve_multiplicity=args.artifact_preserve_multiplicity,
                     resume_result=saved_run,
                     save_progress=save_run_progress,
                 )
